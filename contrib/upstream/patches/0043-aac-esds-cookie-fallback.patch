@@ -1,0 +1,82 @@
+media: AAC whose bare AudioSpecificConfig is refused decodes through its ES_Descriptor
+
+AudioToolbox's 'aac ' converter refused the bare AudioSpecificConfig of
+Instagram's music previews ('!dat'), decoded nothing, and the creation flow's
+music panel sat on its spinner with no sound. On that refusal the converter is
+rebuilt from the full ES_Descriptor (the cookie AudioFile itself hands out for an
+.m4a), with the stream format from kAudioFormatProperty_FormatList's richest
+entry (HE-AAC at its full output rate when present). Reels audio takes the bare
+config and never reaches this path.
+
+diff --git a/runtime/src/media_decode.mm b/runtime/src/media_decode.mm
+--- a/runtime/src/media_decode.mm
++++ b/runtime/src/media_decode.mm
+@@ -521,9 +642,68 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
+         cookiePtr = flacCookie.data();
+         cookieLen = (int)flacCookie.size();
+     }
++    if (!usacCookie.empty()) {
++        cookiePtr = usacCookie.data();
++        cookieLen = (int)usacCookie.size();
++    }
+     if (wantsCookie && cookiePtr && cookieLen > 0) {
+         s = AudioConverterSetProperty(conv, kAudioConverterDecompressionMagicCookie,
+                                       (UInt32)cookieLen, cookiePtr);
++        // An 'aac ' converter that refuses the bare AudioSpecificConfig ('!dat')
++        // takes the full ES_Descriptor instead, with the stream format read from
++        // it -- the shape AudioFile itself hands out for an .m4a, and the one the
++        // USAC branch above already uses. Measured: Instagram's music previews
++        // (creation flow) were refused, decoded nothing, and the player sat on
++        // its spinner with no sound; Reels audio takes the bare config and never
++        // reaches this.
++        if (s != noErr && formatId == 1 && usacCookie.empty()) {
++            const uint8_t* asc = nullptr;
++            int ascLen = 0;
++            if (md_asc_in_csd(csd0, csd0Len, &asc, &ascLen)) {
++                std::vector<uint8_t> esds = md_esds_from_asc(asc, ascLen);
++                // FormatList, not FormatInfo: its FIRST item is the richest
++                // decoding of the stream (HE-AAC v2 > HE-AAC > LC), i.e. with SBR
++                // applied at the full output rate; FormatInfo answers the core
++                // (half-rate) one, which plays muffled.
++                AudioStreamBasicDescription fi = {};
++                fi.mFormatID = kAudioFormatMPEG4AAC;
++                UInt32 fiSize = sizeof(fi);
++                bool haveFormat = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo,
++                        (UInt32)esds.size(), esds.data(), &fiSize, &fi) == noErr;
++                UInt32 listSize = 0;
++                if (AudioFormatGetPropertyInfo(kAudioFormatProperty_FormatList, (UInt32)esds.size(),
++                                               esds.data(), &listSize) == noErr
++                        && listSize >= sizeof(AudioFormatListItem)) {
++                    std::vector<AudioFormatListItem> items(listSize / sizeof(AudioFormatListItem));
++                    if (AudioFormatGetProperty(kAudioFormatProperty_FormatList, (UInt32)esds.size(),
++                                               esds.data(), &listSize, items.data()) == noErr
++                            && items[0].mASBD.mSampleRate > 0) {
++                        fi = items[0].mASBD;
++                        haveFormat = true;
++                    }
++                }
++                if (haveFormat && fi.mSampleRate > 0 && fi.mChannelsPerFrame > 0) {
++                    AudioStreamBasicDescription out2 = out;
++                    out2.mSampleRate = fi.mSampleRate;
++                    out2.mChannelsPerFrame = fi.mChannelsPerFrame;
++                    out2.mBytesPerFrame = 2 * out2.mChannelsPerFrame;
++                    out2.mBytesPerPacket = out2.mBytesPerFrame;
++                    AudioConverterRef c2 = nullptr;
++                    if (AudioConverterNew(&fi, &out2, &c2) == noErr && c2
++                            && AudioConverterSetProperty(c2, kAudioConverterDecompressionMagicCookie,
++                                   (UInt32)esds.size(), esds.data()) == noErr) {
++                        AudioConverterDispose(conv);
++                        conv = c2;
++                        out = out2;
++                        s = noErr;
++                        std::fprintf(stderr, "[media] AAC config via ES_Descriptor: %.0f Hz, %u ch\n",
++                                     out.mSampleRate, (unsigned)out.mChannelsPerFrame);
++                    } else if (c2) {
++                        AudioConverterDispose(c2);
++                    }
++                }
++            }
++        }
+         if (s != noErr)
+             std::fprintf(stderr, "[media] set magic cookie failed (formatId=%d): %d (continuing)\n",
+                          formatId, (int)s);

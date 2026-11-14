@@ -1,0 +1,250 @@
+dex translator: drop constant readings nothing can load (last rescue)
+
+A Dalvik constant is untyped, so each `const` is stored once per reading
+TypeInference gives it: int AND float, long AND double. ConstReadingElision
+drops such a store only when a later const of the same register overwrites it
+in straight-line code outside every try range. That cannot touch a dispatcher:
+each case sets its constant and jumps to a shared tail, and when the method is
+`synchronized` the whole body sits inside the monitor's catch-all.
+
+Translator.NEVER_READ_READINGS adds the global counterpart. Each (register,
+reading) is its own JVM local, zeroed by the prologue and only ever given its
+own scalar, so the store of reading S of register R can change behaviour only
+for something that LOADS local (R, S). When no instruction of the method can --
+no TypeInference use reads (R, S), no move copies R (emitMove copies every
+reading), and no instruction outside the audited families names R -- that
+store is dead at every const of R, whatever the control flow, handlers and
+frames around it. Never ALL readings of a const, for ConstReadingElision's own
+reason (a const that emits no code hands its label's frame to the next
+instruction).
+
+DexConverter arms it only after compact locals was not enough, as one more
+step before the oversize stub, so every method that already converts -- the
+one compact locals rescues included -- keeps its bytes.
+
+Measured on Instagram 455 (228,034 classes): exactly one class changes,
+X/0bRx (LauncherOverlayConfigLayer: the WebRTC overlay configuration read when
+a call starts). getValues() is 11,265 instructions -- a loop over a dispatcher
+of ~2,180 cases, 2,179 const-wide and 1,245 const, in a synchronized block:
+    compact locals not enough for X/0bRx.getValues: 73744 -> 68914
+    RESCUED X/0bRx.getValues()[I by compact locals + never-read constant
+            readings: code_length 73744 -> 50891
+Of its ldc2_w, 2,179 long remain and 0 double. The class links under
+-Xverify:all, no STUBBED method is left in the jar, and boot is 3/3.
+
+diff --git a/src/dex/DexConverter.java b/src/dex/DexConverter.java
+--- a/src/dex/DexConverter.java
++++ b/src/dex/DexConverter.java
+@@ -617,6 +617,28 @@
+                         if (compact > 65535) {
+                             System.err.println("[" + Options.logTag + "] compact locals not enough for "
+                                 + cls.name() + "." + m.name() + ": " + over + " -> " + compact);
++                            // One more: the same, without the constant stores
++                            // whose reading nothing in the method can load
++                            // (Translator.NEVER_READ_READINGS).
++                            int lean = -1;
++                            try {
++                                lean = Translator.translateNeverRead(
++                                    m, mw, hierarchy, plan, superIfaces);
++                            } catch (RuntimeException e) {
++                                lean = -1;
++                            }
++                            if (lean >= 0 && lean <= 65535) {
++                                System.err.println("[" + Options.logTag + "] RESCUED oversize method "
++                                    + cls.name() + "." + m.name() + m.descriptor()
++                                    + " by compact locals + never-read constant readings: code_length "
++                                    + over + " -> " + lean);
++                                continue;
++                            }
++                            mw.resetCode();
++                            if (lean > 65535) {
++                                System.err.println("[" + Options.logTag + "] never-read readings not enough for "
++                                    + cls.name() + "." + m.name() + ": " + over + " -> " + lean);
++                            }
+                         }
+                     }
+                     // Only THIS method is inexpressible; the rest of the class
+diff --git a/src/dex/Translator.java b/src/dex/Translator.java
+--- a/src/dex/Translator.java
++++ b/src/dex/Translator.java
+@@ -1033,6 +1033,9 @@
+             if (ConstReadingElision.armed()) {
+                 deadConstReadings = ConstReadingElision.plan(norm, types, tries,
+                         branchTargets(tries), elisionBarriers(), decoded);
++            }
++            if (NEVER_READ_READINGS.get()) {
++                deadConstReadings = neverReadReadings(norm, deadConstReadings);
+             }
+ 
+             if (split != null) { runSplit(norm, tries); return; }
+@@ -1080,6 +1083,125 @@
+          */
+         Map<Integer, Integer> deadConstReadings;
+ 
++        /**
++         * NEVER-READ READINGS: the global counterpart of ConstReadingElision.
++         *
++         * <p>A Dalvik constant is untyped, so each {@code const} is stored once
++         * per reading TypeInference gives it: int AND float, long AND double.
++         * ConstReadingElision drops a store only when a later const of the same
++         * register overwrites it in straight-line code outside every try range.
++         * That rule cannot touch a dispatcher: each case sets its constant and
++         * jumps to a shared tail, and here the whole body sits in a try (the
++         * catch-all of a {@code synchronized}).
++         *
++         * <p>This rule needs no window. Each (register, reading) is its own JVM
++         * local, zeroed by the prologue and only ever given its own scalar, so
++         * the store of reading S of register R can change behaviour only for
++         * something that LOADS local (R, S). If no instruction of the method
++         * can -- no TypeInference use reads (R, S), no move copies R (emitMove
++         * copies every reading), and no instruction outside the audited
++         * families so much as names R -- then that store is dead at every const
++         * of R, whatever the control flow, handlers and frames around it: the
++         * frames carry the local's type, which the dropped store never changed.
++         *
++         * <p>Never ALL readings of a const, for ConstReadingElision's reason: a
++         * const that emits no code would hand its label's frame to the next
++         * instruction.
++         *
++         * <p>Returns {@code plan} unchanged when an instruction cannot be
++         * accounted for.
++         */
++        private Map<Integer, Integer> neverReadReadings(List<TypeInference.Insn> norm,
++                                                        Map<Integer, Integer> plan) {
++            final int regs = code.registersSize() + 2;
++            final int[] read = new int[regs];
++            final Map<Integer, Instruction> raw = new HashMap<>(decoded.length * 2);
++            for (Instruction i : decoded) if (!i.isPayload()) raw.put(i.address(), i);
++            for (TypeInference.Insn in : norm) {
++                if (!types.isReachable(in.offset)) continue;
++                TypeInference.InsnTypes it = types.typesFor(in.offset);
++                Instruction ri = raw.get(in.offset);
++                if (it == null || ri == null) return plan;
++                final int fam = TypeInference.familyOf(in.opcode);
++                if (fam == TypeInference.F_CONST32 || fam == TypeInference.F_CONST64) continue;
++                for (TypeInference.Use u : it.uses) {
++                    if (u.register < 0 || u.register >= regs) return plan;
++                    read[u.register] |= u.scalar;
++                }
++                if (fam == TypeInference.F_MOVE || fam == TypeInference.F_MOVE_WIDE) {
++                    int src = in.arg(1);
++                    if (src < 0 || src + 1 >= regs) return plan;
++                    read[src] = ~0;
++                    if (fam == TypeInference.F_MOVE_WIDE) read[src + 1] = ~0;
++                }
++                // A register the instruction names that its uses and defs do
++                // not account for is an unknown read of everything; outside the
++                // audited families, so is every register it names.
++                final boolean audited = readsOnlyThroughUses(fam);
++                for (int r = 0; r < regs; r++) {
++                    if (ConstReadingElision.mentions(ri, r) && !(audited && namedBy(it, r))) {
++                        read[r] = ~0;
++                    }
++                }
++            }
++            Map<Integer, Integer> out = plan == null ? new HashMap<>() : new HashMap<>(plan);
++            for (TypeInference.Insn c : norm) {
++                final int fam = TypeInference.familyOf(c.opcode);
++                if (fam != TypeInference.F_CONST32 && fam != TypeInference.F_CONST64) continue;
++                if (!types.isReachable(c.offset)) continue;
++                TypeInference.InsnTypes it = types.typesFor(c.offset);
++                if (it == null) continue;
++                final int reg = c.arg(0);
++                if (reg < 0 || reg >= regs) continue;
++                int readings = 0;
++                for (TypeInference.Def d : it.defs) if (d.register == reg) readings |= d.scalars;
++                if (readings == 0) continue;
++                int dead = ((readings & ~read[reg]) | out.getOrDefault(c.offset, 0)) & readings;
++                if (dead == readings) dead &= ~Integer.lowestOneBit(readings);
++                if (dead != 0) out.put(c.offset, dead); else out.remove(c.offset);
++            }
++            return out;
++        }
++
++        /** ConstReadingElision.audited: the families whose emitter loads a
++         *  register local only through it.uses (moves are handled apart). */
++        private static boolean readsOnlyThroughUses(int family) {
++            switch (family) {
++                case TypeInference.F_NOP:
++                case TypeInference.F_MOVE: case TypeInference.F_MOVE_WIDE:
++                case TypeInference.F_MOVE_RESULT:
++                case TypeInference.F_CONST_STRING: case TypeInference.F_CONST_CLASS:
++                case TypeInference.F_CHECK_CAST: case TypeInference.F_INSTANCE_OF:
++                case TypeInference.F_ARRAY_LEN: case TypeInference.F_NEW_INSTANCE:
++                case TypeInference.F_NEW_ARRAY: case TypeInference.F_FILLED_NEW_ARRAY:
++                case TypeInference.F_CMP:
++                case TypeInference.F_ARRAY_GET: case TypeInference.F_ARRAY_PUT:
++                case TypeInference.F_INSTANCE_GET: case TypeInference.F_INSTANCE_PUT:
++                case TypeInference.F_STATIC_GET: case TypeInference.F_STATIC_PUT:
++                case TypeInference.F_INVOKE_VIRTUAL: case TypeInference.F_INVOKE_SUPER:
++                case TypeInference.F_INVOKE_DIRECT: case TypeInference.F_INVOKE_STATIC:
++                case TypeInference.F_INVOKE_INTERFACE:
++                case TypeInference.F_UNARY_OP: case TypeInference.F_BINARY_OP:
++                case TypeInference.F_BINARY_OP_CONST:
++                case TypeInference.F_IF: case TypeInference.F_IFZ: case TypeInference.F_GOTO:
++                case TypeInference.F_SWITCH: case TypeInference.F_RETURN: case TypeInference.F_THROW:
++                    return true;
++                default:
++                    return false;
++            }
++        }
++
++        /** Whether some use or def of the instruction covers register r. */
++        private static boolean namedBy(TypeInference.InsnTypes it, int r) {
++            for (TypeInference.Use u : it.uses) {
++                if (ConstReadingElision.overlaps(u.register, DexType.isWide(u.scalar), r, false)) return true;
++            }
++            for (TypeInference.Def d : it.defs) {
++                if (ConstReadingElision.overlaps(d.register, d.wide, r, false)) return true;
++            }
++            return false;
++        }
++
+         /** Offsets where an outline chunk or a split part begins or ends, and
+          *  MonitorCover stub sites: locals are read there in ways it.uses does
+          *  not describe, so an elision window must not cross one. */
+@@ -4323,6 +4445,20 @@
+     static final ThreadLocal<Boolean> COMPACT_LOCALS = ThreadLocal.withInitial(() -> false);
+ 
+     /**
++     * Armed on this thread only by {@link #translateNeverRead}, the rescue
++     * after compact locals: drop every constant store whose reading no
++     * instruction of the method can load (see neverReadReadings).
++     *
++     * <p>MEASURED on Instagram 455: {@code X/0bRx.getValues()} --
++     * LauncherOverlayConfigLayer, the WebRTC overlay configuration read when a
++     * call starts -- is a loop over a dispatcher of ~2,180 cases, each setting
++     * a 64-bit MobileConfig id and jumping to a shared tail. 3,424 constants
++     * were stored twice (long and double, int and float): 73,744 bytes, and
++     * still 68,914 with compact locals.
++     */
++    static final ThreadLocal<Boolean> NEVER_READ_READINGS = ThreadLocal.withInitial(() -> false);
++
++    /**
+      * Translate {@code m} once more with {@link #COMPACT_LOCALS} armed and no
+      * outlining or splitting, leaving the body in {@code mw}. Returns the
+      * code_length it measured, or -1 when the method has no body. The caller
+@@ -4341,6 +4477,23 @@
+             return e.length;
+         } finally {
+             COMPACT_LOCALS.set(was);
++        }
++    }
++
++    /**
++     * {@link #translateCompactLocals} with {@link #NEVER_READ_READINGS} armed
++     * as well. A separate step, tried only when compact locals alone was not
++     * enough, so a method that step already rescued keeps its bytes.
++     */
++    static int translateNeverRead(DexMethod m, ClassFileWriter.MethodWriter mw,
++                                  DexType.ClassHierarchy hierarchy, InitRepointPlan plan,
++                                  SuperInterfacePlan superIfaces) {
++        final boolean was = NEVER_READ_READINGS.get();
++        NEVER_READ_READINGS.set(true);
++        try {
++            return translateCompactLocals(m, mw, hierarchy, plan, superIfaces);
++        } finally {
++            NEVER_READ_READINGS.set(was);
+         }
+     }
+ 

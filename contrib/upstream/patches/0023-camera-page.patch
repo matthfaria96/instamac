@@ -1,0 +1,850 @@
+camera page: window insets that settle, a window service, JPEG stills, external textures, and frame rates a UVC camera accepts
+
+Instagram 455's camera page (story / post / reel capture, QuickCaptureFragment)
+stayed black. Five independent gaps, found in order:
+
+1. View.requestApplyInsets() only flagged the view it was called on; the driver
+   dispatches insets from the root and reads the flag there. Now it climbs to the
+   root and schedules a traversal, as requestFitSystemWindows does on AOSP.
+2. ServiceManager.getService("window") returned null. Instagram's
+   WindowInsetsManager reflects IWindowManager.hasNavigationBar() and casts that
+   result to a non-null IBinder: an NPE out of its insets listener, so its bar
+   sizes stayed -1 and the 35 tasks waiting on them (the camera page among them)
+   never ran. An inert Binder for "window" lets it reach the reflection failure it
+   already handles.
+3. The camera advertised YUV_420_888 only; Optic sizes its still stream from the
+   JPEG sizes first and failed with "Invalid picture size: 'null'". JPEG is now in
+   the stream configuration map (it is mandatory on every camera2 device), and a
+   single capture that targets a JPEG ImageReader gets that frame encoded at the
+   reader's size and JPEG_QUALITY (ImageReader gains an encoded-image queue: one
+   plane, strides 0).
+4. Setting the frame rate of a UVC camera to a rate between its listed ones threw
+   NSInvalidArgumentException inside a JNI call: SIGABRT (Logitech C922). The rate
+   now uses the listed range's own durations; @try is the backstop.
+5. ANGLE-Metal has no GL_OES_EGL_image_external; SurfaceTexture already uploads
+   each camera frame as GL_TEXTURE_2D. The GLES bridge now compiles a
+   samplerExternalOES shader as sampler2D and routes GL_TEXTURE_EXTERNAL_OES
+   binds / parameters to GL_TEXTURE_2D (MACAPK_GL_EXTERNAL_AS_2D=0 turns it off).
+   The INVALID_ENUM those binds raised was read by the frame upload as its own
+   error ("first camera-frame GL upload reported error 0x500").
+
+Also: MediaStore.Images/Video.Thumbnails.getThumbnail through loadThumbnail (AOSP
+29+), loadThumbnail logs its first failures, onViewAttachedToWindow throws go to
+GfxTrace.swallow, and MACAPK_DUMP_FRAGMENTS prints the fragment tree with each
+fragment's state on the harness dump cadence.
+
+Measured on Instagram 455 with a Logitech C922: the camera page lays out, the
+preview is live and upright in story and post modes, a photo shared to the story
+target opens the story editor. Open: the shutter does not react to a tap, and the
+gallery grid on that page keeps empty cells (its thumbnail loader never asks).
+
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1967,7 +1967,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         if (attachStateChangeListeners != null) {
+             for (OnAttachStateChangeListener l :
+                     new java.util.ArrayList<>(attachStateChangeListeners)) {
+-                try { l.onViewAttachedToWindow(this); } catch (Throwable ignored) {}
++                try { l.onViewAttachedToWindow(this); }
++                catch (Throwable t) { com.macapk.loader.GfxTrace.swallow("onViewAttachedToWindow", t); }
+             }
+         }
+         // v1.0.410: a late-attached view that carries a ViewTree* owner tag
+@@ -7990,8 +8103,20 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *  tree -- mirrors AOSP's `mPrivateFlags3 |= PFLAG3_NEEDS_DISPATCH`
+      *  + a posted dispatch from ViewRootImpl. Generic across any APK
+      *  that calls requestApplyInsets() on its own widgets. */
++    /** AOSP View.requestApplyInsets() -> requestFitSystemWindows(), which climbs
++     *  the parents to ViewRootImpl; the next traversal dispatches the insets
++     *  again FROM THE ROOT. The driver reads the pending flag on the root view
++     *  only, so the request has to land there: made on any other view it was
++     *  lost. Instagram 455's WindowInsetsManager asks its listener's view (not the
++     *  root) to re-apply while the bottom inset is 0 and does nothing until the
++     *  answer comes -- 35 deferred tasks, the camera page among them, never ran. */
+     public void requestApplyInsets() {
+         macapkInsetsDispatchPending = true;
++        View root = this;
++        ViewParent p = root.parent;
++        while (p instanceof View) { root = (View) p; p = root.parent; }
++        if (root != this) root.macapkInsetsDispatchPending = true;
++        android.view.ViewRootImpl.schedule();
+     }
+     public boolean macapkConsumeInsetsDispatchPending() {
+         boolean r = macapkInsetsDispatchPending;
+diff --git a/runtime/java/android/os/ServiceManager.java b/runtime/java/android/os/ServiceManager.java
+--- a/runtime/java/android/os/ServiceManager.java
++++ b/runtime/java/android/os/ServiceManager.java
+@@ -13,13 +13,27 @@ package android.os;
+  * and only catches ReflectiveOperationException.
+  *
+  * Everything returns null / empty: there are no binders to hand out, and a
+- * null IBinder is the documented result for an absent service.
++ * null IBinder is the documented result for an absent service. The one
++ * exception is "window" (see WINDOW_SERVICE).
+  */
+ public final class ServiceManager {
+     private ServiceManager() {}
+ 
+-    public static IBinder getService(String name) { return null; }
+-    public static IBinder checkService(String name) { return null; }
++    /** The window manager's binder. Every device has the service, and an app that
++     *  reflects IWindowManager casts this result to a non-null IBinder before it
++     *  looks the interface up: Instagram 455's WindowInsetsManager asks
++     *  IWindowManager.hasNavigationBar() that way, catches the reflection
++     *  failures and falls back to resources -- but a null here is a
++     *  NullPointerException out of its insets listener, which left its bar sizes
++     *  unset and every task waiting on them (the camera page) unrun. The binder
++     *  is inert: there is still no IWindowManager behind it, which is the
++     *  ClassNotFoundException such callers already handle. */
++    private static final IBinder WINDOW_SERVICE = new Binder();
++
++    public static IBinder getService(String name) { return checkService(name); }
++    public static IBinder checkService(String name) {
++        return "window".equals(name) ? WINDOW_SERVICE : null;
++    }
+     public static IBinder getServiceOrThrow(String name) throws Exception { return null; }
+     public static IBinder waitForService(String name) { return null; }
+     public static IBinder waitForDeclaredService(String name) { return null; }
+diff --git a/runtime/java/android/hardware/camera2/CameraBackend.java b/runtime/java/android/hardware/camera2/CameraBackend.java
+--- a/runtime/java/android/hardware/camera2/CameraBackend.java
++++ b/runtime/java/android/hardware/camera2/CameraBackend.java
+@@ -295,7 +295,8 @@ final class CameraBackend {
+ 
+         p.put(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+                 StreamConfigurationMap.macapkCreate(
+-                        new int[] { android.graphics.ImageFormat.YUV_420_888 },
++                        new int[] { android.graphics.ImageFormat.YUV_420_888,
++                                    android.graphics.ImageFormat.JPEG },
+                         fmt.sizes,
+                         fmt.fpsRanges));
+ 
+diff --git a/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java b/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java
+--- a/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java
++++ b/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java
+@@ -18,13 +18,17 @@
+ // class at all because getCameraCharacteristics throws first.
+ //
+ // ---------------------------------------------------------------------------
+-// ONLY YUV_420_888 IS ADVERTISED, AND THAT IS THE HONEST ANSWER
++// YUV_420_888 AND JPEG ARE ADVERTISED; PRIVATE IS NOT
+ // ---------------------------------------------------------------------------
+ // The capture backend hands out one pixel format: NV12, described to Java as
+ // the three YUV_420_888 plane descriptors the spec permits for a semiplanar
+-// buffer (see camera_capture.mm's PIXEL FORMAT block). We cannot produce JPEG
+-// (no encoder in the capture path) and cannot produce PRIVATE (there is no
+-// opaque gralloc buffer to hand out), so neither is listed.
++// buffer (see camera_capture.mm's PIXEL FORMAT block). JPEG is listed too:
++// every camera2 device has it (it is in the mandatory stream table of even a
++// LEGACY device), camera stacks size their still stream from it before they
++// open a session (Instagram 455's Optic fails with "Invalid picture size:
++// 'null'" without it), and CameraCaptureSessionImpl produces one by encoding
++// the frame of a capture that targets a JPEG ImageReader. PRIVATE is not
++// listed: there is no opaque gralloc buffer to hand out.
+ //
+ // For a format that is NOT listed, getOutputSizes returns null -- not an empty
+ // array. That is AOSP's documented contract, verified verbatim from
+@@ -101,8 +105,8 @@ public final class StreamConfigurationMap {
+      * reach a package-private constructor -- the same reason SensorEvent
+      * .macapkNew and TriggerEvent.macapkNew exist in this tree.
+      *
+-     * @param formats   the image formats this camera can output. One entry,
+-     *                  YUV_420_888, for the AVFoundation backend.
++     * @param formats   the image formats this camera can output: YUV_420_888
++     *                  and JPEG for the AVFoundation backend.
+      * @param sizes     every advertised resolution, deduplicated and sorted
+      *                  largest-area first.
+      * @param fpsRanges every advertised frame-rate range, deduplicated.
+diff --git a/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java b/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
+--- a/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
++++ b/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
+@@ -91,6 +91,10 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+     /** The ImageReaders behind mOutputs. Written once by doConfigure before
+      *  mConfigured is set, read by the pump thereafter. */
+     private volatile List<ImageReader> mReaders = Collections.emptyList();
++    /** JPEG ImageReader outputs. They take no part in the live stream: a
++     *  request that targets one gets the frame of that capture, encoded
++     *  (deliverStills). Written once by doConfigure. */
++    private volatile List<ImageReader> mStillReaders = Collections.emptyList();
+ 
+     /** The SurfaceTextures behind mOutputs (TextureView previews, GL
+      *  consumers). Same write-once-then-pump-reads discipline as mReaders. */
+@@ -254,16 +258,25 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+                     + " SurfaceTexture outputs and will receive no frames.");
+         }
+ 
+-        // 2. Format. YUV_420_888 is the only thing the capture backend produces,
+-        //    and an ImageReader created for another format would hand its app
+-        //    planes that do not match what it asked for.
++        // 2. Format. The stream is YUV_420_888; a JPEG reader is a still output,
++        //    fed per capture and set aside here. An ImageReader created for any
++        //    other format would hand its app planes that do not match what it
++        //    asked for.
++        List<ImageReader> stills = new ArrayList<>();
++        for (java.util.Iterator<ImageReader> it = readers.iterator(); it.hasNext();) {
++            ImageReader r = it.next();
++            if (r.getImageFormat() == ImageFormat.JPEG) {
++                stills.add(r);
++                it.remove();
++            }
++        }
+         for (ImageReader r : readers) {
+             if (r.getImageFormat() != ImageFormat.YUV_420_888) {
+                 CameraBackend.warn("createCaptureSession FAILED: ImageReader format 0x"
+                         + Integer.toHexString(r.getImageFormat())
+-                        + " is not supported. This backend produces YUV_420_888 (0x23) only;"
+-                        + " CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP advertises"
+-                        + " no other output format.");
++                        + " is not supported. This backend produces YUV_420_888 (0x23) and"
++                        + " JPEG (0x100) only, as"
++                        + " CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP advertises.");
+                 return false;
+             }
+         }
+@@ -355,6 +368,7 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+             st.macapkAttachCameraSource(mHandle, nw, nh);
+         }
+         mReaders = readers;
++        mStillReaders = stills;
+         mSurfaceTextures = textures;
+         mConfigured = true;
+ 
+@@ -936,6 +950,76 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+         CameraBackend.trace("frame pump stopped after " + seen + " delivered frame(s)");
+     }
+ 
++    /** A capture that targets a JPEG reader: this frame, encoded at the reader's
++     *  size and the request's JPEG_QUALITY. AOSP's HAL fills the reader's
++     *  BufferQueue with the JPEG stream of that request; nothing arrives on a
++     *  repeating preview request, which never targets a still output. */
++    private void deliverStills(CaptureRequest request, long timestampNs) {
++        for (Surface target : request.getTargets()) {
++            ImageReader reader = ImageReader.macapkReaderForSurface(target);
++            if (reader == null || reader.getImageFormat() != ImageFormat.JPEG) continue;
++            int quality = 90;
++            try {
++                Byte q = request.get(CaptureRequest.JPEG_QUALITY);
++                if (q != null && q > 0) quality = Math.min(100, q);
++            } catch (Throwable keyNotCarried) { }
++            byte[] jpeg = encodeLatestFrame(reader.getWidth(), reader.getHeight(), quality);
++            if (jpeg == null) {
++                CameraBackend.warn("still capture: no frame to encode yet; the JPEG reader gets nothing");
++                continue;
++            }
++            CameraBackend.trace("still capture: " + reader.getWidth() + "x" + reader.getHeight()
++                    + " JPEG q" + quality + ", " + jpeg.length + " bytes");
++            reader.macapkQueueEncodedImage(jpeg, reader.getWidth(), reader.getHeight(), timestampNs);
++        }
++    }
++
++    private byte[] encodeLatestFrame(int outW, int outH, int quality) {
++        try {
++            // The frame's own size, which is not always the configured one (the
++            // capture session's preset can override the device format): a first
++            // call with no room only reports it.
++            int[] dims = new int[2];
++            CameraBridge.copyLatestArgb(mHandle, new int[0], dims);
++            if (dims[0] <= 0 || dims[1] <= 0) return null;
++            int[] argb = new int[dims[0] * dims[1]];
++            if (CameraBridge.copyLatestArgb(mHandle, argb, dims) == 0L
++                    || (long) dims[0] * dims[1] > argb.length) {
++                return null;
++            }
++            java.awt.image.BufferedImage frame = new java.awt.image.BufferedImage(
++                    dims[0], dims[1], java.awt.image.BufferedImage.TYPE_INT_RGB);
++            frame.setRGB(0, 0, dims[0], dims[1], argb, 0, dims[0]);
++            if (outW > 0 && outH > 0 && (outW != dims[0] || outH != dims[1])) {
++                java.awt.image.BufferedImage scaled = new java.awt.image.BufferedImage(
++                        outW, outH, java.awt.image.BufferedImage.TYPE_INT_RGB);
++                java.awt.Graphics2D g = scaled.createGraphics();
++                g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
++                        java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
++                g.drawImage(frame, 0, 0, outW, outH, null);
++                g.dispose();
++                frame = scaled;
++            }
++            javax.imageio.ImageWriter writer =
++                    javax.imageio.ImageIO.getImageWritersByFormatName("jpeg").next();
++            javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
++            param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
++            param.setCompressionQuality(quality / 100f);
++            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream(outW * outH / 4);
++            try (javax.imageio.stream.ImageOutputStream out =
++                         new javax.imageio.stream.MemoryCacheImageOutputStream(bytes)) {
++                writer.setOutput(out);
++                writer.write(null, new javax.imageio.IIOImage(frame, null, null), param);
++            } finally {
++                writer.dispose();
++            }
++            return bytes.toByteArray();
++        } catch (Throwable t) {
++            CameraBackend.warn("still capture: JPEG encode failed: " + t);
++            return null;
++        }
++    }
++
+     /**
+      * One native frame became available. Notify the readers first (so an app
+      * whose onImageAvailable runs on a different Handler than its
+@@ -980,9 +1064,11 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+         CameraDispatch dispatch;
+         int sequenceId;
+         boolean endsSequence = false;
++        boolean oneShot = false;
+ 
+         synchronized (mLock) {
+             OneShot shot = mOneShots.poll();
++            oneShot = shot != null;
+             if (shot != null) {
+                 request = shot.request;
+                 callback = shot.callback;
+@@ -1008,6 +1094,8 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+             }
+         }
+ 
++        if (oneShot && !mStillReaders.isEmpty()) deliverStills(request, timestampNs);
++
+         if (callback == null || dispatch == null || request == null) {
+             // No callback registered for this frame. The readers were still
+             // notified above, which is what a request with an ImageReader
+diff --git a/runtime/java/android/media/ImageReader.java b/runtime/java/android/media/ImageReader.java
+--- a/runtime/java/android/media/ImageReader.java
++++ b/runtime/java/android/media/ImageReader.java
+@@ -251,6 +251,10 @@ public class ImageReader implements AutoCloseable {
+      *         attached, or when an Image is still outstanding.
+      */
+     public Image acquireLatestImage() {
++        Image rendered = acquireGlImage(true);
++        if (rendered != null) return rendered;
++        Image still = acquireEncodedImage(true);
++        if (still != null) return still;
+         long handle;
+         int negotiatedWidth;
+         int negotiatedHeight;
+@@ -326,7 +330,200 @@ public class ImageReader implements AutoCloseable {
+      * it skip, and this comment is where that behaviour is explained.
+      */
+     public Image acquireNextImage() {
+-        return acquireLatestImage();
++        Image rendered = acquireGlImage(false);
++        if (rendered != null) return rendered;
++        Image still = acquireEncodedImage(false);
++        return still != null ? still : acquireLatestImage();
++    }
++
++    // ---- GL producer --------------------------------------------------------
++    // An EGL window surface made on this reader's Surface (MacApkGlWindow) is a
++    // pbuffer read back at each eglSwapBuffers; the frame arrives here as
++    // top-down rows of non-premultiplied ARGB. This is the BufferQueue of the
++    // pair: a swap that finds maxImages frames queued or acquired replaces the
++    // oldest queued one, where a device would block the producer in
++    // dequeueBuffer.
++
++    private static final class GlFrame {
++        final int[] argb;
++        final int width, height;
++        final long timestampNs;
++        final java.util.function.Consumer<int[]> recycler;
++        GlFrame(int[] argb, int width, int height, long timestampNs,
++                java.util.function.Consumer<int[]> recycler) {
++            this.argb = argb; this.width = width; this.height = height;
++            this.timestampNs = timestampNs; this.recycler = recycler;
++        }
++    }
++    private final java.util.ArrayDeque<GlFrame> mGlQueue = new java.util.ArrayDeque<>();
++    private Object mGlProducer;
++    private int mGlAcquired;
++    private boolean mClosed;
++    /** The last frame queued, for PixelCopy (Surface::getLastQueuedBuffer on a
++     *  device). A private copy: a queued array goes back to the producer. */
++    private int[] mGlLast;
++    private int mGlLastWidth, mGlLastHeight;
++
++    /** @hide The last frame a GL producer queued on this reader, or null. */
++    public android.graphics.Bitmap macapkLastGlFrame() {
++        synchronized (mCameraLock) {
++            if (mGlLast == null) return null;
++            return android.graphics.Bitmap.createBitmap(mGlLast, mGlLastWidth, mGlLastHeight,
++                    android.graphics.Bitmap.Config.ARGB_8888);
++        }
++    }
++
++    /** @hide One producer at a time, as native_window_api_connect allows. */
++    public boolean macapkConnectGlProducer(Object producer) {
++        synchronized (mCameraLock) {
++            if (mClosed || (mGlProducer != null && mGlProducer != producer)) return false;
++            mGlProducer = producer;
++            return true;
++        }
++    }
++
++    /** @hide */
++    public void macapkDisconnectGlProducer(Object producer) {
++        synchronized (mCameraLock) {
++            if (mGlProducer == producer) mGlProducer = null;
++        }
++    }
++
++    /** @hide One swapped frame. {@code recycler} takes the array back once
++     *  nothing can read it any more. */
++    public void macapkQueueGlFrame(int[] argb, int width, int height, long timestampNs,
++            java.util.function.Consumer<int[]> recycler) {
++        GlFrame replaced = null;
++        OnImageAvailableListener listener;
++        android.os.Handler handler;
++        synchronized (mCameraLock) {
++            if (mClosed) {
++                recycler.accept(argb);
++                return;
++            }
++            if (mGlQueue.size() + mGlAcquired >= mMaxImages) replaced = mGlQueue.pollFirst();
++            final int n = width * height;
++            if (mGlLast == null || mGlLast.length != n) mGlLast = new int[n];
++            System.arraycopy(argb, 0, mGlLast, 0, n);
++            mGlLastWidth = width;
++            mGlLastHeight = height;
++            mGlQueue.addLast(new GlFrame(argb, width, height, timestampNs, recycler));
++            listener = mListener;
++            handler = mListenerHandler;
++        }
++        if (replaced != null) replaced.recycler.accept(replaced.argb);
++        if (listener == null) return;
++        final OnImageAvailableListener l = listener;
++        Runnable deliver = () -> {
++            try {
++                l.onImageAvailable(this);
++            } catch (Throwable t) {
++                System.err.println("[imagereader] exception from OnImageAvailableListener:");
++                t.printStackTrace();
++            }
++        };
++        if (handler != null) handler.post(deliver);
++        else deliver.run();
++    }
++
++    // ---- encoded stills ------------------------------------------------------
++    // A camera capture that targets a JPEG reader arrives here already encoded
++    // (CameraCaptureSessionImpl.deliverStills): one plane holding the file's
++    // bytes, pixel and row stride 0, as android.media.Image documents for JPEG.
++
++    private static final class EncodedFrame {
++        final byte[] data;
++        final int width, height;
++        final long timestampNs;
++        EncodedFrame(byte[] data, int width, int height, long timestampNs) {
++            this.data = data; this.width = width; this.height = height; this.timestampNs = timestampNs;
++        }
++    }
++    private final java.util.ArrayDeque<EncodedFrame> mEncodedQueue = new java.util.ArrayDeque<>();
++
++    /** @hide */
++    public void macapkQueueEncodedImage(byte[] data, int width, int height, long timestampNs) {
++        OnImageAvailableListener listener;
++        android.os.Handler handler;
++        synchronized (mCameraLock) {
++            if (mClosed) return;
++            if (mEncodedQueue.size() >= mMaxImages) mEncodedQueue.pollFirst();
++            mEncodedQueue.addLast(new EncodedFrame(data, width, height, timestampNs));
++            listener = mListener;
++            handler = mListenerHandler;
++        }
++        if (listener == null) return;
++        final OnImageAvailableListener l = listener;
++        Runnable deliver = () -> {
++            try {
++                l.onImageAvailable(this);
++            } catch (Throwable t) {
++                System.err.println("[imagereader] exception from OnImageAvailableListener:");
++                t.printStackTrace();
++            }
++        };
++        if (handler != null) handler.post(deliver);
++        else deliver.run();
++    }
++
++    private Image acquireEncodedImage(boolean latest) {
++        EncodedFrame frame;
++        synchronized (mCameraLock) {
++            frame = latest ? mEncodedQueue.pollLast() : mEncodedQueue.pollFirst();
++            if (latest) mEncodedQueue.clear();
++        }
++        if (frame == null) return null;
++        final ByteBuffer bytes = ByteBuffer.allocateDirect(frame.data.length);
++        bytes.put(frame.data).flip();
++        final EncodedFrame f = frame;
++        final int format = mFormat;
++        return new Image() {
++            private final Plane[] planes = { new Plane() {
++                @Override public ByteBuffer getBuffer() { return bytes; }
++                @Override public int getRowStride() { return 0; }
++                @Override public int getPixelStride() { return 0; }
++            } };
++            @Override public int getFormat() { return format; }
++            @Override public int getWidth() { return f.width; }
++            @Override public int getHeight() { return f.height; }
++            @Override public long getTimestamp() { return f.timestampNs; }
++            @Override public Plane[] getPlanes() { return planes; }
++            @Override public void close() { }
++        };
++    }
++
++    /** The next (or newest) rendered frame, or null when no GL frame is queued. */
++    private Image acquireGlImage(boolean latest) {
++        GlFrame frame;
++        java.util.ArrayList<GlFrame> skipped = null;
++        synchronized (mCameraLock) {
++            if (mGlQueue.isEmpty()) return null;
++            if (mGlAcquired >= mMaxImages) {
++                throw new IllegalStateException("maxImages (" + mMaxImages
++                        + ") has already been acquired, call #close before acquiring more.");
++            }
++            frame = mGlQueue.pollFirst();
++            while (latest && !mGlQueue.isEmpty()) {
++                if (skipped == null) skipped = new java.util.ArrayList<>();
++                skipped.add(frame);
++                frame = mGlQueue.pollFirst();
++            }
++            mGlAcquired++;
++        }
++        if (skipped != null) {
++            for (GlFrame f : skipped) f.recycler.accept(f.argb);
++        }
++        return new GlImage(this, frame, mFormat);
++    }
++
++    /** {@code pixelsEscaped}: a HardwareBuffer was handed out, and on a device it
++     *  keeps the buffer alive past Image.close(); the array is then left to the
++     *  collector instead of going back to the producer. */
++    void macapkGlImageClosed(GlFrame frame, boolean pixelsEscaped) {
++        synchronized (mCameraLock) {
++            if (mGlAcquired > 0) mGlAcquired--;
++        }
++        if (!pixelsEscaped) frame.recycler.accept(frame.argb);
+     }
+ 
+     /** Called by CameraImage.close(). */
+diff --git a/runtime/src/camera_capture.mm b/runtime/src/camera_capture.mm
+--- a/runtime/src/camera_capture.mm
++++ b/runtime/src/camera_capture.mm
+@@ -525,21 +525,35 @@ bool macapk_cam_configure(MacapkCamSession* s, int width, int height, int fps) {
+         s->device.activeFormat = best;
+ 
+         if (fps > 0) {
+-            // Clamp into a range the chosen format actually supports; setting a
+-            // duration outside it throws an NSException that would take down
+-            // the JVM rather than surface as a Java error.
+-            double lo = 0, hi = 0;
++            // A frame duration has to be one the format LISTS. A UVC camera's
++            // ranges are single rates (30, 24, 15 ...), so a rate between two
++            // of them -- or a listed rate spelled with another timescale -- is
++            // an NSInvalidArgumentException, and uncaught in a JNI call that
++            // ends the process (Logitech C922, Instagram's camera session:
++            // SIGABRT from std::terminate). So: the range that holds the rate,
++            // else the nearest one, and ITS OWN durations; only a continuous
++            // range is narrowed to the rate asked for. The @try is the
++            // backstop for a device that refuses even that.
++            AVFrameRateRange* pick = nil;
++            double pickDist = 0;
+             for (AVFrameRateRange* r in best.videoSupportedFrameRateRanges) {
+-                if (hi == 0 || r.maxFrameRate > hi) hi = r.maxFrameRate;
+-                if (lo == 0 || r.minFrameRate < lo) lo = r.minFrameRate;
++                const double dist = fps < r.minFrameRate ? r.minFrameRate - fps
++                                  : fps > r.maxFrameRate ? fps - r.maxFrameRate : 0;
++                if (!pick || dist < pickDist) { pick = r; pickDist = dist; }
+             }
+-            double want_fps = (double)fps;
+-            if (hi > 0 && want_fps > hi) want_fps = hi;
+-            if (lo > 0 && want_fps < lo) want_fps = lo;
+-            if (want_fps > 0) {
+-                CMTime dur = CMTimeMake((int64_t)1000, (int32_t)(want_fps * 1000.0));
+-                s->device.activeVideoMinFrameDuration = dur;
+-                s->device.activeVideoMaxFrameDuration = dur;
++            if (pick) {
++                CMTime minDur = pick.minFrameDuration, maxDur = pick.maxFrameDuration;
++                if (pickDist == 0 && pick.maxFrameRate - pick.minFrameRate > 0.01) {
++                    minDur = maxDur = CMTimeMake((int64_t)1000, (int32_t)(fps * 1000.0));
++                }
++                @try {
++                    s->device.activeVideoMinFrameDuration = minDur;
++                    s->device.activeVideoMaxFrameDuration = maxDur;
++                } @catch (NSException* e) {
++                    std::fprintf(stderr, "[camera] %d fps refused by the device (%s); "
++                                 "the format's default rate stays\n",
++                                 fps, e.reason ? e.reason.UTF8String : "no reason given");
++                }
+             }
+         }
+         [s->device unlockForConfiguration];
+diff --git a/runtime/src/native_methods.cpp b/runtime/src/native_methods.cpp
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -1066,14 +1066,60 @@ void GLES20_glActiveTexture(JNIEnv*, jclass, jint unit) {
+     glActiveTexture(unit);
+ #endif
+ }
++// ---- external textures (GL_OES_EGL_image_external) without the extension ----
++// ANGLE's Metal backend does not expose it, and SurfaceTexture already puts each
++// frame into the attached name as a GL_TEXTURE_2D (SurfaceTexture.java,
++// latchCameraFrameToGl). The consumer's half is uniform: its samplerExternalOES
++// shader has to compile -- as sampler2D, without the #extension line -- and its
++// GL_TEXTURE_EXTERNAL_OES binds and parameters have to reach that same 2D
++// texture instead of being GL_INVALID_ENUM (an error the frame upload's own
++// check then read as its own and gave up: "first camera-frame GL upload
++// reported error 0x500"). Instagram's camera preview is such a consumer.
++// MACAPK_GL_EXTERNAL_AS_2D=0 turns the mapping off.
++static constexpr int kTextureExternalOes = 0x8D65;
++static bool external_as_2d() {
++    static const bool on = [] {
++        const char* e = std::getenv("MACAPK_GL_EXTERNAL_AS_2D");
++        return !(e && e[0] == '0');
++    }();
++    return on;
++}
++static inline int tex_target(int target) {
++    return (target == kTextureExternalOes && external_as_2d()) ? 0x0DE1 /*GL_TEXTURE_2D*/ : target;
++}
++// The source with `samplerExternalOES` as `sampler2D` and the extension
++// directive blanked (the line stays, so compile errors keep their numbers).
++// Empty when the shader does not use external textures.
++static std::string external_shader_as_2d(const char* source) {
++    if (!external_as_2d() || !std::strstr(source, "samplerExternalOES")) return std::string();
++    std::string out(source);
++    static const char kSampler[] = "samplerExternalOES";
++    for (size_t at = 0; (at = out.find(kSampler, at)) != std::string::npos; at += 9) {
++        out.replace(at, sizeof kSampler - 1, "sampler2D");
++    }
++    for (size_t at = 0; (at = out.find("GL_OES_EGL_image_external", at)) != std::string::npos;) {
++        size_t line = out.rfind('\n', at);
++        line = line == std::string::npos ? 0 : line + 1;
++        size_t end = out.find('\n', at);
++        if (end == std::string::npos) end = out.size();
++        if (out.compare(line, 10, "#extension") == 0 || out.find("#extension", line) < at) {
++            out.replace(line, end - line, "");
++            at = line;
++        } else {
++            at = end;
++        }
++    }
++    return out;
++}
++
+ void GLES20_glBindTexture(JNIEnv*, jclass, jint target, jint tex) {
+ #ifdef MACAPK_HAS_ANGLE
+-    glBindTexture(target, tex);
++    glBindTexture(tex_target(target), tex);
+ #endif
+ }
+ void GLES20_glTexParameteri(JNIEnv*, jclass, jint target, jint pname, jint param) {
+ #ifdef MACAPK_HAS_ANGLE
+-    glTexParameteri(target, pname, param);
++    glTexParameteri(tex_target(target), pname, param);
+ #endif
+ }
+ void GLES20_glBindBuffer(JNIEnv*, jclass, jint target, jint buf) {
+@@ -1247,8 +1293,10 @@ void GLES20_glShaderSource(JNIEnv* env, jclass, jint shader, jstring src) {
+ #ifdef MACAPK_HAS_ANGLE
+     if (!src) return;
+     const char* s = env->GetStringUTFChars(src, nullptr);
+-    GLint len = (GLint) std::strlen(s);
+-    glShaderSource(shader, 1, &s, &len);
++    const std::string as_2d = external_shader_as_2d(s);
++    const char* text = as_2d.empty() ? s : as_2d.c_str();
++    GLint len = (GLint) std::strlen(text);
++    glShaderSource(shader, 1, &text, &len);
+     env->ReleaseStringUTFChars(src, s);
+ #endif
+ }
+@@ -2273,6 +2321,7 @@ void GLES20_glReleaseShaderCompiler(JNIEnv*, jclass) {
+ }
+ void GLES20_glTexParameterf(JNIEnv*, jclass, jint t, jint pn, jfloat v) {
+     GL_GATE("texparam");
++    t = tex_target(t);
+     // finer bisect: 0x2800/0x2801 = MAG/MIN filter, 0x2802/0x2803 = WRAP_S/T
+     if ((pn == 0x2800 || pn == 0x2801) && gl_grp_off("texfilter")) return;
+     if ((pn == 0x2802 || pn == 0x2803) && gl_grp_off("texwrap")) return;
+@@ -2812,7 +2861,7 @@ void GLES20_glTexParameterfv_arr(JNIEnv* env, jclass, jint t, jint pn, jfloatArr
+     if (avail <= 0) return;
+     jsize take = avail > 4 ? 4 : avail;
+     env->GetFloatArrayRegion(v, off, take, f);
+-    glTexParameterfv((GLenum) t, (GLenum) pn, f);
++    glTexParameterfv((GLenum) tex_target(t), (GLenum) pn, f);
+ #else
+     (void) env; (void) t; (void) pn; (void) v; (void) off;
+ #endif
+diff --git a/runtime/java/com/macapk/loader/FragmentLifecycle.java b/runtime/java/com/macapk/loader/FragmentLifecycle.java
+--- a/runtime/java/com/macapk/loader/FragmentLifecycle.java
++++ b/runtime/java/com/macapk/loader/FragmentLifecycle.java
+@@ -421,6 +421,86 @@ public final class FragmentLifecycle {
+         return null;
+     }
+ 
++    // ---- MACAPK_DUMP_FRAGMENTS: the fragment tree, for a harness run ----------
++    // One line per fragment reachable from the activity: class, androidx state
++    // (Fragment.mState), max lifecycle, user-visible hint, whether it has a
++    // view. Answers "which fragment is the app holding back" when a screen
++    // stays empty with nothing in the log. Shape-based like the rest of this
++    // class: the manager's fragment list is whichever no-arg method returns a
++    // List of androidx Fragments (R8 renames getFragments).
++    private static final boolean DUMP_FRAGMENTS = System.getenv("MACAPK_DUMP_FRAGMENTS") != null;
++
++    public static void dumpTree(Activity activity) {
++        if (!DUMP_FRAGMENTS || activity == null) return;
++        try {
++            Object fm = getHostFragmentManager(activity);
++            if (fm == null) fm = callNoArg(activity, "getSupportFragmentManager");
++            StringBuilder sb = new StringBuilder("fragment tree of " + activity.getClass().getName());
++            dumpManager(fm, 1, sb);
++            NativeLog.i(TAG, sb.toString());
++        } catch (Throwable t) {
++            NativeLog.w(TAG, "fragment dump failed: " + t);
++        }
++    }
++
++    private static void dumpManager(Object fm, int depth, StringBuilder sb) {
++        if (fm == null || depth > 6) return;
++        for (Object f : fragmentsByShape(fm)) {
++            sb.append('\n');
++            for (int i = 0; i < depth; i++) sb.append("  ");
++            sb.append(f.getClass().getName())
++              .append(" state=").append(fragmentField(f, "mState"))
++              .append(" max=").append(fragmentField(f, "mMaxState"))
++              .append(" visibleHint=").append(fragmentField(f, "mUserVisibleHint"))
++              .append(" deferStart=").append(fragmentField(f, "mDeferStart"))
++              .append(" hidden=").append(fragmentField(f, "mHidden"))
++              .append(" view=").append(fragmentField(f, "mView") != null);
++            dumpManager(fragmentField(f, "mChildFragmentManager"), depth + 1, sb);
++        }
++    }
++
++    private static List<Object> fragmentsByShape(Object fm) {
++        List<Object> out = new ArrayList<>();
++        Class<?> fragment;
++        try {
++            fragment = Class.forName("androidx.fragment.app.Fragment", false, fm.getClass().getClassLoader());
++        } catch (Throwable notAndroidx) {
++            return out;
++        }
++        for (Class<?> c = fm.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
++            for (Method m : c.getDeclaredMethods()) {
++                if (m.getParameterCount() != 0 || m.getReturnType() != List.class
++                        || java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
++                try {
++                    m.setAccessible(true);
++                    Object got = m.invoke(fm);
++                    if (!(got instanceof List) || ((List<?>) got).isEmpty()) continue;
++                    boolean all = true;
++                    for (Object o : (List<?>) got) all &= fragment.isInstance(o);
++                    if (!all) continue;
++                    out.addAll((List<?>) got);
++                    return out;
++                } catch (Throwable ignored) { }
++            }
++        }
++        return out;
++    }
++
++    private static Object fragmentField(Object fragment, String name) {
++        for (Class<?> c = fragment.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
++            try {
++                java.lang.reflect.Field f = c.getDeclaredField(name);
++                f.setAccessible(true);
++                return f.get(fragment);
++            } catch (NoSuchFieldException up) {
++                continue;
++            } catch (Throwable t) {
++                return null;
++            }
++        }
++        return null;
++    }
++
+     private static Object callNoArg(Object target, String name) {
+         if (target == null) return null;
+         Method m = findNoArg(target.getClass(), name);
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -1607,6 +1607,16 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             // MACAPK_DUMP_TREE_EVERY is set and MACAPK_TEXT_DUMP is not 0.
+             try { ViewTextDump.dumpToLog(rootView, statusBarH); }
+             catch (Throwable ignored) {}
++            try {
++                android.content.Context dumpCtx = rootView.getContext();
++                while (dumpCtx instanceof android.content.ContextWrapper
++                        && !(dumpCtx instanceof android.app.Activity)) {
++                    dumpCtx = ((android.content.ContextWrapper) dumpCtx).getBaseContext();
++                }
++                if (dumpCtx instanceof android.app.Activity) {
++                    FragmentLifecycle.dumpTree((android.app.Activity) dumpCtx);
++                }
++            } catch (Throwable ignored) {}
+             if ("1".equals(ENV_MACAPK_TRACE_BARRIER)) {
+                 try { dumpBarriers(rootView); } catch (Throwable ignored) {}
+             }
+diff --git a/runtime/java/android/provider/MediaStore.java b/runtime/java/android/provider/MediaStore.java
+--- a/runtime/java/android/provider/MediaStore.java
++++ b/runtime/java/android/provider/MediaStore.java
+@@ -99,6 +99,19 @@ public final class MediaStore {
+     }
+ 
+     // ---- Images ---------------------------------------------------------
++    /** MediaStore.Images/Video.Thumbnails.getThumbnail's body (AOSP API 29+). */
++    static android.graphics.Bitmap macapkThumbnail(android.content.ContentResolver cr,
++            android.net.Uri base, long id, int kind) {
++        if (cr == null) return null;
++        android.util.Size size = kind == 3 ? new android.util.Size(96, 96)
++                : kind == 2 ? new android.util.Size(1024, 786) : new android.util.Size(512, 384);
++        try {
++            return cr.loadThumbnail(android.content.ContentUris.withAppendedId(base, id), size, null);
++        } catch (Throwable t) {
++            return null;
++        }
++    }
++
+     public static final class Images {
+         /** AOSP declares a public no-arg constructor. */
+         public Images() { }
+@@ -192,10 +205,17 @@ public final class MediaStore {
+                 return Uri.parse("content://media/" + volumeName + "/images/thumbnails");
+             }
+             /** No thumbnail store on a de-Googled device; AOSP returns null. */
++            /** AOSP (API 29+): ThumbnailConstants -> loadThumbnail on the image's
++             *  own URI, MINI 512x384, MICRO 96x96, FULL_SCREEN 1024x786; null on
++             *  failure. */
+             public static android.graphics.Bitmap getThumbnail(android.content.ContentResolver cr, long origId,
+-                    int kind, android.graphics.BitmapFactory.Options options) { return null; }
++                    int kind, android.graphics.BitmapFactory.Options options) {
++                return macapkThumbnail(cr, Media.EXTERNAL_CONTENT_URI, origId, kind);
++            }
+             public static android.graphics.Bitmap getThumbnail(android.content.ContentResolver cr, long origId,
+-                    long groupId, int kind, android.graphics.BitmapFactory.Options options) { return null; }
++                    long groupId, int kind, android.graphics.BitmapFactory.Options options) {
++                return macapkThumbnail(cr, Media.EXTERNAL_CONTENT_URI, origId, kind);
++            }
+ 
+             /**
+              * AOSP's thumbnail generation is synchronous since API 29, so there
+diff --git a/runtime/java/android/content/ContentResolver.java b/runtime/java/android/content/ContentResolver.java
+--- a/runtime/java/android/content/ContentResolver.java
++++ b/runtime/java/android/content/ContentResolver.java
+@@ -416,6 +416,20 @@ public class ContentResolver {
+     // "at least" promise a grid layout is relying on.
+     public android.graphics.Bitmap loadThumbnail(Uri uri, android.util.Size size,
+             CancellationSignal signal) throws java.io.IOException {
++        try {
++            return macapkLoadThumbnail(uri, size, signal);
++        } catch (java.io.IOException | RuntimeException e) {
++            if (sThumbFailLog > 0) {
++                sThumbFailLog--;
++                com.macapk.loader.NativeLog.w("ContentResolver", "loadThumbnail " + uri + " " + size + " failed: " + e);
++            }
++            throw e;
++        }
++    }
++    private static int sThumbFailLog = 8;
++
++    private android.graphics.Bitmap macapkLoadThumbnail(Uri uri, android.util.Size size,
++            CancellationSignal signal) throws java.io.IOException {
+         java.util.Objects.requireNonNull(uri, "uri");
+         java.util.Objects.requireNonNull(size, "size");
+         final int targetW = Math.max(1, size.getWidth());

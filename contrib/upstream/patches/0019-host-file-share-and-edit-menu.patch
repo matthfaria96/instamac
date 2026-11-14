@@ -1,0 +1,1111 @@
+host file share: Mac photos and videos to the app's own share targets (Arquivo menu, drop on the window, the app's create button), and the Edit menu
+
+A file chosen from the menu bar (Arquivo) or dropped on the window is started on
+one of the app's share targets as ACTION_SEND / ACTION_SEND_MULTIPLE, which is
+what another app's share sheet does on a device. Finder drags arrive as file
+URLs, Photos drags as file promises (NSFilePromiseReceiver); a drop asks for the
+destination with a menu where the files landed, opened after the drop has been
+answered so the drag's source is not kept waiting.
+
+MACAPK_HOST_CLICK="id/<entry name>=<target>" hands a click on the app's own view
+to the same file panel (View.performClick -> DocumentPickerHandler.macapkHostPick).
+Instamac sets it for the main feed's create button, whose own screen (the camera
+page) this runtime does not show. The first panel of a run opens on Pictures.
+The embedded Info.plist lists the localizations, so the panel is drawn in the
+user's language instead of English.
+
+The guest never opens the user's originals. document_picker.mm stages each file
+under the temporary directory on a background queue (an APFS clone, or a JPEG
+re-encode in sRGB for HEIC / TIFF / RAW), batches older than a day are swept, and
+the staged copies are served through HostDocumentsProvider with a read grant,
+like a picked document. DocumentPickerHandler.macapkOnHostShare builds the Intent
+(EXTRA_STREAM plus the ClipData that carries the grant) and delivers it on the
+cross-app arrival path with DocumentsUI as the sender.
+
+PackageManager.resolveContentProvider answers for the ExternalStorageProvider
+authority the host documents carry: another package under another uid, as on a
+device. Instagram 455's direct share target refuses a content:// URI whose
+provider resolves to nothing or to its own uid (it showed a toast and finished);
+with this it opens its recipient sheet.
+
+The Edit menu (cut / copy / paste / select all / emoji) and its responder
+actions are in the same cocoa_bridge.mm hunks; the menu block supersedes the one
+published in 0015. The hostkey harness gains "share <target> <path>[|<path>]".
+
+Measured on Instagram 455 (macOS 27.2): one JPEG to the feed target reaches the
+editor and the "new post" screen; JPEG + HEIC as SEND_MULTIPLE reach the editor
+(HEIC staged as JPEG); the direct target opens the recipient list. The story target opens
+the story editor with the photo (after 0023). A tap on the feed's create button opens the panel on
+Pictures. Cmd+V with a 37-character string on a test pasteboard lands in the
+caption field of the "new post" screen.
+
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -12,6 +12,7 @@
+ #import <MetalKit/MetalKit.h>
+ #import <QuartzCore/QuartzCore.h>
+ #import <ImageIO/ImageIO.h>   // CGImageSource -- native webp/heic decode
++#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>   // UTTypeImage / UTTypeMovie (file share)
+ #import <CoreVideo/CoreVideo.h>   // CVPixelBufferRef -- TextureView video-frame extraction
+ #import <IOSurface/IOSurfaceRef.h> // the Canvas present's IOSurface ring (CocoaPresentFrameFrom)
+ #import <objc/runtime.h>
+@@ -9897,6 +10044,559 @@ @implementation MacApkBackAccessory
+ - (void)macapkBack:(id)sender { (void)sender; CocoaDispatchBack(); }
+ @end
+ 
++// ---- orientation (Retrato / Paisagem) and the fixed window size ---------------
++//
++// Owner decision: the window has TWO shapes and the user picks one from the
++// View menu, like turning a phone:
++//   Retrato   -- upright: the app sees a phone (500dp wide) and puts its
++//                navigation at the bottom;
++//   Paisagem  -- lying down: the app sees a wide display (1280dp) and puts its
++//                navigation on the side.
++// The shape itself is the window policy's box for the per-app preference
++// (portrait / default), so launch, Cmd+R and the menu all go through the same
++// decision and the app's Configuration always describes the window it is in.
++//
++// On top of that the window SIZE is fixed by default: no resize handle, no zoom
++// button, no fullscreen. The lock never chooses a size -- it pins whatever box
++// the policy gave the current orientation, and follows it on a rotation. The
++// menu can lift it, labelled as not recommended; the choice is remembered in
++// <android_root>/.macapk/resolution ("locked" / "free").
++namespace macapk {
++static void set_orientation_pref(bool portrait);
++static bool orientation_pref_is_portrait();
++}
++
++static BOOL g_size_locked = NO;
++
++static BOOL resolution_ui_on(void) {
++    static const BOOL on = [] {
++        const char* e = std::getenv("MACAPK_RESOLUTION_UI");
++        return (BOOL)(e && e[0] == '1');
++    }();
++    return on;
++}
++
++static BOOL resolution_locked(void) { return resolution_ui_on() && g_size_locked; }
++
++static NSString* resolution_path(void) {
++    const char* root = std::getenv("MACAPK_ANDROID_ROOT");
++    if (!root || !root[0]) return nil;
++    return [NSString stringWithFormat:@"%s/.macapk/resolution", root];
++}
++
++static void resolution_load(void) {
++    NSString* path = resolution_path();
++    NSString* mode = path ? [NSString stringWithContentsOfFile:path
++                                                      encoding:NSUTF8StringEncoding
++                                                         error:NULL] : nil;
++    mode = [mode stringByTrimmingCharactersInSet:
++                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
++    // Free unless the user locked it (View > Travar Tamanho da Janela).
++    g_size_locked = [mode isEqualToString:@"locked"];
++}
++
++static void resolution_save(void) {
++    NSString* path = resolution_path();
++    if (!path) return;
++    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
++                              withIntermediateDirectories:YES attributes:nil error:NULL];
++    [(g_size_locked ? @"locked" : @"free") writeToFile:path atomically:YES
++                                              encoding:NSUTF8StringEncoding error:NULL];
++}
++
++// Pin (or release) the window at the content size it has NOW. Called once the
++// window exists and again after every reshape, so the pinned size is always the
++// policy's box for the current orientation. Never resizes the window: a resize
++// made here during boot is what once left the Android configuration describing
++// one size and the surface another.
++static void resolution_apply(NSWindow* w) {
++    if (!w || !resolution_ui_on()) return;
++    if (([w styleMask] & NSWindowStyleMaskFullScreen) != 0) return;   // AppKit owns it
++    NSWindowStyleMask mask = [w styleMask];
++    NSWindowCollectionBehavior behaviour = [w collectionBehavior];
++    NSButton* zoom = [w standardWindowButton:NSWindowZoomButton];
++    if (g_size_locked) {
++        const NSSize cur = [w contentRectForFrameRect:[w frame]].size;
++        mask &= ~NSWindowStyleMaskResizable;
++        behaviour &= ~NSWindowCollectionBehaviorFullScreenPrimary;
++        behaviour |= NSWindowCollectionBehaviorFullScreenNone;
++        [w setCollectionBehavior:behaviour];
++        [w setStyleMask:mask];
++        [w setContentMinSize:cur];
++        [w setContentMaxSize:cur];
++        [zoom setHidden:YES];
++    } else {
++        // Resizable, never fullscreen: the green button zooms inside the mode's
++        // limits.
++        mask |= NSWindowStyleMaskResizable;
++        behaviour &= ~NSWindowCollectionBehaviorFullScreenPrimary;
++        behaviour |= NSWindowCollectionBehaviorFullScreenNone;
++        [w setCollectionBehavior:behaviour];
++        [w setStyleMask:mask];
++        [zoom setHidden:NO];
++        [zoom setEnabled:YES];
++        window_mode_limits(w);
++    }
++}
++// Each mode stays what it is while the user resizes it. Android's line between
++// a phone and a tablet layout is 600dp of width (1dp = 1pt here): Retrato never
++// reaches it, Paisagem never drops near it. The side itself (taller than wide,
++// or wider than tall) is held by the policy's resize range.
++static void window_mode_limits(NSWindow* w) {
++    if (!w || !resolution_ui_on() || g_size_locked) return;
++    if (([w styleMask] & NSWindowStyleMaskFullScreen) != 0) return;
++    if (macapk::orientation_pref_is_portrait()) {
++        [w setContentMinSize:NSMakeSize(320, 480)];
++        [w setContentMaxSize:NSMakeSize(599, FLT_MAX)];
++    } else {
++        [w setContentMinSize:NSMakeSize(720, 480)];
++        [w setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
++    }
++}
++
++// A reshape is about to give the window another box: the pin must not hold the
++// old one against it. resolution_apply re-pins once the new frame is set.
++static void resolution_release_for_reshape(NSWindow* w) {
++    if (!w || !resolution_ui_on()) return;
++    [w setContentMinSize:NSMakeSize(1, 1)];
++    [w setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
++}
++
++// ---- scroll settings (the Rolagem menu) -----------------------------------------
++//
++// Speed multiplies the travel of the synthesized finger. Inertia picks whose
++// physics run once the fingers lift: the guest's own fling, or the macOS momentum
++// tail fed to the same finger. Both are kept in the user defaults. Auto-scroll
++// advances one screenful every N seconds while the user leaves the window alone;
++// it lasts for the session. MACAPK_SCROLL_SCALE / MACAPK_SCROLL_NO_MOMENTUM, when
++// set, still win for that run.
++static double g_scroll_speed = 1.0;
++static BOOL   g_scroll_host_inertia = NO;
++static double g_autoscroll_secs = 0.0;
++static void autoscroll_set(double secs);          // defined with the input view
++static void autoscroll_note_user_input(void);
++static void app_cache_clear_async(void);         // defined below, with the menu
++static NSString* const kScrollSpeedKey = @"ScrollSpeed";
++static NSString* const kScrollHostInertiaKey = @"ScrollHostInertia";
++static void scroll_settings_load(void) {
++    NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
++    const double v = [d doubleForKey:kScrollSpeedKey];
++    g_scroll_speed = (v >= 0.25 && v <= 4.0) ? v : 1.0;
++    g_scroll_host_inertia = [d boolForKey:kScrollHostInertiaKey];
++    // MACAPK_DEBUG_CLEAR_CACHE=<secs>: clear the cache that long after launch.
++    if (const char* e = std::getenv("MACAPK_DEBUG_CLEAR_CACHE"); e && atof(e) > 0.0) {
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(e) * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{ app_cache_clear_async(); });
++    }
++    // MACAPK_AUTOSCROLL=<secs>: auto-scroll on from launch (an unattended run).
++    if (const char* e = std::getenv("MACAPK_AUTOSCROLL"); e && atof(e) > 0.0) {
++        const double secs = atof(e);
++        dispatch_async(dispatch_get_main_queue(), ^{ autoscroll_set(secs); });
++    }
++}
++static void scroll_settings_save(void) {
++    NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
++    [d setDouble:g_scroll_speed forKey:kScrollSpeedKey];
++    [d setBool:g_scroll_host_inertia forKey:kScrollHostInertiaKey];
++}
++static double scroll_effective_speed(void) {
++    static const double pinned = [] {
++        const char* e = std::getenv("MACAPK_SCROLL_SCALE");
++        const double v = e ? atof(e) : 0.0;
++        return (v >= 0.05 && v <= 4.0) ? v : 0.0;
++    }();
++    return pinned > 0.0 ? pinned : g_scroll_speed;
++}
++
++enum { kMenuTagScrollSpeed = 1, kMenuTagScrollInertia = 2, kMenuTagAutoScroll = 3 };
++
++// ---- the app's cache (app menu > Limpar Cache…) ----------------------------------
++//
++// What Settings > Storage > Clear cache does on a device: the CONTENTS of every
++// package's cache/ and code_cache/ under the Android root. An app may lose them
++// at any moment and rebuilds what it needs; accounts, databases and preferences
++// live elsewhere and are not touched. `remove` NO only measures.
++static unsigned long long app_cache_sweep(BOOL remove, NSUInteger* files_out) {
++    const char* root = std::getenv("MACAPK_ANDROID_ROOT");
++    unsigned long long bytes = 0;
++    NSUInteger files = 0;
++    if (root && root[0]) {
++        NSFileManager* fm = [NSFileManager defaultManager];
++        NSString* data = [NSString stringWithFormat:@"%s/data/data", root];
++        NSArray<NSURLResourceKey>* keys = @[ NSURLIsRegularFileKey, NSURLTotalFileAllocatedSizeKey ];
++        for (NSString* pkg in [fm contentsOfDirectoryAtPath:data error:NULL]) {
++            for (NSString* sub in @[ @"cache", @"code_cache" ]) {
++                // cache/ may be a link out of the bundle (~/Library/Caches).
++                NSString* dir = [[[data stringByAppendingPathComponent:pkg]
++                    stringByAppendingPathComponent:sub] stringByResolvingSymlinksInPath];
++                NSDirectoryEnumerator<NSURL*>* e =
++                    [fm enumeratorAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
++                        includingPropertiesForKeys:keys options:0 errorHandler:nil];
++                for (NSURL* u in e) {
++                    NSNumber *regular = nil, *size = nil;
++                    [u getResourceValue:&regular forKey:NSURLIsRegularFileKey error:NULL];
++                    if (![regular boolValue]) continue;
++                    [u getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:NULL];
++                    bytes += [size unsignedLongLongValue];
++                    ++files;
++                }
++                if (!remove) continue;
++                for (NSString* name in [fm contentsOfDirectoryAtPath:dir error:NULL])
++                    [fm removeItemAtPath:[dir stringByAppendingPathComponent:name] error:NULL];
++            }
++        }
++    }
++    if (files_out) *files_out = files;
++    return bytes;
++}
++static void app_cache_clear_async(void) {
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        NSUInteger files = 0;
++        const unsigned long long bytes = app_cache_sweep(YES, &files);
++        std::fprintf(stderr, "[I] cocoa: cache cleared: %lu file(s), %.1f MB\n",
++                     (unsigned long)files, (double)bytes / 1048576.0);
++    });
++}
++
++// ---- sending Mac files to the app (Arquivo menu, files dropped on the window) -----
++// Each destination is one of the app's own share targets -- the activities another
++// app's share sheet starts on a device. document_picker.mm stages the files and
++// hands them to DocumentPickerHandler.macapkOnHostShare.
++namespace macapk {
++NSURL* HostShareNewDropDir();
++void HostShareFiles(NSArray<NSURL*>* urls, const char* image_cls, const char* video_cls,
++                    const char* many_cls);
++}
++
++namespace {
++struct ShareTarget {
++    NSString* __unsafe_unretained menu_title;   // Arquivo menu: opens the file panel
++    NSString* __unsafe_unretained drop_title;   // the menu shown where files are dropped
++    NSString* __unsafe_unretained key;
++    NSEventModifierFlags mods;
++    const char* image;                          // activity for one image,
++    const char* video;                          // for one video,
++    const char* many;                           // and for several items
++};
++const ShareTarget kShareTargets[] = {
++    { @"Nova Publicação…", @"Publicar no Feed", @"n", NSEventModifierFlagCommand,
++      "com.instagram.share.handleractivity.ShareHandlerActivity",
++      "com.instagram.share.handleractivity.ShareHandlerActivity",
++      "com.instagram.share.handleractivity.ShareHandlerActivityMultipleFeedAlias" },
++    { @"Novo Story…", @"Adicionar ao Story", @"n", NSEventModifierFlagCommand | NSEventModifierFlagShift,
++      "com.instagram.share.handleractivity.StoryShareHandlerActivity",
++      "com.instagram.share.handleractivity.StoryShareHandlerActivity",
++      "com.instagram.share.handleractivity.MultiStoryShareHandlerActivity" },
++    { @"Novo Reel…", @"Criar Reel", @"n", NSEventModifierFlagCommand | NSEventModifierFlagOption,
++      "com.instagram.share.handleractivity.ReelShareHandlerActivity",
++      "com.instagram.share.handleractivity.ReelShareHandlerActivity",
++      "com.instagram.share.handleractivity.ReelShareHandlerActivity" },
++    { @"Enviar por Mensagem…", @"Enviar por Mensagem", @"d", NSEventModifierFlagCommand,
++      "com.instagram.direct.share.handler.DirectExternalMediaShareActivityPhoto",
++      "com.instagram.direct.share.handler.DirectExternalMediaShareActivityVideo",
++      "com.instagram.direct.share.handler.DirectMultipleExternalMediaShareActivity" },
++};
++const NSInteger kShareTargetCount = sizeof(kShareTargets) / sizeof(kShareTargets[0]);
++}  // namespace
++
++static void share_send(NSArray<NSURL*>* urls, NSInteger target) {
++    if (target < 0 || target >= kShareTargetCount || !urls.count) return;
++    const ShareTarget& t = kShareTargets[target];
++    std::fprintf(stderr, "[I] cocoa: share %lu file(s) -> %s\n", (unsigned long)urls.count,
++                 t.drop_title.UTF8String);
++    macapk::HostShareFiles(urls, t.image, t.video, t.many);
++}
++
++// The file panel for one destination: the Arquivo menu, and the app's own create
++// button when MACAPK_HOST_CLICK hands it over (View.macapkHostClick).
++static void share_pick(NSInteger target) {
++    if (target < 0 || target >= kShareTargetCount) return;
++    NSOpenPanel* panel = [NSOpenPanel openPanel];
++    panel.canChooseFiles = YES;
++    panel.canChooseDirectories = NO;
++    panel.allowsMultipleSelection = YES;
++    panel.allowedContentTypes = @[ UTTypeImage, UTTypeMovie ];
++    panel.message = kShareTargets[target].drop_title;
++    panel.prompt = @"Enviar";
++    // The first panel of a run opens on Pictures; after that, wherever the user went.
++    static bool s_opened = false;
++    if (!s_opened) {
++        s_opened = true;
++        panel.directoryURL = [NSFileManager.defaultManager URLsForDirectory:NSPicturesDirectory
++                                                                  inDomains:NSUserDomainMask].firstObject;
++    }
++    [NSApp activateIgnoringOtherApps:YES];
++    [panel beginWithCompletionHandler:^(NSModalResponse r) {
++        if (r == NSModalResponseOK) share_send(panel.URLs, target);
++    }];
++}
++
++namespace macapk {
++bool HostSharePick(int target) {
++    if (target < 0 || target >= kShareTargetCount) return false;
++    std::fprintf(stderr, "[I] cocoa: host click -> file panel for %s\n",
++                 kShareTargets[target].drop_title.UTF8String);
++    dispatch_async(dispatch_get_main_queue(), ^{ share_pick(target); });
++    return true;
++}
++}
++
++@interface MacApkViewMenuTarget : NSObject <NSMenuDelegate>
++@property(nonatomic, strong) NSMenuItem* portraitItem;
++@property(nonatomic, strong) NSMenuItem* landscapeItem;
++@property(nonatomic, strong) NSMenuItem* lockItem;
++@property(nonatomic, strong) NSMenu* scrollMenu;
++@property(nonatomic, copy)   NSString* appTitle;
++- (void)pickPortrait:(id)sender;
++- (void)pickLandscape:(id)sender;
++- (void)defaultSize:(id)sender;
++- (void)toggleSizeLock:(id)sender;
++- (void)pickScrollSpeed:(id)sender;
++- (void)pickScrollInertia:(id)sender;
++- (void)pickAutoScroll:(id)sender;
++- (void)goBack:(id)sender;
++- (void)shareFiles:(id)sender;
++- (void)shareDropped:(id)sender;
++- (void)showAbout:(id)sender;
++- (void)clearCache:(id)sender;
++@end
++
++@implementation MacApkViewMenuTarget
++- (void)pickPortrait:(id)sender  { (void)sender; macapk::set_orientation_pref(true); }
++- (void)pickLandscape:(id)sender { (void)sender; macapk::set_orientation_pref(false); }
++- (void)defaultSize:(id)sender   { (void)sender; macapk::window_default_size_main(); }
++- (void)toggleSizeLock:(id)sender {
++    (void)sender;
++    g_size_locked = !g_size_locked;
++    resolution_save();
++    resolution_apply(macapk::g_placeholder_window);
++    std::fprintf(stderr, "[I] cocoa: window size %s\n", g_size_locked ? "locked" : "free");
++}
++- (void)pickScrollSpeed:(id)sender {
++    g_scroll_speed = [[(NSMenuItem*)sender representedObject] doubleValue];
++    scroll_settings_save();
++    std::fprintf(stderr, "[I] cocoa: scroll speed %.2fx\n", g_scroll_speed);
++}
++- (void)pickScrollInertia:(id)sender {
++    g_scroll_host_inertia = [[(NSMenuItem*)sender representedObject] boolValue];
++    scroll_settings_save();
++    std::fprintf(stderr, "[I] cocoa: scroll inertia %s\n", g_scroll_host_inertia ? "macOS" : "guest");
++}
++- (void)pickAutoScroll:(id)sender {
++    autoscroll_set([[(NSMenuItem*)sender representedObject] doubleValue]);
++}
++- (void)goBack:(id)sender { (void)sender; CocoaDispatchBack(); }
++- (void)shareFiles:(id)sender { share_pick([(NSMenuItem*)sender tag]); }
++- (void)shareDropped:(id)sender {
++    share_send([(NSMenuItem*)sender representedObject], [(NSMenuItem*)sender tag]);
++}
++- (void)clearCache:(id)sender {
++    (void)sender;
++    NSUInteger files = 0;
++    const unsigned long long bytes = app_cache_sweep(NO, &files);
++    NSAlert* alert = [[NSAlert alloc] init];
++    [alert setMessageText:@"Limpar o cache?"];
++    [alert setInformativeText:[NSString stringWithFormat:
++        @"O cache ocupa %@ (%lu arquivos): vídeos e imagens já baixados. Sua conta, suas "
++        @"mensagens e seus ajustes não são apagados; o que for preciso é baixado de novo.",
++        [NSByteCountFormatter stringFromByteCount:(long long)bytes
++                                       countStyle:NSByteCountFormatterCountStyleFile],
++        (unsigned long)files]];
++    [alert addButtonWithTitle:@"Limpar Cache"];
++    [alert addButtonWithTitle:@"Cancelar"];
++    [NSApp activateIgnoringOtherApps:YES];
++    if ([alert runModal] == NSAlertFirstButtonReturn) app_cache_clear_async();
++}
++- (void)showAbout:(id)sender {
++    (void)sender;
++    [NSApp activateIgnoringOtherApps:YES];
++    [NSApp orderFrontStandardAboutPanelWithOptions:
++        @{ NSAboutPanelOptionApplicationName : (self.appTitle ?: @"") }];
++}
++// The checkmarks are read when a menu opens, so they are right whichever way the
++// setting last changed (menu, shortcut, or what was read at launch).
++- (void)menuNeedsUpdate:(NSMenu*)menu {
++    (void)menu;
++    const BOOL portrait = macapk::orientation_pref_is_portrait();
++    [self.portraitItem  setState:portrait ? NSControlStateValueOn : NSControlStateValueOff];
++    [self.landscapeItem setState:portrait ? NSControlStateValueOff : NSControlStateValueOn];
++    [self.lockItem setState:g_size_locked ? NSControlStateValueOn : NSControlStateValueOff];
++    for (NSMenuItem* it in [self.scrollMenu itemArray]) {
++        const double v = [[it representedObject] doubleValue];
++        BOOL on = NO;
++        switch ([it tag]) {
++            case kMenuTagScrollSpeed:   on = fabs(v - g_scroll_speed) < 0.01; break;
++            case kMenuTagScrollInertia: on = (v != 0.0) == (g_scroll_host_inertia != NO); break;
++            case kMenuTagAutoScroll:    on = fabs(v - g_autoscroll_secs) < 0.01; break;
++            default: continue;
++        }
++        [it setState:on ? NSControlStateValueOn : NSControlStateValueOff];
++    }
++}
++@end
++
++static MacApkViewMenuTarget* g_view_menu_target = nil;
++
++static NSMenu* add_menu(NSMenu* mainMenu, NSString* title) {
++    NSMenuItem* slot = [[NSMenuItem alloc] init];
++    [mainMenu addItem:slot];
++    NSMenu* menu = [[NSMenu alloc] initWithTitle:title];
++    [slot setSubmenu:menu];
++    return menu;
++}
++static NSMenuItem* add_item(NSMenu* menu, NSString* title, SEL action, NSString* key,
++                            NSEventModifierFlags mods, id target) {
++    NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
++    [it setKeyEquivalentModifierMask:mods];
++    [it setTarget:target];
++    [menu addItem:it];
++    return it;
++}
++static void add_choice(NSMenu* menu, NSString* title, SEL action, NSInteger tag, double value) {
++    NSMenuItem* it = add_item(menu, title, action, @"", 0, g_view_menu_target);
++    [it setTag:tag];
++    [it setRepresentedObject:@(value)];
++}
++
++// Visualizar: the two modes, the rotate shortcut, the mode's size.
++static void install_view_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Visualizar");
++    [menu setDelegate:g_view_menu_target];
++    g_view_menu_target.portraitItem = add_item(menu, @"Celular — em pé", @selector(pickPortrait:),
++        @"1", NSEventModifierFlagCommand, g_view_menu_target);
++    g_view_menu_target.landscapeItem = add_item(menu, @"Tablet — deitado", @selector(pickLandscape:),
++        @"2", NSEventModifierFlagCommand, g_view_menu_target);
++    // target nil: the responder chain takes it to MacApkMetalView.
++    add_item(menu, @"Girar", @selector(macapkMenuRotate:), @"r", NSEventModifierFlagCommand, nil);
++    if (resolution_ui_on()) {
++        [menu addItem:[NSMenuItem separatorItem]];
++        add_item(menu, @"Tamanho Padrão", @selector(defaultSize:), @"0", NSEventModifierFlagCommand,
++                 g_view_menu_target);
++        g_view_menu_target.lockItem = add_item(menu, @"Travar Tamanho da Janela",
++            @selector(toggleSizeLock:), @"", 0, g_view_menu_target);
++    }
++}
++
++// Rolagem: speed, whose inertia, and the hands-free advance.
++static void install_scroll_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Rolagem");
++    [menu setDelegate:g_view_menu_target];
++    g_view_menu_target.scrollMenu = menu;
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Velocidade"]];
++    add_choice(menu, @"Lenta — 0,5×",        @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 0.5);
++    add_choice(menu, @"Reduzida — 0,75×",    @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 0.75);
++    add_choice(menu, @"Normal — 1×",         @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 1.0);
++    add_choice(menu, @"Rápida — 1,5×",       @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 1.5);
++    add_choice(menu, @"Muito Rápida — 2×",   @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 2.0);
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Inércia ao Soltar"]];
++    add_choice(menu, @"Do Instagram",        @selector(pickScrollInertia:), kMenuTagScrollInertia, 0.0);
++    add_choice(menu, @"Do macOS",            @selector(pickScrollInertia:), kMenuTagScrollInertia, 1.0);
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Rolagem Automática"]];
++    add_choice(menu, @"Desligada",           @selector(pickAutoScroll:), kMenuTagAutoScroll, 0.0);
++    add_choice(menu, @"A Cada 3 Segundos",   @selector(pickAutoScroll:), kMenuTagAutoScroll, 3.0);
++    add_choice(menu, @"A Cada 5 Segundos",   @selector(pickAutoScroll:), kMenuTagAutoScroll, 5.0);
++    add_choice(menu, @"A Cada 10 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 10.0);
++    add_choice(menu, @"A Cada 15 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 15.0);
++    add_choice(menu, @"A Cada 30 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 30.0);
++}
++
++// Arquivo: a photo or video from the Mac, to one of the app's share targets.
++static void install_file_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Arquivo");
++    for (NSInteger i = 0; i < kShareTargetCount; i++) {
++        const ShareTarget& t = kShareTargets[i];
++        [add_item(menu, t.menu_title, @selector(shareFiles:), t.key, t.mods, g_view_menu_target) setTag:i];
++    }
++}
++
++// Files dropped on the window: where to send them, asked where they landed.
++static void share_drop_menu(NSArray<NSURL*>* urls, NSView* view, NSPoint at) {
++    if (!urls.count) return;
++    NSMenu* menu = [[NSMenu alloc] initWithTitle:@""];
++    for (NSInteger i = 0; i < kShareTargetCount; i++) {
++        NSMenuItem* it = add_item(menu, kShareTargets[i].drop_title, @selector(shareDropped:), @"", 0,
++                                  g_view_menu_target);
++        it.tag = i;
++        it.representedObject = urls;
++    }
++    [NSApp activateIgnoringOtherApps:YES];
++    [menu popUpMenuPositioningItem:nil atLocation:at inView:view];
++}
++
++// The image and video files of a drag, as file URLs.
++static NSArray<NSURL*>* share_dragged_files(id<NSDraggingInfo> info) {
++    return [info.draggingPasteboard readObjectsForClasses:@[ NSURL.class ] options:@{
++        NSPasteboardURLReadingFileURLsOnlyKey : @YES,
++        NSPasteboardURLReadingContentsConformToTypesKey : @[ UTTypeImage.identifier, UTTypeMovie.identifier ],
++    }] ?: @[];
++}
++
++// The image and video promises of a drag (Photos hands out promises, not files).
++static NSArray<NSFilePromiseReceiver*>* share_dragged_promises(id<NSDraggingInfo> info) {
++    NSMutableArray<NSFilePromiseReceiver*>* out = [NSMutableArray array];
++    for (NSFilePromiseReceiver* r in [info.draggingPasteboard
++             readObjectsForClasses:@[ NSFilePromiseReceiver.class ] options:nil]) {
++        for (NSString* identifier in r.fileTypes) {
++            UTType* type = [UTType typeWithIdentifier:identifier];
++            if ([type conformsToType:UTTypeImage] || [type conformsToType:UTTypeMovie]) {
++                [out addObject:r];
++                break;
++            }
++        }
++    }
++    return out;
++}
++
++// Have the promised files written, then call `done` on the main queue with them.
++static void share_receive_promises(NSArray<NSFilePromiseReceiver*>* promises,
++                                   void (^done)(NSArray<NSURL*>*)) {
++    NSURL* dir = macapk::HostShareNewDropDir();
++    if (!dir) return;
++    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
++    queue.maxConcurrentOperationCount = 1;   // serializes the two captures below
++    NSMutableArray<NSURL*>* files = [NSMutableArray array];
++    __block NSUInteger pending = 0;
++    for (NSFilePromiseReceiver* r in promises) pending += r.fileNames.count;
++    if (!pending) return;
++    for (NSFilePromiseReceiver* r in promises) {
++        [r receivePromisedFilesAtDestination:dir options:@{} operationQueue:queue
++                                      reader:^(NSURL* url, NSError* err) {
++            if (url && !err) [files addObject:url];
++            if (--pending == 0) {
++                NSArray<NSURL*>* all = [files copy];
++                dispatch_async(dispatch_get_main_queue(), ^{ done(all); });
++            }
++        }];
++    }
++}
++
++// Editar: the standard actions, answered by the input view (target nil).
++static void install_edit_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Editar");
++    add_item(menu, @"Recortar", @selector(cut:), @"x", NSEventModifierFlagCommand, nil);
++    add_item(menu, @"Copiar", @selector(copy:), @"c", NSEventModifierFlagCommand, nil);
++    add_item(menu, @"Colar", @selector(paste:), @"v", NSEventModifierFlagCommand, nil);
++    add_item(menu, @"Selecionar Tudo", @selector(selectAll:), @"a", NSEventModifierFlagCommand, nil);
++    [menu addItem:[NSMenuItem separatorItem]];
++    add_item(menu, @"Emojis e Símbolos", @selector(orderFrontCharacterPalette:), @" ",
++             NSEventModifierFlagCommand | NSEventModifierFlagControl, nil);
++}
++
++static void install_go_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Navegar");
++    add_item(menu, @"Voltar", @selector(goBack:), @"[", NSEventModifierFlagCommand, g_view_menu_target);
++}
++
++static void install_window_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Janela");
++    add_item(menu, @"Minimizar", @selector(performMiniaturize:), @"m", NSEventModifierFlagCommand, nil);
++    add_item(menu, @"Zoom", @selector(performZoom:), @"", 0, nil);
++    [menu addItem:[NSMenuItem separatorItem]];
++    add_item(menu, @"Trazer Todas para a Frente", @selector(arrangeInFront:), @"", 0, nil);
++    [NSApp setWindowsMenu:menu];
++}
++
++
+ namespace macapk {   // reopened after the ObjC class above
+ 
+ /** v1.0.1047: register the live-appearance KVO observer. Registered for the
+@@ -10945,7 +11692,7 @@ static void MacApkDebugHostKeyFile(MacApkMetalView* mv, double now) {
+         0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06};
+     static const unsigned short kDigit[10] = {  // kVK_ANSI_0 .. kVK_ANSI_9
+         0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19};
+-    char line[128];
++    char line[1024];   // room for the paths of a "share" line
+     while (std::fgets(line, sizeof line, f)) {
+         NSEventModifierFlags mods = 0;
+         char key = 0;
+@@ -10964,6 +11711,21 @@ static void MacApkDebugHostKeyFile(MacApkMetalView* mv, double now) {
+             std::fprintf(stderr, "[key] hostkey harness: activated\n");
+             continue;
+         }
++        // "share <target> <path>[|<path>...]": files to a share target, as the
++        // Arquivo menu sends them once its panel has answered.
++        if (!std::strncmp(line, "share ", 6)) {
++            char* end = nullptr;
++            const long target = std::strtol(line + 6, &end, 10);
++            NSString* rest = [[NSString stringWithUTF8String:end ?: ""]
++                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++            NSMutableArray<NSURL*>* urls = [NSMutableArray array];
++            for (NSString* path in [rest componentsSeparatedByString:@"|"]) {
++                if (path.length) [urls addObject:[NSURL fileURLWithPath:path]];
++            }
++            std::fprintf(stderr, "[key] hostkey harness: share %ld %s\n", target, rest.UTF8String);
++            share_send(urls, target);
++            continue;
++        }
+         if (!std::strncmp(line, "deactivate", 10)) {
+             [NSApp deactivate];
+             [[mv window] orderBack:nil];
+@@ -11484,9 +12336,36 @@ - (instancetype)initWithFrame:(CGRect)frameRect device:(id<MTLDevice>)device {
+         // 10_12" -- the Touch Bar only, so a trackpad finger never reached us. ADD indirect.
+         self.allowedTouchTypes |= NSTouchTypeMaskIndirect;
+     }
++    if (self) {
++        NSMutableArray<NSPasteboardType>* dragged = [NSMutableArray arrayWithObject:NSPasteboardTypeFileURL];
++        [dragged addObjectsFromArray:NSFilePromiseReceiver.readableDraggedTypes];
++        [self registerForDraggedTypes:dragged];
++    }
+     return self;
+ }
+ 
++// Photos and videos dragged onto the window (see "sending Mac files to the app").
++- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
++    return share_dragged_files(sender).count || share_dragged_promises(sender).count
++        ? NSDragOperationCopy : NSDragOperationNone;
++}
++
++- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
++    const NSPoint at = [self convertPoint:sender.draggingLocation fromView:nil];
++    // The menu opens after the drop has been answered: tracked from inside it,
++    // it would keep the drag's source waiting for the whole choice.
++    void (^ask)(NSArray<NSURL*>*) = ^(NSArray<NSURL*>* urls) { share_drop_menu(urls, self, at); };
++    NSArray<NSURL*>* files = share_dragged_files(sender);
++    if (files.count) {
++        dispatch_async(dispatch_get_main_queue(), ^{ ask(files); });
++        return YES;
++    }
++    NSArray<NSFilePromiseReceiver*>* promises = share_dragged_promises(sender);
++    if (!promises.count) return NO;
++    share_receive_promises(promises, ask);
++    return YES;
++}
++
+ // A replaced / removed view, or a window that loses key, can end a contact without
+ // AppKit ever sending touchesEnded / touchesCancelled to this view. An EMPTY frame
+ // tells the mapper every contact is gone (it CANCELs a live hold and forgets them),
+@@ -12084,6 +13010,21 @@ - (BOOL)performKeyEquivalent:(NSEvent*)event {
+ // invoked by the menu, its ⌘R shortcut, or the raw keystroke.
+ - (void)macapkMenuRotate:(id)sender { macapk::CocoaRotateRender(); }
+ 
++// The Edit menu (Editar), and anything else in macOS that sends the standard
++// editing actions down the responder chain. Android's own text widgets answer
++// Ctrl+X / C / V / A (TextView.onKeyShortcut -> onTextContextMenuItem), and the
++// guest clipboard is the general pasteboard (clipboard_bridge.mm), so each
++// action is that chord, pressed and released.
++- (void)macapkEditChord:(int)androidKeyCode {
++    static const int kMetaCtrl = 0x1000 | 0x2000;   // META_CTRL_ON | META_CTRL_LEFT_ON
++    [self dispatchKeyRawAction:0 keyCode:androidKeyCode unicode:0 meta:kMetaCtrl repeat:NO];
++    [self dispatchKeyRawAction:1 keyCode:androidKeyCode unicode:0 meta:kMetaCtrl repeat:NO];
++}
++- (void)cut:(id)sender       { (void)sender; [self macapkEditChord:52]; }   // KEYCODE_X
++- (void)copy:(id)sender      { (void)sender; [self macapkEditChord:31]; }   // KEYCODE_C
++- (void)paste:(id)sender     { (void)sender; [self macapkEditChord:50]; }   // KEYCODE_V
++- (void)selectAll:(id)sender { (void)sender; [self macapkEditChord:29]; }   // KEYCODE_A
++
+ // Override keyDown:/keyUp: WITHOUT calling super so unhandled keys don't
+ // trigger the macOS alert beep; we deliver them to the guest instead.
+ // (Cmd+R is also caught here in case performKeyEquivalent: wasn't consulted.)
+diff --git a/runtime/src/document_picker.mm b/runtime/src/document_picker.mm
+--- a/runtime/src/document_picker.mm
++++ b/runtime/src/document_picker.mm
+@@ -41,8 +41,10 @@
+ 
+ #import <AppKit/AppKit.h>
+ #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
++#import <ImageIO/ImageIO.h>
+ #include <jni.h>
+ #include <cstdio>
++#include <string>
+ 
+ namespace macapk {
+ namespace docpicker {
+@@ -51,6 +53,7 @@
+ static jclass    g_cls = nullptr;
+ static jmethodID g_on_picked = nullptr;
+ static jmethodID g_block_reason = nullptr;   // String macapkTreeBlockReason(String), optional
++static jmethodID g_on_host_share = nullptr;  // void macapkOnHostShare(String[], String x3), optional
+ 
+ static JNIEnv* attachedEnv() {
+     if (!g_vm) return nullptr;
+@@ -243,8 +246,144 @@ static jboolean nativePickEx(JNIEnv* env, jclass, jint mode, jboolean multiple,
+     const_cast<char*>("(IZ[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)Z"),
+     reinterpret_cast<void*>(nativePickEx)};
+ 
++// ---- host share ---------------------------------------------------------------
++// Files dragged onto the window or chosen from the menu bar, on their way to one
++// of the app's share targets (DocumentPickerHandler.macapkOnHostShare). The guest
++// never opens the user's originals: each file is staged under the temporary
++// directory first -- an APFS clone, or a JPEG re-encode for an image format an
++// Android app does not expect (HEIC, TIFF, RAW) -- on a background queue, so a
++// slow volume or a macOS privacy prompt cannot stall the AppKit thread.
++
++static NSURL* shareRoot() {
++    return [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
++        URLByAppendingPathComponent:@"macapk-share" isDirectory:YES];
++}
++
++/** A fresh directory for one batch. Batches older than a day are removed here:
++ *  the app has long since read (and re-encoded) what it was given. */
++static NSURL* newShareDir(NSString* prefix) {
++    NSFileManager* fm = NSFileManager.defaultManager;
++    NSURL* root = shareRoot();
++    NSDate* cutoff = [NSDate dateWithTimeIntervalSinceNow:-86400];
++    for (NSURL* old in [fm contentsOfDirectoryAtURL:root
++                            includingPropertiesForKeys:@[ NSURLContentModificationDateKey ]
++                                               options:0 error:nil]) {
++        NSDate* modified = nil;
++        [old getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
++        if (modified && [modified compare:cutoff] == NSOrderedAscending) [fm removeItemAtURL:old error:nil];
++    }
++    NSURL* dir = [root URLByAppendingPathComponent:
++        [prefix stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
++    return [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil] ? dir : nil;
++}
++
++static bool needsJpeg(NSURL* src) {
++    UTType* type = [UTType typeWithFilenameExtension:src.pathExtension];
++    if (!type || ![type conformsToType:UTTypeImage]) return false;
++    for (UTType* native in @[ UTTypeJPEG, UTTypePNG, UTTypeGIF, UTTypeWebP ]) {
++        if ([type conformsToType:native]) return false;
++    }
++    return true;
++}
++
++/** Re-encode keeping the metadata (orientation included), colours converted to
++ *  sRGB: a Display P3 photo read by a decoder that ignores profiles looks washed out. */
++static bool writeJpeg(NSURL* src, NSURL* dst) {
++    CGImageSourceRef in = CGImageSourceCreateWithURL((__bridge CFURLRef) src, nullptr);
++    if (!in) return false;
++    bool ok = false;
++    CGImageDestinationRef out = CGImageDestinationCreateWithURL(
++        (__bridge CFURLRef) dst, (__bridge CFStringRef) UTTypeJPEG.identifier, 1, nullptr);
++    if (out) {
++        NSDictionary* opts = @{
++            (__bridge id) kCGImageDestinationLossyCompressionQuality : @0.92,
++            (__bridge id) kCGImageDestinationOptimizeColorForSharing : @YES,
++        };
++        CGImageDestinationAddImageFromSource(out, in, 0, (__bridge CFDictionaryRef) opts);
++        ok = CGImageDestinationFinalize(out);
++        CFRelease(out);
++    }
++    CFRelease(in);
++    return ok;
++}
++
++static NSArray<NSURL*>* stageForShare(NSArray<NSURL*>* urls) {
++    NSFileManager* fm = NSFileManager.defaultManager;
++    NSMutableArray<NSURL*>* staged = [NSMutableArray array];
++    NSURL* dir = newShareDir(@"");
++    if (!dir) return staged;
++    for (NSURL* src in urls) {
++        const bool jpeg = needsJpeg(src);
++        NSString* name = src.lastPathComponent;
++        if (jpeg) name = [[name stringByDeletingPathExtension] stringByAppendingPathExtension:@"jpg"];
++        NSURL* dst = [dir URLByAppendingPathComponent:name];
++        if ([fm fileExistsAtPath:dst.path]) {   // same name from two folders
++            dst = [dir URLByAppendingPathComponent:
++                [NSString stringWithFormat:@"%lu-%@", (unsigned long) staged.count, name]];
++        }
++        NSError* err = nil;
++        const bool ok = jpeg ? writeJpeg(src, dst) : [fm copyItemAtURL:src toURL:dst error:&err];
++        if (ok) {
++            [staged addObject:dst];
++        } else {
++            std::fprintf(stderr, "[W] share: could not stage %s (%s)\n", src.lastPathComponent.UTF8String,
++                         err ? err.localizedDescription.UTF8String : "not a readable image");
++        }
++    }
++    return staged;
++}
++
++static jboolean nativeHostPick(JNIEnv*, jclass, jint target);
++
++static const JNINativeMethod kHostPick = {
++    const_cast<char*>("nativeHostPick"),
++    const_cast<char*>("(I)Z"),
++    reinterpret_cast<void*>(nativeHostPick)};
++
+ }  // namespace docpicker
+ 
++bool HostSharePick(int target);   // cocoa_bridge.mm: the Arquivo menu's panel
++
++static jboolean docpicker::nativeHostPick(JNIEnv*, jclass, jint target) {
++    return HostSharePick((int) target) ? JNI_TRUE : JNI_FALSE;
++}
++
++NSURL* HostShareNewDropDir() {
++    return docpicker::newShareDir(@"drop-");
++}
++
++void HostShareFiles(NSArray<NSURL*>* urls, const char* image_cls, const char* video_cls,
++                    const char* many_cls) {
++    using namespace docpicker;
++    if (!urls.count || !g_vm || !g_cls || !g_on_host_share) return;
++    const std::string image = image_cls, video = video_cls, many = many_cls;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++        NSArray<NSURL*>* staged = stageForShare(urls);
++        std::fprintf(stderr, "[I] share: %lu of %lu file(s) staged\n",
++                     (unsigned long) staged.count, (unsigned long) urls.count);
++        if (!staged.count) return;
++        // Back on the AppKit thread, which is already attached to the JVM.
++        dispatch_async(dispatch_get_main_queue(), ^{
++            JNIEnv* env = attachedEnv();
++            if (!env) return;
++            jclass str = env->FindClass("java/lang/String");
++            jobjectArray paths = env->NewObjectArray((jsize) staged.count, str, nullptr);
++            for (NSUInteger i = 0; i < staged.count; i++) {
++                jstring js = env->NewStringUTF(staged[i].path.UTF8String);
++                env->SetObjectArrayElement(paths, (jsize) i, js);
++                env->DeleteLocalRef(js);
++            }
++            jstring cls[3] = { env->NewStringUTF(image.c_str()), env->NewStringUTF(video.c_str()),
++                               env->NewStringUTF(many.c_str()) };
++            env->CallStaticVoidMethod(g_cls, g_on_host_share, paths, cls[0], cls[1], cls[2]);
++            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
++            for (int i = 0; i < 3; i++) env->DeleteLocalRef(cls[i]);
++            env->DeleteLocalRef(paths);
++            env->DeleteLocalRef(str);
++        });
++    });
++}
++
+ void RegisterDocumentPickerMethods(JNIEnv* env) {
+     using namespace docpicker;
+     jclass cls = env->FindClass("com/macapk/loader/DocumentPickerHandler");
+@@ -271,6 +410,10 @@ void RegisterDocumentPickerMethods(JNIEnv* env) {
+     g_block_reason = env->GetStaticMethodID(cls, "macapkTreeBlockReason",
+                                             "(Ljava/lang/String;)Ljava/lang/String;");
+     if (!g_block_reason) env->ExceptionClear();
++    if (env->RegisterNatives(cls, &kHostPick, 1) != JNI_OK) env->ExceptionClear();
++    g_on_host_share = env->GetStaticMethodID(cls, "macapkOnHostShare",
++        "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
++    if (!g_on_host_share) env->ExceptionClear();
+     env->GetJavaVM(&g_vm);
+     g_cls = (jclass) env->NewGlobalRef(cls);
+     env->DeleteLocalRef(cls);
+diff --git a/runtime/java/com/macapk/loader/DocumentPickerHandler.java b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+--- a/runtime/java/com/macapk/loader/DocumentPickerHandler.java
++++ b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+@@ -373,6 +373,84 @@ public final class DocumentPickerHandler {
+         }
+     }
+ 
++    // ---- host share ---------------------------------------------------------
++    // Files the user dragged onto the window or chose from the menu bar, started
++    // on one of the app's own share targets as ACTION_SEND / ACTION_SEND_MULTIPLE
++    // -- what another app's share sheet does on a device. The paths are staged
++    // copies (document_picker.mm), served through HostDocumentsProvider with a
++    // read grant, exactly like a picked document.
++
++    /** JNI, from the AppKit thread. `imageCls` / `videoCls` take one item of that
++     *  kind, `manyCls` takes several; each is an activity or alias of this app. */
++    public static void macapkOnHostShare(String[] paths, String imageCls, String videoCls,
++                                         String manyCls) {
++        ActivityHost.macapkPostOnOwner(() -> hostShare(paths, imageCls, videoCls, manyCls));
++    }
++
++    private static void hostShare(String[] paths, String imageCls, String videoCls, String manyCls) {
++        final String pkg = ActivityHost.macapkOwnPackage();
++        java.util.ArrayList<Uri> uris = new java.util.ArrayList<>();
++        boolean allImages = true, allVideos = true;
++        String firstMime = null;
++        if (paths != null) {
++            for (String path : paths) {
++                File f = path == null ? null : new File(path);
++                if (f == null || !f.isFile()) continue;
++                String mime = HostDocumentsProvider.mimeOf(f);
++                if (!isMediaMime(mime)) continue;
++                if (firstMime == null) firstMime = mime;
++                allImages &= mime.startsWith("image/");
++                allVideos &= mime.startsWith("video/");
++                uris.add(HostDocumentsProvider.mint(f, false));
++            }
++        }
++        if (pkg == null || uris.isEmpty()) {
++            NativeLog.w(TAG, "share: nothing to send (" + (paths == null ? 0 : paths.length)
++                    + " path(s), none an image or a video)");
++            return;
++        }
++        final boolean many = uris.size() > 1;
++        final String cls = many ? manyCls : allVideos ? videoCls : imageCls;
++        // The type a share sheet sends: the item's own for one, the common
++        // family for several, any for a mix.
++        final String type = !many ? firstMime : allImages ? "image/*" : allVideos ? "video/*" : "*/*";
++        Intent send = new Intent(many ? Intent.ACTION_SEND_MULTIPLE : Intent.ACTION_SEND);
++        send.setComponent(new android.content.ComponentName(pkg, cls));
++        send.setType(type);
++        if (many) send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
++        else send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
++        // Intent.migrateExtraStreamToClipData: the streams are also the ClipData,
++        // which is what carries the grant.
++        ClipData clip = new ClipData(null, new String[] { type }, new ClipData.Item(uris.get(0)));
++        for (int i = 1; i < uris.size(); i++) clip.addItem(new ClipData.Item(uris.get(i)));
++        send.setClipData(clip);
++        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
++        MacApkUriGrants.grantFromIntent(send);
++        NativeLog.i(TAG, "share: " + uris.size() + " item(s) " + type + " -> " + cls);
++        try {
++            ActivityHost.macapkNoteReferrer(send, SHARE_SENDER);
++            ActivityHost.macapkDeliverCrossApp(send, SHARE_SENDER);
++        } catch (Throwable t) {
++            NativeLog.w(TAG, "share: start of " + cls + " threw: " + t);
++        }
++    }
++
++    /** The host's file panel for share target {@code target} (the menu bar's
++     *  table), whose choice comes back through macapkOnHostShare. False when
++     *  this runtime has no such panel, so the caller carries on as before. */
++    public static boolean macapkHostPick(int target) {
++        try {
++            return nativeHostPick(target);
++        } catch (UnsatisfiedLinkError olderNativeSide) {
++            return false;
++        }
++    }
++
++    private static native boolean nativeHostPick(int target);
++
++    /** Who a device would name as the sender of a file share: DocumentsUI. */
++    private static final String SHARE_SENDER = "com.android.documentsui";
++
+     /** The macOS panel (runtime/src/document_picker.mm), bound softly: a runtime
+      *  whose native side lacks it throws UnsatisfiedLinkError, which handle()
+      *  turns into a cancel. Asynchronous: returns once the panel is scheduled;
+diff --git a/runtime/java/com/macapk/loader/ActivityHost.java b/runtime/java/com/macapk/loader/ActivityHost.java
+--- a/runtime/java/com/macapk/loader/ActivityHost.java
++++ b/runtime/java/com/macapk/loader/ActivityHost.java
+@@ -1032,6 +1044,11 @@ public final class ActivityHost {
+         return null;
+     }
+ 
++    /** This app's package name, or null before the Application exists. */
++    static String macapkOwnPackage() {
++        return app != null ? app.getPackageName() : null;
++    }
++
+     /** Post onto the owner (main) looper -- IntentInbox's warm drain. */
+     static void macapkPostOnOwner(Runnable r) {
+         ownerHandler().post(r);
+diff --git a/runtime/java/com/macapk/loader/MacApkPackageManager.java b/runtime/java/com/macapk/loader/MacApkPackageManager.java
+--- a/runtime/java/com/macapk/loader/MacApkPackageManager.java
++++ b/runtime/java/com/macapk/loader/MacApkPackageManager.java
+@@ -5122,6 +5122,33 @@ public final class MacApkPackageManager extends PackageManager {
+             }
+             return info;
+         }
++        // The documents the host serves (HostDocumentsProvider) carry AOSP's
++        // ExternalStorageProvider authority, and on a device that provider is
++        // another package under another uid (frameworks/base
++        // packages/ExternalStorageProvider/AndroidManifest.xml: exported,
++        // grantUriPermissions, guarded by MANAGE_DOCUMENTS). A share target tells
++        // a foreign stream from one of its own files by exactly that: it refuses
++        // a content:// URI whose provider resolves to nothing, or to its own uid.
++        if (HostDocumentsProvider.AUTHORITY.equals(authority)) {
++            ApplicationInfo owner = new ApplicationInfo();
++            owner.packageName = "com.android.externalstorage";
++            owner.flags = ApplicationInfo.FLAG_SYSTEM;
++            owner.enabled = true;
++            owner.uid = android.os.Process.FIRST_APPLICATION_UID;
++            if (owner.uid == android.os.Process.myUid()) owner.uid++;
++            ProviderInfo info = new ProviderInfo();
++            info.applicationInfo = owner;
++            info.packageName = owner.packageName;
++            info.processName = owner.packageName;
++            info.name = "com.android.externalstorage.ExternalStorageProvider";
++            info.authority = authority;
++            info.enabled = true;
++            info.exported = true;
++            info.grantUriPermissions = true;
++            info.readPermission = "android.permission.MANAGE_DOCUMENTS";
++            info.writePermission = "android.permission.MANAGE_DOCUMENTS";
++            return info;
++        }
+         return null;
+     }
+ 
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -4281,12 +4282,48 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+                 + " listener=" + (onClickListener == null ? "NULL"
+                     : onClickListener.getClass().getName()));
+         }
++        if (MACAPK_HOST_CLICKS != null && macapkHostClick()) return true;
+         if (onClickListener != null) {
+             onClickListener.onClick(this);
+             return true;
+         }
+         return false;
+     }
++
++    // ---- host clicks (MACAPK_HOST_CLICK) -----------------------------------------
++    // "id/<entry name>=<share target>[;...]": a click on the view with that
++    // resource name opens the host's file panel for that share target (see
++    // DocumentPickerHandler.macapkHostPick) instead of running the app's
++    // listener. For an app's own "create" button when the screen behind it is
++    // one this runtime does not show. Unset (the default): null, no cost.
++    private static final java.util.Map<String, Integer> MACAPK_HOST_CLICKS =
++        macapkParseHostClicks(System.getenv("MACAPK_HOST_CLICK"));
++
++    private static java.util.Map<String, Integer> macapkParseHostClicks(String spec) {
++        if (spec == null || spec.isEmpty()) return null;
++        java.util.HashMap<String, Integer> out = new java.util.HashMap<>();
++        for (String rule : spec.split(";")) {
++            int eq = rule.indexOf('=');
++            if (eq <= 0 || !rule.startsWith("id/")) continue;
++            try {
++                out.put(rule.substring(3, eq).trim(), Integer.parseInt(rule.substring(eq + 1).trim()));
++            } catch (NumberFormatException ignored) { }
++        }
++        return out.isEmpty() ? null : out;
++    }
++
++    private boolean macapkHostClick() {
++        final int id = getId();
++        if (id == NO_ID || (id >>> 24) == 0) return false;
++        final Integer target;
++        try {
++            target = MACAPK_HOST_CLICKS.get(getResources().getResourceEntryName(id));
++        } catch (Throwable notAResource) {
++            return false;
++        }
++        return target != null && com.macapk.loader.DocumentPickerHandler.macapkHostPick(target);
++    }
++
+     public boolean performLongClick() {
+         if (onLongClickListener != null) {
+             return onLongClickListener.onLongClick(this);
+diff --git a/runtime/macapk-runtime-info.plist b/runtime/macapk-runtime-info.plist
+--- a/runtime/macapk-runtime-info.plist
++++ b/runtime/macapk-runtime-info.plist
+@@ -2,17 +2,24 @@
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0">
+ <dict>
+-  <!-- EMBEDDED into macapk-runtime's __TEXT,__info_plist at link time.
+-       See runtime/CMakeLists.txt for why this cannot live in a bundle plist. -->
+-  <key>CFBundleIdentifier</key><string>org.macapk.runtime</string>
+-  <key>CFBundleName</key><string>Mac.apk</string>
++  <!-- EMBEDDED into the runtime's __TEXT,__info_plist at link time.
++       This is the name macOS shows in the menu bar and in every permission
++       prompt for the running process: it is the PRODUCT name, Instamac. -->
++  <key>CFBundleIdentifier</key><string>dev.instamac.runtime</string>
++  <key>CFBundleName</key><string>Instamac</string>
++  <key>CFBundleDisplayName</key><string>Instamac</string>
+   <key>CFBundleShortVersionString</key><string>1.0</string>
+-  <key>NSCameraUsageDescription</key><string>An Android app running in Mac.apk is requesting camera access.</string>
+-  <key>NSMicrophoneUsageDescription</key><string>An Android app running in Mac.apk is requesting microphone access.</string>
+-  <key>NSLocationWhenInUseUsageDescription</key><string>An Android app running in Mac.apk is requesting your location.</string>
+-  <key>NSBluetoothAlwaysUsageDescription</key><string>An Android app running in Mac.apk is requesting Bluetooth access.</string>
+-  <key>NSLocalNetworkUsageDescription</key><string>An Android app running in Mac.apk is requesting local network access.</string>
+-  <key>NSPhotoLibraryUsageDescription</key><string>An Android app running in Mac.apk is requesting photo library access.</string>
+-  <key>NSSpeechRecognitionUsageDescription</key><string>An Android app running in Mac.apk is requesting speech recognition.</string>
++  <!-- The runtime ships no .lproj: without these keys every panel and alert the
++       system draws for the process (the file panel, its sidebar) stays in English. -->
++  <key>CFBundleDevelopmentRegion</key><string>pt_BR</string>
++  <key>CFBundleLocalizations</key><array><string>pt_BR</string><string>pt</string><string>en</string></array>
++  <key>CFBundleAllowMixedLocalizations</key><true/>
++  <key>NSCameraUsageDescription</key><string>O Instagram rodando no Instamac está pedindo acesso à câmera.</string>
++  <key>NSMicrophoneUsageDescription</key><string>O Instagram rodando no Instamac está pedindo acesso ao microfone.</string>
++  <key>NSLocationWhenInUseUsageDescription</key><string>O Instagram rodando no Instamac está pedindo sua localização.</string>
++  <key>NSBluetoothAlwaysUsageDescription</key><string>O Instagram rodando no Instamac está pedindo acesso ao Bluetooth.</string>
++  <key>NSLocalNetworkUsageDescription</key><string>O Instagram rodando no Instamac está pedindo acesso à rede local.</string>
++  <key>NSPhotoLibraryUsageDescription</key><string>O Instagram rodando no Instamac está pedindo acesso à fototeca.</string>
++  <key>NSSpeechRecognitionUsageDescription</key><string>O Instagram rodando no Instamac está pedindo reconhecimento de fala.</string>
+ </dict>
+ </plist>

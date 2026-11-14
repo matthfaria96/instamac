@@ -1,0 +1,339 @@
+framework fidelity: covariant LinearLayout params, addView with the inflated params, and what a tablet-sized Instagram needed
+
+LinearLayout.generateLayoutParams(AttributeSet) returns LinearLayout.LayoutParams,
+as in AOSP (TableLayout / TableRow / RadioGroup follow with their own). An app
+subclass compiled against the SDK calls super by the descriptor that returns
+LinearLayout$LayoutParams; with only the ViewGroup$LayoutParams one that was a
+NoSuchMethodError -- Instagram 455: IgLinearLayout.generateLayoutParams, 377
+times per launch, each falling back to parameters the app's override never saw.
+After: 0.
+
+LayoutInflater hands the generated params to addView(view, params) with the view
+carrying none, as rInflate does, instead of setLayoutParams + addView(view). A
+parent that re-parents its child sees the difference: SlidingPaneLayout wraps
+the detail pane with `new TouchBlocker(child)` -> addView(child), which on a
+device gives a params-less child MATCH_PARENT and here inherited the pane's own
+layout_width (300dp). Measured on Instagram's tablet inbox: the "Suas mensagens"
+panel was 300px wide at the left edge of an 816px pane; after, it is centred.
+MACAPK_INFLATE_ADDVIEW_PARAMS=0 restores the old call.
+
+ViewStub, APP QUIRK (Instagram): when the large-screen rail's stub
+(ls_vertical_nav_bar_stub) inflates, the phone tab bar and its 1px separator
+(tab_bar, tab_bar_shadow) go GONE. They stay in the main layout on a large
+screen, the app's own updater returns early while the rail is up, and the empty
+bar's separator was drawn across the content 48px above the bottom of the
+window. What removes it on a device was not found (MACAPK_TRACE_SETVIS on both
+ids: no call besides the inflater's background). MACAPK_QUIRK_RAIL_TABBAR=0
+turns the quirk off.
+
+VMRuntime.setTargetHeapUtilization / getTargetHeapUtilization exist (a
+NoSuchMethodError once per launch). View: MACAPK_TRACE_SETVIS=<id> logs every
+setVisibility / setAlpha / setTranslationY / setBackground* on that view and who
+asked.
+
+diff --git a/runtime/java/android/widget/LinearLayout.java b/runtime/java/android/widget/LinearLayout.java
+--- a/runtime/java/android/widget/LinearLayout.java
++++ b/runtime/java/android/widget/LinearLayout.java
+@@ -1284,9 +1284,17 @@ public class LinearLayout extends ViewGroup {
+      *
+      *  BISECT GATE (default ON): MACAPK_LL_GENLP_ATTRS=0 restores the inherited base
+      *  answer here AND the unseeded 0x0 LayoutParams(Context, AttributeSet). */
++    //
++    // COVARIANT, as in AOSP (`public LayoutParams generateLayoutParams`): an app
++    // subclass compiled against the SDK calls super with the descriptor that
++    // returns LinearLayout$LayoutParams, and the JVM links by descriptor. With
++    // only the ViewGroup$LayoutParams one here that call was a NoSuchMethodError
++    // (Instagram 455: IgLinearLayout.generateLayoutParams, 377 times per launch),
++    // and the inflater fell back to parameters the app's own override never saw.
++    // javac keeps the old descriptor as a bridge.
+     @Override
+-    public ViewGroup.LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
+-        if (!LayoutParams.MACAPK_GENLP_ATTRS) return super.generateLayoutParams(attrs);
++    public LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
++        if (!LayoutParams.MACAPK_GENLP_ATTRS) return generateLayoutParams(super.generateLayoutParams(attrs));
+         return new LayoutParams(getContext(), attrs);
+     }
+ 
+diff --git a/runtime/java/android/widget/TableLayout.java b/runtime/java/android/widget/TableLayout.java
+--- a/runtime/java/android/widget/TableLayout.java
++++ b/runtime/java/android/widget/TableLayout.java
+@@ -381,7 +381,7 @@ public class TableLayout extends LinearLayout {
+      *  generateDefaultLayoutParams: rows carry TableLayout.LayoutParams (width
+      *  always MATCH_PARENT). See TableRow for why this matters since v1.0.1643. */
+     @Override
+-    public android.view.ViewGroup.LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
++    public TableLayout.LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
+         return new TableLayout.LayoutParams(getContext(), attrs);
+     }
+     @Override
+diff --git a/runtime/java/android/widget/TableRow.java b/runtime/java/android/widget/TableRow.java
+--- a/runtime/java/android/widget/TableRow.java
++++ b/runtime/java/android/widget/TableRow.java
+@@ -94,7 +94,7 @@ public class TableRow extends LinearLayout {
+      *  v1.0.1643 checkLayoutParams never converts them (a conversion through
+      *  the ViewGroup.LayoutParams copy constructor drops weight and margins). */
+     @Override
+-    public android.view.ViewGroup.LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
++    public TableRow.LayoutParams generateLayoutParams(android.util.AttributeSet attrs) {
+         return new TableRow.LayoutParams(getContext(), attrs);
+     }
+     @Override
+diff --git a/runtime/java/android/widget/RadioGroup.java b/runtime/java/android/widget/RadioGroup.java
+--- a/runtime/java/android/widget/RadioGroup.java
++++ b/runtime/java/android/widget/RadioGroup.java
+@@ -140,7 +140,7 @@ public class RadioGroup extends LinearLayout {
+     /** AOSP RadioGroup.generateLayoutParams(AttributeSet) / generateDefaultLayoutParams
+      *  (android14 :260-276). See TableRow for why this matters since v1.0.1643. */
+     @Override
+-    public android.view.ViewGroup.LayoutParams generateLayoutParams(AttributeSet attrs) {
++    public RadioGroup.LayoutParams generateLayoutParams(AttributeSet attrs) {
+         return new RadioGroup.LayoutParams(getContext(), attrs);
+     }
+     @Override
+diff --git a/runtime/java/android/view/LayoutInflater.java b/runtime/java/android/view/LayoutInflater.java
+--- a/runtime/java/android/view/LayoutInflater.java
++++ b/runtime/java/android/view/LayoutInflater.java
+@@ -931,7 +931,7 @@ public class LayoutInflater {
+         if (root != null && attachToRoot
+             && inflated != root
+             && inflated.getParent() == null) {
+-            root.addView(inflated);
++            macapkAddInflated(root, inflated);
+         }
+         return inflated;
+     }
+@@ -1057,7 +1057,7 @@ public class LayoutInflater {
+                     View childView = inflateElement(child, parent);
+                     if (childView != null && childView != parent
+                         && childView.getParent() == null && parent != null) {
+-                        parent.addView(childView);
++                        macapkAddInflated(parent, childView);
+                         NativeLog.i(TAG, "merge: addView " + childView.getClass().getSimpleName()
+                           + " id=0x" + Integer.toHexString(childView.getId()) + " to " + parent.getClass().getSimpleName()
+                           + "(now " + parent.getChildCount() + " children)");
+@@ -1388,7 +1388,7 @@ public class LayoutInflater {
+                     View childView = inflateElement(child, vg);
+                     if (childView != null && childView != vg
+                                             && childView.getParent() == null) {
+-                        vg.addView(childView);
++                        macapkAddInflated(vg, childView);
+                     }
+                 }
+             }
+@@ -1613,6 +1613,46 @@ public class LayoutInflater {
+         return c;
+     }
+ 
++    private static final boolean GENLP_APP_FINAL =
++        !"0".equals(System.getenv("MACAPK_GENLP_APP_FINAL"));
++    private static final java.util.Map<Class<?>, Boolean> sAppOverridesGenerateLp =
++        new java.util.concurrent.ConcurrentHashMap<>();
++
++    /** AOSP rInflate ends in `viewGroup.addView(view, params)`: the params it
++     *  generated, and a view that has none of its own yet. Ours put them on the
++     *  view first (setLayoutParams in inflateElement) and called addView(view).
++     *  To a plain ViewGroup that is the same call; to a parent that re-parents
++     *  the child it is not. SlidingPaneLayout wraps its detail pane with
++     *  `new TouchBlocker(child)` -> FrameLayout.addView(child), which on a device
++     *  finds a child without params and gives it MATCH_PARENT, and here found the
++     *  pane's own (layout_width 300dp) and pinned the pane's content to 300px
++     *  inside a pane 816px wide (measured: Instagram's tablet inbox, the "Suas
++     *  mensagens" panel drawn at the pane's left edge instead of centred).
++     *  MACAPK_INFLATE_ADDVIEW_PARAMS=0 restores addView(view). */
++    private static final boolean MACAPK_INFLATE_ADDVIEW_PARAMS =
++        !"0".equals(System.getenv("MACAPK_INFLATE_ADDVIEW_PARAMS"));
++    private static void macapkAddInflated(ViewGroup parent, View child) {
++        final ViewGroup.LayoutParams lp = MACAPK_INFLATE_ADDVIEW_PARAMS ? child.getLayoutParams() : null;
++        if (lp == null) { parent.addView(child); return; }
++        child.macapkForgetLayoutParams();
++        parent.addView(child, lp);
++    }
++
++    /** True when `parent`'s generateLayoutParams(AttributeSet) is declared by a
++     *  class the APK loaded (not by this framework). */
++    private static boolean macapkAppOverridesGenerateLp(ViewGroup parent) {
++        return sAppOverridesGenerateLp.computeIfAbsent(parent.getClass(), c -> {
++            try {
++                java.lang.reflect.Method m =
++                    c.getMethod("generateLayoutParams", android.util.AttributeSet.class);
++                return m.getDeclaringClass().getClassLoader()
++                    != LayoutInflater.class.getClassLoader();
++            } catch (Throwable t) {
++                return false;
++            }
++        });
++    }
++
+     private ViewGroup.LayoutParams buildLayoutParams(ViewGroup parent, Element elem) {
+         if (parent == null) return null;
+         // Diagnostic: log the parent class + child tag so we can verify
+diff --git a/runtime/java/android/view/ViewStub.java b/runtime/java/android/view/ViewStub.java
+--- a/runtime/java/android/view/ViewStub.java
++++ b/runtime/java/android/view/ViewStub.java
+@@ -228,6 +228,7 @@ public final class ViewStub extends View {
+ 
+         mInflatedViewRef = new WeakReference<View>(view);
+ 
++        macapkRailReplacesTabBar(this, view);
+         if (mInflateListener != null) {
+             mInflateListener.onInflate(this, view);
+         }
+@@ -235,6 +236,39 @@ public final class ViewStub extends View {
+         return view;
+     }
+ 
++    /** APP QUIRK, Instagram: the large-screen rail replaces the bottom tab bar.
++     *
++     *  Instagram 455's main layout keeps its phone tab bar in the tree on a large
++     *  screen (`tab_bar`, 48dp and childless there, and the 1px `tab_bar_shadow`
++     *  above it), where the navigation is the rail inflated from
++     *  `ls_vertical_nav_bar_stub`. Its own tab-bar updater
++     *  (InstagramMainActivity.A0U) returns early while the rail is up and nothing
++     *  else touches either view (MACAPK_TRACE_SETVIS on both ids: the inflater's
++     *  background and no other call), so the empty bar's separator stayed drawn
++     *  across the content, 48px above the bottom of the tablet window. What takes
++     *  it away on a device was not found. Until it is, the two views get the
++     *  state A0U(8) gives them -- GONE -- when the rail's stub inflates.
++     *  MACAPK_QUIRK_RAIL_TABBAR=0 turns this off. */
++    private static void macapkRailReplacesTabBar(ViewStub stub, View inflated) {
++        if (inflated == null || "0".equals(System.getenv("MACAPK_QUIRK_RAIL_TABBAR"))) return;
++        try {
++            final android.content.res.Resources r = stub.getResources();
++            final int id = stub.getId();
++            if (id == View.NO_ID || r == null
++                    || !"ls_vertical_nav_bar_stub".equals(r.getResourceEntryName(id))) return;
++            final String pkg = r.getResourcePackageName(id);
++            final View root = inflated.getRootView();
++            for (String name : new String[]{ "tab_bar_shadow", "tab_bar" }) {
++                final int vid = r.getIdentifier(name, "id", pkg);
++                final View v = (vid != 0 && root != null) ? root.findViewById(vid) : null;
++                if (v != null) v.setVisibility(View.GONE);
++            }
++            com.macapk.loader.NativeLog.i("Mac.apk.ViewStub", "rail inflated: bottom tab bar and its separator set GONE");
++        } catch (Throwable ignored) {
++            // an id this app does not have: not the app this is for
++        }
++    }
++
+     public void setOnInflateListener(OnInflateListener inflateListener) {
+         mInflateListener = inflateListener;
+     }
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1550,7 +1550,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+     public float getTranslationX() { return transX; }
+     public float getTranslationY() { return transY; }
+     public void  setTranslationX(float t) { if (transX != t) { transX = t; invalidate(); } }
+-    public void  setTranslationY(float t) { if (transY != t) { transY = t; invalidate(); } }
++    public void  setTranslationY(float t) { if (MACAPK_TRACE_SETVIS_ID != 0 && getId() == MACAPK_TRACE_SETVIS_ID) macapkTraceSet("translationY", t); if (transY != t) { transY = t; invalidate(); } }
+     // Tier 3 M12: real elevation / translationZ storage (were no-op stubs).
+     // getZ() = elevation + translationZ (AOSP View.getZ). A non-zero Z makes
+     // ViewGroup.dispatchDraw cast an outline-shaped soft shadow UNDER the view
+@@ -4628,6 +4628,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+ 
+     public void setVisibility(int rawVisibility) {
+         final int v = rawVisibility & VISIBILITY_MASK;
++        if (MACAPK_TRACE_SETVIS_ID != 0 && getId() == MACAPK_TRACE_SETVIS_ID) macapkTraceSetVisibility(v);
+         final int macapkOldVisibility = this.visibility;
+         // Tier 3 M6: a visibility change alters layout/draw, so request a
+         // traversal (AOSP View.setVisibility -> requestLayout + invalidate when
+@@ -4821,7 +4822,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+     // traversal and the new alpha actually renders (AOSP setAlpha ->
+     // mRenderNode.setAlpha + invalidateViewProperty/invalidate). invalidate()
+     // is itself flag-gated (no-op flag-off), so the shipped build is unchanged.
+-    public void  setAlpha(float a)      { if (alpha != a) { alpha = a; invalidate(); } }
++    public void  setAlpha(float a)      { if (MACAPK_TRACE_SETVIS_ID != 0 && getId() == MACAPK_TRACE_SETVIS_ID) macapkTraceSet("alpha", a); if (alpha != a) { alpha = a; invalidate(); } }
+ 
+     public ViewParent getParent()       { return parent; }
+     public void  setParent(ViewParent p){
+@@ -4835,6 +4836,51 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         return lp.width + "x" + lp.height;
+     }
+     public ViewGroup.LayoutParams getLayoutParams() { return layoutParams; }
++    /** The inflater hands the params to addView(view, params) as AOSP does, with
++     *  the view carrying none (LayoutInflater.macapkAddInflated). */
++    final void macapkForgetLayoutParams() { layoutParams = null; }
++    /** MACAPK_TRACE_SETVIS=<id, 0x7f...> (diagnostic, default off): every
++     *  setVisibility / setAlpha / setTranslationY / setBackground* on the view
++     *  with that id -- the value and who asked. */
++    private static final int MACAPK_TRACE_SETVIS_ID = macapkParseTraceId(System.getenv("MACAPK_TRACE_SETVIS"));
++    private static int macapkParseTraceId(String v) {
++        try { return (v == null || v.isEmpty()) ? 0 : Long.decode(v).intValue(); }
++        catch (NumberFormatException e) { return 0; }
++    }
++    private void macapkTraceSetVisibility(int v) { macapkTraceSet("visibility", v); }
++    private void macapkTraceSet(String what, float v) {
++        final StringBuilder sb = new StringBuilder("set " + what + "=" + v + " on id=0x" + Integer.toHexString(getId()));
++        int shown = 0;
++        for (StackTraceElement f : new Throwable().getStackTrace()) {
++            if (f.getClassName().equals("android.view.View")) continue;
++            sb.append(" <- ").append(f.getClassName()).append('.').append(f.getMethodName());
++            if (++shown == 7) break;
++        }
++        com.macapk.loader.NativeLog.i("Mac.apk.View", sb.toString());
++    }
++    /** MACAPK_TRACE_SETLP=<simple class name> (diagnostic, default off): every
++     *  setLayoutParams on a view of that class -- the params' class, width,
++     *  height and weight, and who called -- 60 lines max. A view's params in a
++     *  tree dump say what they ARE; this says who made them so. */
++    private static final String MACAPK_TRACE_SETLP = System.getenv("MACAPK_TRACE_SETLP");
++    private static final java.util.concurrent.atomic.AtomicInteger sTraceSetLpN =
++        new java.util.concurrent.atomic.AtomicInteger();
++    private void macapkTraceSetLp(ViewGroup.LayoutParams lp) {
++        if (MACAPK_TRACE_SETLP == null || !MACAPK_TRACE_SETLP.equals(getClass().getSimpleName())
++                || sTraceSetLpN.incrementAndGet() > 60) return;
++        StringBuilder sb = new StringBuilder();
++        sb.append(getClass().getSimpleName()).append('@')
++          .append(Integer.toHexString(System.identityHashCode(this)))
++          .append(" lp=").append(lp.getClass().getName())
++          .append(' ').append(lp.width).append('x').append(lp.height);
++        if (lp instanceof android.widget.LinearLayout.LayoutParams)
++            sb.append(" weight=").append(((android.widget.LinearLayout.LayoutParams) lp).weight);
++        sb.append(" parent=").append(getParent() == null ? "null" : getParent().getClass().getSimpleName());
++        StackTraceElement[] st = new Throwable().getStackTrace();
++        for (int i = 2; i < st.length && i < 12; i++) sb.append("\n    at ").append(st[i]);
++        com.macapk.loader.NativeLog.i("Mac.apk.SetLp", sb.toString());
++    }
++
+     public void setLayoutParams(ViewGroup.LayoutParams lp) {
+         // AOSP :18175 opens with
+         //     if (params == null) throw new NullPointerException("Layout parameters cannot be null");
+@@ -6465,6 +6512,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+     private static final boolean sBgNullClearsColor =
+         !"0".equals(System.getenv("MACAPK_BG_NULL_CLEARS_COLOR"));
+     public void setBackgroundColor(int color) {
++        if (MACAPK_TRACE_SETVIS_ID != 0 && getId() == MACAPK_TRACE_SETVIS_ID) macapkTraceSet("backgroundColor", color);
+         this.backgroundColor = color;
+         this.macapkBackgroundExplicitlySet = true;
+         if (macapkColorBackground != null) macapkColorBackground.setColor(color);
+@@ -6500,6 +6548,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *  opaque clear when no GL pipeline is below. */
+     public int getBackgroundColor() { return backgroundColor; }
+     public void setBackgroundDrawable(android.graphics.drawable.Drawable d) {
++        if (MACAPK_TRACE_SETVIS_ID != 0 && getId() == MACAPK_TRACE_SETVIS_ID) macapkTraceSet("background " + d, 0f);
+         // AOSP's SECOND statement, and it is load-bearing (View.java:23662-23667,
+         // android11-release, fetched 2026-08-09):
+         //     public void setBackgroundDrawable(Drawable background) {
+diff --git a/runtime/java/dalvik/system/VMRuntime.java b/runtime/java/dalvik/system/VMRuntime.java
+--- a/runtime/java/dalvik/system/VMRuntime.java
++++ b/runtime/java/dalvik/system/VMRuntime.java
+@@ -78,6 +78,18 @@ public final class VMRuntime {
+     /** AOSP: the primary ABI's instruction set ("arm64-v8a" / "armeabi-v7a").
+      *  Honest for Stage 6; overridable via "macapk.vm.instructionSet" for the
+      *  arm32-lifter path. */
++    /** AOSP VMRuntime.setTargetHeapUtilization / getTargetHeapUtilization: a GC
++     *  tuning hint (ART's heap growth target). The JVM sizes its own heap; the
++     *  value is kept so the getter answers what was set, and the old one is
++     *  returned as on a device. Instagram 455 calls the setter once at start. */
++    private float macapkTargetHeapUtilization = 0.75f;
++    public float getTargetHeapUtilization() { return macapkTargetHeapUtilization; }
++    public float setTargetHeapUtilization(float newTarget) {
++        final float old = macapkTargetHeapUtilization;
++        if (newTarget > 0f && newTarget < 1f) macapkTargetHeapUtilization = newTarget;
++        return old;
++    }
++
+     public String vmInstructionSet() {
+         String p = System.getProperty("macapk.vm.instructionSet");
+         if (p != null && !p.isEmpty()) return p;

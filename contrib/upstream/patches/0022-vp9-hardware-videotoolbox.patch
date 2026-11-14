@@ -1,0 +1,303 @@
+VP9 decodes in hardware: VideoToolbox's VP9 decoder has to be registered first
+
+video_toolbox.mm's header records that VP9 comes back -12906
+(kVTCouldNotFindVideoDecoderErr) "even when fed a real config record" and
+concludes the host has no VP9 decoder, which is why video_vp9_decode.mm is
+software-only libvpx. The decoder is a supplemental one: VideoToolbox offers it
+only after VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9).
+Measured standalone on an Apple M4, macOS 27.2, with a vpcC record:
+VTIsHardwareDecodeSupported = false and -12906 before the call; true, noErr and
+a hardware session after it. (AV1 answers the same way after its own call; not
+wired here.)
+
+macapk_vtb_open_vp9 registers the decoder once and opens a session from the
+stream's own parameters. video_vp9_decode.mm reads them from each keyframe's
+uncompressed header (Android gives a VP9 codec no csd), opens or reopens the
+session when they change, and forwards decode / poll / flush / close to it.
+libvpx stays as the fallback: no hardware session, or MACAPK_VP9_HW=0. Both
+engines hand out 32BGRA CVPixelBuffers, so nothing downstream changes.
+
+Measured on Instagram 455, Reels (960-wide VP9 profile 0): "hw=YES
+(VideoToolbox)" on every stream, 0 decode errors, picture correct; the thread
+that ran libvpx (ExoPlayer:Playback) went from 8.1% to 1.1% of a core. The
+process total did not move outside its noise (43-68% -> 42-54%): the Android main
+thread, repainting the view tree in Java2D for every video frame, is 26-41% of a
+core and is the cost that remains.
+
+diff --git a/runtime/src/video_vp9_decode.mm b/runtime/src/video_vp9_decode.mm
+--- a/runtime/src/video_vp9_decode.mm
++++ b/runtime/src/video_vp9_decode.mm
+@@ -253,6 +253,12 @@ void I420ToBgraInto(const vpx_image_t* img, CVPixelBufferRef pb) {
+ struct Vp9Decoder {
+     vpx_codec_ctx_t ctx;
+     bool ctxOk = false;
++    // The hardware route (see "VideoToolbox first" below): the VideoToolbox
++    // session every call is forwarded to while it exists, the stream parameters
++    // it was opened for, and whether opening one is still worth trying.
++    void* vt = nullptr;
++    bool vtAllowed = true;
++    int vtProfile = -1, vtBitDepth = 0;
+     int width = 0, height = 0;   // last known DISPLAY dims; 0 until the first keyframe decodes
+ 
+     // Same reasoning as video_vp8_decode.mm's Vp8Decoder: vpx_codec_decode()
+@@ -287,6 +293,119 @@ bool InitCtx(Vp9Decoder* d, int widthHint, int heightHint) {
+ // video_vp8_decode.mm's macapk_vp8_* naming and signatures.
+ // ---------------------------------------------------------------------------
+ 
++// ---- VideoToolbox first ---------------------------------------------------------
++// Apple Silicon decodes VP9 in hardware, through a decoder VideoToolbox only
++// offers once it is registered (video_toolbox.mm macapk_vtb_open_vp9). libvpx
++// is then the fallback: a host without that decoder, a session that is not
++// hardware, MACAPK_VP9_HW=0. The VideoToolbox session needs the frame's real
++// parameters, and Android gives a VP9 codec none (csd-0 is optional), so they
++// are read from each keyframe's uncompressed header and the session is
++// (re)opened when they change -- an adaptive stream switches resolution on a
++// keyframe. Both engines hand out 32BGRA CVPixelBuffers, so the frame-level
++// functions (render, release, copy) do not care which one produced a frame.
++extern "C" {
++void* macapk_vtb_open_vp9(int width, int height, int profile, int bitDepth,
++                          int subsamplingX, int subsamplingY, int fullRange,
++                          int colorSpace, int* outHw);
++int  macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int eos);
++int  macapk_vtb_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags);
++void macapk_vtb_flush(void* h);
++void macapk_vtb_close(void* h);
++}
++
++namespace {
++
++struct Vp9KeyframeInfo {
++    int profile = 0, bitDepth = 8, colorSpace = 0, fullRange = 0;
++    int subsamplingX = 1, subsamplingY = 1;
++    int width = 0, height = 0;
++};
++
++// VP9 bitstream spec 6.2 (uncompressed_header): true when `au` starts with a
++// keyframe, with what its header says. In a superframe the first frame's
++// header is at the start of the buffer.
++bool ParseVp9Keyframe(const uint8_t* au, int auLen, Vp9KeyframeInfo* out) {
++    int bit = 0;
++    const int bits = auLen * 8;
++    auto read = [&](int n) -> int {
++        int v = 0;
++        for (int i = 0; i < n; i++, bit++) {
++            if (bit >= bits) return -1;
++            v = (v << 1) | ((au[bit >> 3] >> (7 - (bit & 7))) & 1);
++        }
++        return v;
++    };
++    if (read(2) != 2) return false;                         // frame_marker
++    const int profileLow = read(1), profileHigh = read(1);
++    out->profile = (profileHigh << 1) | profileLow;
++    if (out->profile == 3 && read(1) != 0) return false;    // reserved_zero
++    if (read(1) != 0) return false;                         // show_existing_frame
++    if (read(1) != 0) return false;                         // frame_type: 0 = KEY_FRAME
++    read(1);                                                // show_frame
++    read(1);                                                // error_resilient_mode
++    if (read(8) != 0x49 || read(8) != 0x83 || read(8) != 0x42) return false;   // frame_sync_code
++    out->bitDepth = 8;
++    if (out->profile >= 2) out->bitDepth = read(1) ? 12 : 10;
++    out->colorSpace = read(3);
++    if (out->colorSpace != 7) {                             // not CS_RGB
++        out->fullRange = read(1);
++        if (out->profile == 1 || out->profile == 3) {
++            out->subsamplingX = read(1);
++            out->subsamplingY = read(1);
++            read(1);                                        // reserved_zero
++        }
++    } else {
++        out->fullRange = 1;
++        out->subsamplingX = out->subsamplingY = 0;
++        if (out->profile == 1 || out->profile == 3) read(1);
++    }
++    const int w = read(16), h = read(16);                   // frame_width/height_minus_1
++    if (w < 0 || h < 0) return false;
++    out->width = w + 1;
++    out->height = h + 1;
++    return true;
++}
++
++bool Vp9HardwareWanted() {
++    static const bool wanted = [] {
++        const char* e = std::getenv("MACAPK_VP9_HW");
++        return !(e && e[0] == '0');
++    }();
++    return wanted;
++}
++
++// Open (or reopen) the VideoToolbox session when `au` is a keyframe whose
++// parameters are not the current session's. A refusal ends the attempts.
++void Vp9FollowKeyframe(Vp9Decoder* d, const uint8_t* au, int auLen) {
++    Vp9KeyframeInfo k;
++    if (!ParseVp9Keyframe(au, auLen, &k)) return;
++    if (d->vt && k.width == d->width && k.height == d->height
++            && k.profile == d->vtProfile && k.bitDepth == d->vtBitDepth) {
++        return;
++    }
++    if (d->vt) {
++        macapk_vtb_close(d->vt);
++        d->vt = nullptr;
++    }
++    int hw = 0;
++    d->vt = macapk_vtb_open_vp9(k.width, k.height, k.profile, k.bitDepth, k.subsamplingX,
++                                k.subsamplingY, k.fullRange, k.colorSpace, &hw);
++    if (!d->vt) {
++        d->vtAllowed = false;
++        std::fprintf(stderr, "[video-vp9] no hardware VideoToolbox session for %dx%d profile %d "
++                    "(%d-bit): staying on libvpx\n", k.width, k.height, k.profile, k.bitDepth);
++        return;
++    }
++    d->width = k.width;
++    d->height = k.height;
++    d->vtProfile = k.profile;
++    d->vtBitDepth = k.bitDepth;
++    std::fprintf(stderr, "[video-vp9] keyframe %dx%d profile %d (%d-bit): hw=YES (VideoToolbox)\n",
++                k.width, k.height, k.profile, k.bitDepth);
++}
++
++}  // namespace
++
+ extern "C" {
+ 
+ // Always 1 for the VP9 mime (libvpx is statically linked in, always
+@@ -322,9 +441,11 @@ int macapk_vp9_probe_mime(const char* mimeC, int* outHw) {
+     d->ctxOk = true;
+     d->width  = width  > 0 ? width  : 0;
+     d->height = height > 0 ? height : 0;
++    d->vtAllowed = Vp9HardwareWanted();
+     if (outHw) *outHw = 0;
+     std::fprintf(stderr, "[video-vp9] open: mime=%s %dx%d (hint; confirmed at first "
+-                "keyframe) hw=no (software libvpx)\n", mime.c_str(), d->width, d->height);
++                "keyframe) %s\n", mime.c_str(), d->width, d->height,
++                d->vtAllowed ? "hardware decided at the first keyframe" : "hw=no (software libvpx)");
+     return d;
+ }
+ 
+@@ -339,6 +460,8 @@ int macapk_vp9_probe_mime(const char* mimeC, int* outHw) {
+ int macapk_vp9_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int eos) {
+     Vp9Decoder* d = (Vp9Decoder*)h;
+     if (!d || !d->ctxOk) return -1;
++    if (d->vtAllowed && au && auLen > 0) Vp9FollowKeyframe(d, au, auLen);
++    if (d->vt) return macapk_vtb_decode(d->vt, au, auLen, ptsUs, eos);
+     if (au && auLen > 0) {
+         vpx_codec_err_t e = vpx_codec_decode(&d->ctx, au, (unsigned int)auLen, nullptr, 0);
+         if (e != VPX_CODEC_OK) {
+@@ -388,6 +511,7 @@ int macapk_vp9_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int
+ int macapk_vp9_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags) {
+     Vp9Decoder* d = (Vp9Decoder*)h;
+     if (!d) return -1;
++    if (d->vt) return macapk_vtb_poll(d->vt, outPixbuf, outPtsUs, outFlags);
+     std::lock_guard<std::mutex> lk(d->mu);
+     if (d->outQ.empty()) return 0;
+     Vp9Decoder::OutFrame f = d->outQ.front();
+@@ -444,6 +568,10 @@ int macapk_vp9_frame_copy_bgra(void* pixbuf, uint8_t* outBuf, int outCap,
+ void macapk_vp9_flush(void* h) {
+     Vp9Decoder* d = (Vp9Decoder*)h;
+     if (!d) return;
++    if (d->vt) {
++        macapk_vtb_flush(d->vt);
++        return;
++    }
+     {
+         std::lock_guard<std::mutex> lk(d->mu);
+         while (!d->outQ.empty()) {
+@@ -464,6 +592,7 @@ void macapk_vp9_flush(void* h) {
+ void macapk_vp9_close(void* h) {
+     Vp9Decoder* d = (Vp9Decoder*)h;
+     if (!d) return;
++    if (d->vt) macapk_vtb_close(d->vt);
+     if (d->ctxOk) vpx_codec_destroy(&d->ctx);
+     {
+         std::lock_guard<std::mutex> lk(d->mu);
+diff --git a/runtime/src/video_toolbox.mm b/runtime/src/video_toolbox.mm
+--- a/runtime/src/video_toolbox.mm
++++ b/runtime/src/video_toolbox.mm
+@@ -869,6 +869,88 @@ int macapk_vtb_probe_mime(const char* mimeC, int* outHw) {
+ // Feeds one compressed access unit (may be null/0-length at eos with nothing
+ // left to submit). Fire-and-forget: the decoded frame (if any) surfaces later
+ // through macapk_vtb_poll. Returns 0 on success, negative on error.
++// VP9 through VideoToolbox, for video_vp9_decode.mm.
++//
++// The VP9 decoder is a SUPPLEMENTAL one: until the process registers it,
++// VTDecompressionSessionCreate answers -12906 for 'vp09'. That is the whole of
++// the "no decoder component on this host" finding in this file's header --
++// measured on an Apple M4, macOS 27.2, with a vpcC record: -12906 and
++// VTIsHardwareDecodeSupported = false before
++// VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9), noErr
++// with a hardware session after it. The stream's parameters come from the
++// keyframe the caller parsed; they go into the vpcC atom (VP Codec ISO Media
++// File Format Binding, "VPCodecConfigurationRecord"). A session that is not
++// hardware is refused: the caller's libvpx is the known software path.
++void* macapk_vtb_open_vp9(int width, int height, int profile, int bitDepth,
++                          int subsamplingX, int subsamplingY, int fullRange,
++                          int colorSpace, int* outHw) {
++    if (outHw) *outHw = 0;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
++    });
++    if (width <= 0 || height <= 0) return nullptr;
++
++    // The lowest VP9 level whose luma picture size holds the frame.
++    static const struct { long samples; uint8_t level; } kLevels[] = {
++        { 36864, 10 }, { 73728, 11 }, { 122880, 20 }, { 245760, 21 }, { 552960, 30 },
++        { 983040, 31 }, { 2228224, 40 }, { 8912896, 50 }, { 35651584, 60 },
++    };
++    uint8_t level = 62;
++    for (const auto& l : kLevels) {
++        if ((long)width * height <= l.samples) { level = l.level; break; }
++    }
++    // 4:2:0 (colocated), 4:2:2 or 4:4:4, as the record numbers them.
++    const uint8_t chroma = (subsamplingX && subsamplingY) ? 1 : subsamplingX ? 2 : 3;
++    // VP9 color_space -> (primaries, transfer, matrix) code points; 2 = unspecified.
++    uint8_t cp = 2, tc = 2, mc = 2;
++    if (colorSpace == 1)      { cp = 6; tc = 6; mc = 6; }    // BT.601
++    else if (colorSpace == 2) { cp = 1; tc = 1; mc = 1; }    // BT.709
++    else if (colorSpace == 5) { cp = 9; tc = 1; mc = 9; }    // BT.2020
++    const uint8_t vpcC[12] = {
++        1, 0, 0, 0,                                     // version, flags
++        (uint8_t)profile, level,
++        (uint8_t)((bitDepth << 4) | (chroma << 1) | (fullRange ? 1 : 0)),
++        cp, tc, mc,
++        0, 0,                                           // no codec initialization data
++    };
++    CMVideoFormatDescriptionRef fmt = nullptr;
++    @autoreleasepool {
++        NSDictionary* extensions = @{
++            (id)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: @{
++                @"vpcC": [NSData dataWithBytes:vpcC length:sizeof vpcC],
++            },
++        };
++        OSStatus s = CMVideoFormatDescriptionCreate(
++            kCFAllocatorDefault, kCMVideoCodecType_VP9, width, height,
++            (__bridge CFDictionaryRef)extensions, &fmt);
++        if (s != noErr || !fmt) {
++            std::fprintf(stderr, "[video-toolbox] vp9: CMVideoFormatDescriptionCreate failed %d\n", (int)s);
++            return nullptr;
++        }
++    }
++    VtDecoder* d = new VtDecoder();
++    d->codecType = kCMVideoCodecType_VP9;
++    d->isAvcOrHevc = false;
++    d->fmtDesc = fmt;
++    d->width = width;
++    d->height = height;
++    bool hw = false;
++    d->session = CreateSessionInternal(fmt, /*refcon=*/d, &hw);
++    if (!d->session || !hw) {
++        if (d->session) {
++            VTDecompressionSessionInvalidate(d->session);
++            CFRelease(d->session);
++        }
++        CFRelease(d->fmtDesc);
++        delete d;
++        return nullptr;
++    }
++    d->usingHardware = true;
++    if (outHw) *outHw = 1;
++    return d;
++}
++
+ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int eos) {
+     VtDecoder* d = (VtDecoder*)h;
+     if (!d || !d->session) return -1;

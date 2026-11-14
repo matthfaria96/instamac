@@ -1,0 +1,115 @@
+Titlebar: no title, three centered controls (Back, Rotate, Create)
+
+Owner design: the window title is hidden and three small rounded-rectangle buttons with a hairline border (brighter under the pointer) sit centered in the titlebar: Back (KEYCODE_BACK), Rotate (View > Girar / Cmd+R) and Create (a menu of the Arquivo share targets: new post, story, reel, message from Mac files). Glyphs are drawn into one 16x16 template box so the buttons match. The MacApkTitlebarButton/MacApkTitlebarTarget classes sit in a hunk shared with earlier changes; runtime.patch carries them.
+
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -10007,48 +11072,77 @@ static void InstallBackTitlebarAccessory(NSWindow* w) {
+         return !e || std::strcmp(e, "0") != 0;
+     }();
+     if (!on) return;
+-    MacApkBackAccessory* acc = [[MacApkBackAccessory alloc] init];
+-    // chevron.backward is the system Back glyph (RTL-aware). Semibold ~13pt reads
+-    // like Safari's toolbar back without a bezel.
+-    NSImage* chev = [NSImage imageWithSystemSymbolName:@"chevron.backward"
+-                                accessibilityDescription:@"Back"];
+-    if (@available(macOS 11.0, *)) {
++    // The titlebar view is the traffic lights' superview; the controls live in it,
++    // centered, so they stay centered whatever the window's width (both modes).
++    NSView* titlebar = [[w standardWindowButton:NSWindowCloseButton] superview];
++    if (!titlebar) return;
++    w.titleVisibility = NSWindowTitleHidden;
++    MacApkBackAccessory* actions = [[[MacApkBackAccessory alloc] init] autorelease];   // back / rotate
++    objc_setAssociatedObject(w, "macapk.titlebar.actions", actions, OBJC_ASSOCIATION_RETAIN);
++    if (!g_titlebar_target) g_titlebar_target = [[MacApkTitlebarTarget alloc] init];
++
++    // Every glyph drawn into the same 16x16 template box, so the three buttons
++    // have one size whatever the symbol's own proportions.
++    auto symbol = [](NSString* name, NSString* desc) -> NSImage* {
++        NSImage* sym = [NSImage imageWithSystemSymbolName:name accessibilityDescription:desc];
+         NSImageSymbolConfiguration* cfg =
+             [NSImageSymbolConfiguration configurationWithPointSize:13
+                                                             weight:NSFontWeightSemibold
+                                                              scale:NSImageSymbolScaleMedium];
+-        chev = [chev imageWithSymbolConfiguration:cfg];
+-    }
+-    NSButton* btn = [NSButton buttonWithImage:(chev ?: [NSImage imageNamed:NSImageNameGoLeftTemplate])
+-                                       target:acc
+-                                       action:@selector(macapkBack:)];
+-    btn.bordered = NO;
+-    btn.imagePosition = NSImageOnly;
+-    btn.toolTip = @"Back";
+-    btn.focusRingType = NSFocusRingTypeNone;
+-    btn.translatesAutoresizingMaskIntoConstraints = NO;
+-    // AppKit stretches the accessory view to the full titlebar height, and the
+-    // traffic lights are centered in that same titlebar -- so centering the button
+-    // vertically in the host aligns the chevron exactly on the traffic-light row
+-    // (a hardcoded y bottom-anchored it a hair low). 22x22 hit target, 2pt leading.
+-    NSView* host = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 28, 28)];
+-    [host addSubview:btn];
++        sym = [sym imageWithSymbolConfiguration:cfg];
++        const NSSize box = NSMakeSize(16, 16);
++        NSImage* img = [NSImage imageWithSize:box flipped:NO drawingHandler:^BOOL(NSRect dst) {
++            NSSize s = sym.size;
++            CGFloat k = std::min(dst.size.width / s.width, dst.size.height / s.height);
++            NSRect r = NSMakeRect((dst.size.width - s.width * k) / 2, (dst.size.height - s.height * k) / 2,
++                                  s.width * k, s.height * k);
++            [sym drawInRect:r];
++            return YES;
++        }];
++        [img setTemplate:YES];
++        img.accessibilityDescription = desc;
++        return img;
++    };
++    auto make = [&](NSString* sym, NSString* tip, id target, SEL action) -> NSButton* {
++        MacApkTitlebarButton* b = [[[MacApkTitlebarButton alloc] initWithFrame:NSMakeRect(0, 0, 34, 22)] autorelease];
++        b.image = symbol(sym, tip);
++        b.imagePosition = NSImageOnly;
++        b.imageScaling = NSImageScaleProportionallyDown;   // a tall glyph must not grow the box
++        [b setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
++                                    forOrientation:NSLayoutConstraintOrientationVertical];
++        b.bordered = NO;
++        b.wantsLayer = YES;
++        b.contentTintColor = NSColor.labelColor;
++        b.toolTip = tip;
++        b.focusRingType = NSFocusRingTypeNone;
++        b.target = target;
++        b.action = action;
++        b.translatesAutoresizingMaskIntoConstraints = NO;
++        [b.widthAnchor constraintEqualToConstant:34].active = YES;
++        [b.heightAnchor constraintEqualToConstant:22].active = YES;
++        return b;
++    };
++    NSStackView* bar = [NSStackView stackViewWithViews:@[
++        make(@"chevron.backward", @"Voltar (Esc)", actions, @selector(macapkBack:)),
++        make(@"rectangle.portrait.rotate", @"Girar: celular ou tablet (⌘R)", actions, @selector(macapkRotate:)),
++        make(@"plus", @"Criar a partir de arquivos do Mac", g_titlebar_target, @selector(macapkCreate:)),
++    ]];
++    bar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
++    bar.spacing = 14;
++    bar.alignment = NSLayoutAttributeCenterY;
++    bar.translatesAutoresizingMaskIntoConstraints = NO;
++    [titlebar addSubview:bar];
+     [NSLayoutConstraint activateConstraints:@[
+-        [btn.centerYAnchor constraintEqualToAnchor:host.centerYAnchor],
+-        [btn.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:2],
+-        [btn.widthAnchor  constraintEqualToConstant:22],
+-        [btn.heightAnchor constraintEqualToConstant:22],
++        [bar.centerXAnchor constraintEqualToAnchor:titlebar.centerXAnchor],
++        [bar.centerYAnchor constraintEqualToAnchor:[w standardWindowButton:NSWindowCloseButton].centerYAnchor],
+     ]];
+-    acc.view = host;
+-    acc.layoutAttribute = NSLayoutAttributeLeading;   // leading edge, after the traffic lights
+-    [w addTitlebarAccessoryViewController:acc];        // window retains acc
+ }
+ 
+ static MacApkLanguageTarget* g_language_target = nil;
+ static void install_language_menu(NSMenu* mainMenu) {
+     NSMenuItem* item = [[NSMenuItem alloc] init];
+     [mainMenu addItem:item];
+-    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Language"];
++    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Idioma"];
+     if (!g_language_target) g_language_target = [[MacApkLanguageTarget alloc] init];
+     [menu setDelegate:g_language_target];
+     [item setSubmenu:menu];

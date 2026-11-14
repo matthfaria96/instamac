@@ -1,0 +1,3 @@
+[submodule "vendor/macapk"]
+	path = vendor/macapk
+	url = https://github.com/kksimp/Mac.apk

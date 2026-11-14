@@ -1,0 +1,83 @@
+a SurfaceView that is not the window's render target gets its own surface lifecycle
+
+The native side has ONE render target per window (NativeCocoa.setRenderer; the
+last SurfaceView constructed wins). A second SurfaceView on screen never got
+surfaceCreated/surfaceChanged, so whatever it draws through its holder never
+started: Instagram's carousel editor (one SurfaceView per page) showed the first
+page blank and only the page whose view was built last.
+- SurfaceView remembers which instance holds the native target (a weak
+  reference set where setRenderer is called).
+- setFrame: a SurfaceView that is attached, laid out with a size, not the native
+  target and not yet created posts its own surfaceCreated/surfaceChanged with a
+  locked-canvas holder (macapkTryFireHolderCreatedHere), the path the target's
+  own lifecycle already uses.
+- MACAPK_SV_SECONDARY=0 restores the single-target behaviour.
+
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -80,9 +80,55 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+         // GLSurfaceView) override and short-circuit the reflection
+         // path. Subclasses that don't (e.g. cocos2d-x's
+         // FSGLSurfaceView) get the autodiscovery fallback below.
+-        if (handle != 0) NativeCocoa.setRenderer(handle, this);
++        if (handle != 0) {
++            NativeCocoa.setRenderer(handle, this);
++            sNativeTarget = new java.lang.ref.WeakReference<>(this);
++        }
+         macapkRegisterLiveForEgl(this);
+     }
++
++    // ---- SurfaceViews that are not the window's render target ---------------
++    // The native side drives ONE SurfaceView per window (setRenderer above: the
++    // last one constructed wins), built for a game's single surface. A second
++    // SurfaceView in the same window -- one per page of Instagram's carousel
++    // editor -- never received surfaceCreated, so its renderer never started and
++    // that page stayed empty (the first of two attachments had no preview).
++    // AOSP gives every SurfaceView its own surface lifecycle. Such a view is
++    // shown through its own per-surface layer (lockCanvas, setBuffer), so its
++    // holder is answered with the view's own size, and surfaceCreated /
++    // surfaceChanged are delivered from its own layout, once attached and
++    // sized. MACAPK_SV_SECONDARY=0 restores the single-target behaviour.
++    private static volatile java.lang.ref.WeakReference<SurfaceView> sNativeTarget;
++    private static final boolean sSecondaryGate =
++        !"0".equals(System.getenv("MACAPK_SV_SECONDARY"));
++    private boolean macapkSecondaryPosted;
++
++    private boolean macapkIsNativeTarget() {
++        java.lang.ref.WeakReference<SurfaceView> r = sNativeTarget;
++        return r != null && r.get() == this;
++    }
++
++    private void macapkMaybeStartSecondary(int w, int h) {
++        if (!sSecondaryGate || holderSurfaceCreatedFired || macapkSecondaryPosted
++                || w <= 0 || h <= 0 || macapkIsNativeTarget() || !isAttachedToWindow()) {
++            return;
++        }
++        macapkSecondaryPosted = true;
++        post(() -> {
++            macapkSecondaryPosted = false;
++            if (holderSurfaceCreatedFired || macapkIsNativeTarget() || !isAttachedToWindow()
++                    || getWidth() <= 0 || getHeight() <= 0 || !macapkHolderDispatchReady()) {
++                return;   // the next layout tries again
++            }
++            holder.macapkLockedCanvas = true;   // the view's size, its own layer
++            if (macapkTryFireHolderCreatedHere(getWidth(), getHeight())) {
++                NativeLog.i(TAG, "secondary surface: surfaceCreated/Changed " + getWidth() + "x"
++                    + getHeight() + " on " + getClass().getName() + "@"
++                    + Integer.toHexString(System.identityHashCode(this))
++                    + " (not the window's render target)");
++            }
++        });
++    }
+     public SurfaceView(Context c, android.util.AttributeSet a) { this(c); }
+     /** AOSP API 21 four-argument constructor. AOSP's three-argument form is
+      *  exactly this(context, attrs, defStyleAttr, 0), so delegating the other
+@@ -1180,6 +1226,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+     protected boolean setFrame(int left, int top, int right, int bottom) {
+         boolean changed = super.setFrame(left, top, right, bottom);
+         if (sViewSizeGate || sViewSizeGlGate) macapkSnapLayout(right - left, bottom - top);
++        macapkMaybeStartSecondary(right - left, bottom - top);
+         return changed;
+     }
+ 

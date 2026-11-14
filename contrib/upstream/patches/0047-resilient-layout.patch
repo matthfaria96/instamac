@@ -1,0 +1,54 @@
+View: resilient layout (an onLayout that throws no longer aborts the pass)
+
+The twin of the resilient measure that was already there: View.layout catches a throwing onLayout, logs it once per class with its stack, and the traversal continues. The measure guard now also logs the stack on the first throw per class. Measured on Instagram's profile: a suggestions RecyclerView whose onMeasure threw (app ClassCastException on a server item) left RecyclerView.State mid-step; its onLayout then threw "Layout state should be one of 100 but it is 10" on every pass and the action bar, buttons and grid kept 0x0 frames. Now only that list stays empty.
+
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1891,6 +1893,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *  throws every frame) while a SECOND distinct offender is still reported. */
+     private static final java.util.Set<String> warnedMeasureThrowClasses =
+         java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
++    /** Same, for onLayout (resilient layout in layout()). */
++    private static final java.util.Set<String> warnedLayoutThrowClasses =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
+     /** Recursive attach dispatch (AOSP dispatchAttachedToWindow: self
+      *  first, then children -- ViewGroup overrides to recurse).
+      *  Idempotent. App onAttachedToWindow overrides are guarded so a
+@@ -4923,7 +5018,23 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         // stops firing for any view a parent squeezed to zero.
+         if ((this.measuredWidth & MEASURED_SIZE_MASK) == 0)  this.measuredWidth  = newW;
+         if ((this.measuredHeight & MEASURED_SIZE_MASK) == 0) this.measuredHeight = newH;
+-        onLayout(true, l, t, r, b);
++        // RESILIENT layout, the twin of the resilient measure below: a view whose
++        // onLayout throws must not abort the whole pass (siblings and every view
++        // after it would keep 0x0 frames -- a screen half drawn). Measured on
++        // Instagram's profile: a suggestions RecyclerView whose onMeasure threw
++        // (app ClassCastException) left its State mid-step, its onLayout then
++        // threw on every pass, and the action bar, buttons and grid never got
++        // frames. Now only that list stays empty.
++        try {
++            onLayout(true, l, t, r, b);
++        } catch (Throwable thr) {
++            if (warnedLayoutThrowClasses.add(getClass().getName())) {
++                final java.io.StringWriter sw = new java.io.StringWriter();
++                thr.printStackTrace(new java.io.PrintWriter(sw));
++                com.macapk.loader.NativeLog.w("View", "onLayout threw on " + getClass().getName()
++                    + ", tree continues: " + sw);
++            }
++        }
+         // AOSP setFrame -> sizeChange: fire onSizeChanged when the size actually
+         // changed (custom views build size-dependent state there).
+         if (newW != oldW || newH != oldH) macapkDispatchSizeChanged(newW, newH, oldW, oldH);
+@@ -5110,6 +5262,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+                 com.macapk.loader.NativeLog.w("View",
+                     "onMeasure threw on " + getClass().getName() + ": " + t
+                     + " -- measuring as " + w + "x" + h + ", tree continues");
++                // The first throw per class also gets its stack: the message
++                // alone does not say which app frame threw.
++                final java.io.StringWriter sw = new java.io.StringWriter();
++                t.printStackTrace(new java.io.PrintWriter(sw));
++                com.macapk.loader.NativeLog.w("View", sw.toString());
+             }
+             // A ComposeView that threw because its owner wasn't reachable should
+             // retry composition creation on a later pass; queue it.

@@ -1,0 +1,369 @@
+Visualizar > Som dos Vídeos ao Abrir: videos start with sound on, off, or as the app decides
+
+The choice is sent to the app as a phone sends it, through the volume rocker,
+never through the app's internals:
+- on: music volume up one step, then KEYCODE_VOLUME_UP;
+- off: music volume to 0, then KEYCODE_VOLUME_DOWN; the volume is put back
+  quietly once the key is handled. (Instagram reads "volume down with the stream
+  at 0" as sound off and "volume up" as sound on, for the feed and for Reels.)
+It is sent when a track starts playing (AudioTrack.play): a video is on screen
+and the controller that owns it is the one listening for the key. Instagram's
+feed takes the key only while a feed video plays, so a try that nobody takes is
+repeated on a later track (3 s apart, at most 6 tries). Under "off" the track that
+carries the try is held silent until the app's player has applied its new
+volume, so the first video never blips at full sound.
+
+AudioManager now behaves like a volume an app can watch: the stream volumes are
+shared, setStreamVolume/adjustStreamVolume notify content://settings/system and
+broadcast VOLUME_CHANGED_ACTION with its extras.
+
+Native side (cocoa_bridge.mm): the menu section with three choices (Ativado,
+Desativado, Padrão do Instagram), kept in the user defaults (VideoSoundAtStart),
+copied before the JVM starts into MACAPK_VIDEO_SOUND_AT_START (which still wins
+when set) by a constructor, and sent to AudioManager.macapkSetVideoSoundAtStart at
+once when changed from the menu. MACAPK_AUDIO_VOLUME_TRACE=1 logs every
+AudioTrack.setVolume with its caller.
+
+diff --git a/runtime/java/android/media/AudioManager.java b/runtime/java/android/media/AudioManager.java
+--- a/runtime/java/android/media/AudioManager.java
++++ b/runtime/java/android/media/AudioManager.java
+@@ -17,10 +17,130 @@ public class AudioManager {
+     // only makes the Java-visible state honest for callers that read back
+     // what they wrote (volume UI, mute toggles).
+     private static final int STREAM_TYPE_COUNT = 11;
+-    private final int[] mStreamVolume = new int[STREAM_TYPE_COUNT];
++    // ONE set of volumes for the process, as AudioService holds one: every
++    // getSystemService(AUDIO_SERVICE) here is a new AudioManager, and a volume
++    // written through one has to read back through any other.
++    private static final int[] mStreamVolume = new int[STREAM_TYPE_COUNT];
++    static { java.util.Arrays.fill(mStreamVolume, 7); }
++
++    public AudioManager() { }
++
++    // ---- volume changes reach the app's observers --------------------------
++    // AOSP AudioService writes each stream volume into Settings.System
++    // ("volume_music_speaker" ...) and broadcasts VOLUME_CHANGED_ACTION; apps
++    // watch either to follow the hardware volume keys. Instagram turns its video
++    // sound on when the music volume goes up and off when it reaches 0, exactly
++    // as on a phone. Nothing here was ever notified, so no volume change ever
++    // reached an app.
++    public static final String VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION";
++    public static final String EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE";
++    public static final String EXTRA_VOLUME_STREAM_VALUE = "android.media.EXTRA_VOLUME_STREAM_VALUE";
++    public static final String EXTRA_PREV_VOLUME_STREAM_VALUE = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE";
++
++    private static void macapkVolumeChanged(int streamType, int prev, int now) {
++        if (prev == now) return;
++        try {
++            android.app.Application a = android.app.ActivityThread.currentApplication();
++            if (a == null) return;
++            a.getContentResolver().notifyChange(
++                android.net.Uri.parse("content://settings/system/volume_music_speaker"), null);
++            android.content.Intent i = new android.content.Intent(VOLUME_CHANGED_ACTION);
++            i.putExtra(EXTRA_VOLUME_STREAM_TYPE, streamType);
++            i.putExtra(EXTRA_VOLUME_STREAM_VALUE, now);
++            i.putExtra(EXTRA_PREV_VOLUME_STREAM_VALUE, prev);
++            a.sendBroadcast(i);
++        } catch (Throwable ignored) { }
++    }
++
++    // ---- video sound when the app opens (MACAPK_VIDEO_SOUND_AT_START) -------
++    // on | off; anything else leaves the app's own default. Both act through the
++    // signal a phone gives an app, never through its internals: the volume rocker.
++    //   on  -- music volume up one step, then KEYCODE_VOLUME_UP;
++    //   off -- music volume to 0, then KEYCODE_VOLUME_DOWN, the volume put back
++    //          quietly once the key is handled (Instagram reads "down with the
++    //          stream at 0" as sound off, and its own unmute works as usual).
++    // Sent when a track starts playing -- a video is on screen, and the controller
++    // that owns it is the one listening for the rocker (Instagram's feed takes
++    // the key only while a feed video plays) -- and again on later tracks, a few
++    // seconds apart, until the app takes it (at most 6 tries).
++    // The native side copies the menu's saved choice (Visualizar > Som dos Vídeos
++    // ao Abrir) into the variable before the JVM starts.
++    private static final String START_SOUND = System.getenv("MACAPK_VIDEO_SOUND_AT_START");
++    private static volatile boolean sStartOn = "on".equals(START_SOUND);
++    private static volatile boolean sStartSoundDone = !sStartOn && !"off".equals(START_SOUND);
++    private static int sStartTries;
++    private static long sStartNextTry;
++
++    /** @hide The menu (0 the app decides, 1 on, 2 off): the choice for this run
++     *  from the next video on, and sent right away to a video playing now. */
++    public static void macapkSetVideoSoundAtStart(int choice) {
++        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
++            synchronized (AudioManager.class) { sStartTries = 0; sStartNextTry = 0; }
++            sStartOn = choice == 1;
++            sStartSoundDone = choice != 1 && choice != 2;
++            if (!sStartSoundDone && macapkVideoSoundNow(sStartOn)) sStartSoundDone = true;
++        });
++    }
++
++    /** @hide AudioTrack.play(). Under "off" the track that carries the try is held
++     *  silent until the app has answered the key and its player has applied the
++     *  new volume, so the first video never blips at full sound. */
++    static void macapkPlaybackStarted(AudioTrack track) {
++        if (sStartSoundDone) return;
++        synchronized (AudioManager.class) {
++            final long now = android.os.SystemClock.uptimeMillis();
++            if (sStartSoundDone || now < sStartNextTry) return;
++            if (++sStartTries > 6) { sStartSoundDone = true; return; }
++            sStartNextTry = now + 3000;
++        }
++        final boolean on = sStartOn;
++        if (!on) track.macapkHold(true);
++        final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
++        main.postDelayed(() -> {
++            if (!sStartSoundDone && macapkVideoSoundNow(on)) sStartSoundDone = true;
++            if (!on) main.postDelayed(() -> track.macapkHold(false), 250);
++        }, 300);
++    }
+ 
+-    public AudioManager() {
+-        java.util.Arrays.fill(mStreamVolume, 7);
++    /** @hide The rocker, now (the start policy, the menu); true when the app took the key. */
++    public static boolean macapkVideoSoundNow(boolean on) {
++        final int prev = mStreamVolume[STREAM_MUSIC];
++        boolean taken;
++        if (on) {
++            final int now = Math.min(15, Math.max(prev, 7) + 1);
++            mStreamVolume[STREAM_MUSIC] = now;
++            macapkVolumeChanged(STREAM_MUSIC, prev, now);
++            taken = macapkVolumeKey(android.view.KeyEvent.KEYCODE_VOLUME_UP);
++        } else {
++            mStreamVolume[STREAM_MUSIC] = 0;
++            macapkVolumeChanged(STREAM_MUSIC, prev, 0);
++            taken = macapkVolumeKey(android.view.KeyEvent.KEYCODE_VOLUME_DOWN);
++            final int back = prev > 0 ? prev : 7;
++            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
++                if (mStreamVolume[STREAM_MUSIC] == 0) mStreamVolume[STREAM_MUSIC] = back;
++            }, 400);
++        }
++        com.macapk.loader.NativeLog.i("AudioManager", "video sound " + (on ? "ON" : "OFF")
++            + ": music volume " + prev + " -> " + mStreamVolume[STREAM_MUSIC] + " key taken=" + taken);
++        return taken;
++    }
++
++    private static boolean macapkVolumeKey(int keyCode) {
++        try {
++            android.app.Activity act = com.macapk.loader.ActivityHost.macapkTopActivity();
++            if (act == null) return false;
++            long t = android.os.SystemClock.uptimeMillis();
++            boolean down = act.dispatchKeyEvent(new android.view.KeyEvent(t, t,
++                android.view.KeyEvent.ACTION_DOWN, keyCode, 0));
++            boolean up = act.dispatchKeyEvent(new android.view.KeyEvent(t, t + 40,
++                android.view.KeyEvent.ACTION_UP, keyCode, 0));
++            com.macapk.loader.NativeLog.i("AudioManager", "volume key " + keyCode + " -> "
++                + act.getClass().getSimpleName() + " handled=" + down + "/" + up);
++            return down || up;
++        } catch (Throwable t) {
++            com.macapk.loader.NativeLog.w("AudioManager", "volume key failed: " + t);
++            return false;
++        }
+     }
+ 
+     // HISTORY: getProperty(String) was deliberately ABSENT v1.0.270..v1.0.601.
+@@ -46,7 +166,9 @@ public class AudioManager {
+         int max = getStreamMaxVolume(streamType);
+         if (index < min) index = min;
+         if (index > max) index = max;
++        int prev = mStreamVolume[streamType];
+         mStreamVolume[streamType] = index;
++        macapkVolumeChanged(streamType, prev, index);
+     }
+     // isMusicActive() stays hardcoded false: an honest answer needs to query
+     // whether any Stream in audio_backend.mm's g_streams is PLAYSTATE_PLAYING
+@@ -304,7 +426,18 @@ public class AudioManager {
+     public int generateAudioSessionId() { return mSessionIds.incrementAndGet(); }
+ 
+     public void adjustVolume(int direction, int flags) {}
+-    public void adjustStreamVolume(int streamType, int direction, int flags) {}
++    /** AOSP ADJUST_RAISE (1) / ADJUST_LOWER (-1) / ADJUST_MUTE (-100) /
++     *  ADJUST_UNMUTE (100) / ADJUST_TOGGLE_MUTE (101), one step per call. */
++    public void adjustStreamVolume(int streamType, int direction, int flags) {
++        if (streamType < 0 || streamType >= mStreamVolume.length) return;
++        int v = mStreamVolume[streamType];
++        if (direction == 1) v++;
++        else if (direction == -1) v--;
++        else if (direction == -100) v = 0;
++        else if (direction == 100 && v == 0) v = 7;
++        else if (direction == 101) v = v == 0 ? 7 : 0;
++        setStreamVolume(streamType, v, flags);
++    }
+     public void adjustSuggestedStreamVolume(int direction, int suggestedStreamType, int flags) {}
+     public int getStreamMinVolume(int streamType) { return 0; }
+     public boolean isStreamMute(int streamType) { return false; }
+diff --git a/runtime/java/android/media/AudioTrack.java b/runtime/java/android/media/AudioTrack.java
+--- a/runtime/java/android/media/AudioTrack.java
++++ b/runtime/java/android/media/AudioTrack.java
+@@ -277,6 +277,7 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
+     public void play()  { com.macapk.loader.AudioTrace.hit("AudioTrack.play");
+         if (honestUninitialized())
+             throw new IllegalStateException("play() called on uninitialized AudioTrack.");
++        AudioManager.macapkPlaybackStarted(this);
+         if (handle != 0) com.macapk.loader.NativeAudio.nativePlay(handle); }
+     public void pause() { com.macapk.loader.AudioTrace.hit("AudioTrack.pause");
+         if (honestUninitialized())
+@@ -417,14 +418,23 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
+     private volatile float mBaseVolL = 1.0f;
+     private volatile float mBaseVolR = 1.0f;
+     private volatile float mShaperScale = 1.0f;
++    // 0 while AudioManager holds this track silent (the start-up sound choice is
++    // being sent to the app); never visible to the app.
++    private volatile float mHoldScale = 1.0f;
+ 
+     private void pushVolume() {
+         if (handle != 0) {
+             com.macapk.loader.NativeAudio.nativeSetVolume(handle,
+-                    mBaseVolL * mShaperScale, mBaseVolR * mShaperScale);
++                    mBaseVolL * mShaperScale * mHoldScale, mBaseVolR * mShaperScale * mHoldScale);
+         }
+     }
+ 
++    /** @hide AudioManager.macapkPlaybackStarted. */
++    void macapkHold(boolean hold) {
++        mHoldScale = hold ? 0f : 1f;
++        pushVolume();
++    }
++
+     /** @deprecated in AOSP since API 21; superseded by setVolume(float). */
+     @Deprecated
+     public int setStereoVolume(float left, float right) {
+@@ -440,10 +450,19 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
+         // AOSP's setVolume(float) is "return setStereoVolume(gain, gain);"
+         // (:2746-2747), so it inherits the same STATE_UNINITIALIZED check.
+         if (honestUninitialized()) return ERROR_INVALID_OPERATION;
++        if (VOLUME_TRACE && sVolumeLog-- > 0) {
++            StringBuilder st = new StringBuilder();
++            StackTraceElement[] tr = new Throwable().getStackTrace();
++            for (int i = 1; i < Math.min(tr.length, 22); i++) st.append(" | ").append(tr[i]);
++            com.macapk.loader.NativeLog.i("AudioTrack", "setVolume " + gain + " on track "
++                + Integer.toHexString(System.identityHashCode(this)) + st);
++        }
+         mBaseVolL = gain; mBaseVolR = gain;
+         pushVolume();
+         return SUCCESS;
+     }
++    private static final boolean VOLUME_TRACE = System.getenv("MACAPK_AUDIO_VOLUME_TRACE") != null;
++    private static int sVolumeLog = 40;
+ 
+     public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) {
+         int ch  = channelsFromConfig(channelConfig);
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -10281,6 +10281,36 @@
+     if (!w || !resolution_ui_on()) return;
+     [w setContentMinSize:NSMakeSize(1, 1)];
+     [w setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
++}
++
++// ---- Visualizar > Som dos Vídeos ao Abrir ------------------------------------------
++// How the app's videos start: 0 as the app decides, 1 with sound, 2 muted. Kept in
++// the user defaults and copied, before the JVM exists, into the variable
++// android.media.AudioManager reads (MACAPK_VIDEO_SOUND_AT_START, which wins when it
++// is set already); AudioManager sends it to the app as the volume rocker. A change
++// from the menu also goes to AudioManager at once (macapkSetVideoSoundAtStart).
++static NSString* const kVideoSoundKey = @"VideoSoundAtStart";
++static long g_video_sound = 0;
++__attribute__((constructor)) static void video_sound_env(void) {
++    if (std::getenv("MACAPK_VIDEO_SOUND_AT_START")) return;
++    Boolean ok = false;
++    const CFIndex v = CFPreferencesGetAppIntegerValue(CFSTR("VideoSoundAtStart"),
++                                                      kCFPreferencesCurrentApplication, &ok);
++    if (ok && (v == 1 || v == 2)) setenv("MACAPK_VIDEO_SOUND_AT_START", v == 1 ? "on" : "off", 0);
++}
++static void video_sound_send(long choice) {
++    JavaVM* vm = nullptr;
++    jsize n = 0;
++    if (JNI_GetCreatedJavaVMs(&vm, 1, &n) != JNI_OK || n <= 0 || !vm) return;
++    JNIEnv* env = nullptr;
++    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21) == JNI_EDETACHED)
++        vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
++    if (!env) return;
++    jclass c = env->FindClass("android/media/AudioManager");
++    jmethodID m = c ? env->GetStaticMethodID(c, "macapkSetVideoSoundAtStart", "(I)V") : nullptr;
++    if (m) env->CallStaticVoidMethod(c, m, (jint) choice);
++    if (env->ExceptionCheck()) env->ExceptionClear();
++    if (c) env->DeleteLocalRef(c);
+ }
+ 
+ // ---- scroll settings (the Rolagem menu) -----------------------------------------
+@@ -10304,6 +10334,8 @@
+     const double v = [d doubleForKey:kScrollSpeedKey];
+     g_scroll_speed = (v >= 0.25 && v <= 4.0) ? v : 1.0;
+     g_scroll_host_inertia = [d boolForKey:kScrollHostInertiaKey];
++    g_video_sound = [d integerForKey:kVideoSoundKey];
++    if (g_video_sound < 0 || g_video_sound > 2) g_video_sound = 0;
+     // MACAPK_DEBUG_CLEAR_CACHE=<secs>: clear the cache that long after launch.
+     if (const char* e = std::getenv("MACAPK_DEBUG_CLEAR_CACHE"); e && atof(e) > 0.0) {
+         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(e) * NSEC_PER_SEC)),
+@@ -10329,7 +10361,8 @@
+     return pinned > 0.0 ? pinned : g_scroll_speed;
+ }
+ 
+-enum { kMenuTagScrollSpeed = 1, kMenuTagScrollInertia = 2, kMenuTagAutoScroll = 3 };
++enum { kMenuTagScrollSpeed = 1, kMenuTagScrollInertia = 2, kMenuTagAutoScroll = 3,
++       kMenuTagVideoSound = 4 };
+ 
+ 
+ // ---- the app's cache (app menu > Limpar Cache…) ----------------------------------
+@@ -10468,6 +10501,7 @@
+ @property(nonatomic, strong) NSMenuItem* landscapeItem;
+ @property(nonatomic, strong) NSMenuItem* lockItem;
+ @property(nonatomic, strong) NSMenu* scrollMenu;
++@property(nonatomic, strong) NSMenu* viewMenu;
+ @property(nonatomic, copy)   NSString* appTitle;
+ - (void)pickPortrait:(id)sender;
+ - (void)pickLandscape:(id)sender;
+@@ -10476,6 +10510,7 @@
+ - (void)pickScrollSpeed:(id)sender;
+ - (void)pickScrollInertia:(id)sender;
+ - (void)pickAutoScroll:(id)sender;
++- (void)pickVideoSound:(id)sender;
+ - (void)goBack:(id)sender;
+ - (void)shareFiles:(id)sender;
+ - (void)shareDropped:(id)sender;
+@@ -10506,6 +10541,12 @@
+ }
+ - (void)pickAutoScroll:(id)sender {
+     autoscroll_set([[(NSMenuItem*)sender representedObject] doubleValue]);
++}
++- (void)pickVideoSound:(id)sender {
++    g_video_sound = [[(NSMenuItem*)sender representedObject] longValue];
++    [[NSUserDefaults standardUserDefaults] setInteger:g_video_sound forKey:kVideoSoundKey];
++    video_sound_send(g_video_sound);
++    std::fprintf(stderr, "[I] cocoa: video sound at start %ld\n", g_video_sound);
+ }
+ - (void)goBack:(id)sender { (void)sender; CocoaDispatchBack(); }
+ - (void)shareFiles:(id)sender { share_pick([(NSMenuItem*)sender tag]); }
+@@ -10543,6 +10584,11 @@
+     [self.portraitItem  setState:portrait ? NSControlStateValueOn : NSControlStateValueOff];
+     [self.landscapeItem setState:portrait ? NSControlStateValueOff : NSControlStateValueOn];
+     [self.lockItem setState:g_size_locked ? NSControlStateValueOn : NSControlStateValueOff];
++    for (NSMenuItem* it in [self.viewMenu itemArray]) {
++        if ([it tag] != kMenuTagVideoSound) continue;
++        const BOOL on = [[it representedObject] longValue] == g_video_sound;
++        [it setState:on ? NSControlStateValueOn : NSControlStateValueOff];
++    }
+     for (NSMenuItem* it in [self.scrollMenu itemArray]) {
+         const double v = [[it representedObject] doubleValue];
+         BOOL on = NO;
+@@ -10584,6 +10630,7 @@
+ static void install_view_menu(NSMenu* mainMenu) {
+     NSMenu* menu = add_menu(mainMenu, @"Visualizar");
+     [menu setDelegate:g_view_menu_target];
++    g_view_menu_target.viewMenu = menu;
+     g_view_menu_target.portraitItem = add_item(menu, @"Celular — em pé", @selector(pickPortrait:),
+         @"1", NSEventModifierFlagCommand, g_view_menu_target);
+     g_view_menu_target.landscapeItem = add_item(menu, @"Tablet — deitado", @selector(pickLandscape:),
+@@ -10597,6 +10644,11 @@
+         g_view_menu_target.lockItem = add_item(menu, @"Travar Tamanho da Janela",
+             @selector(toggleSizeLock:), @"", 0, g_view_menu_target);
+     }
++    [menu addItem:[NSMenuItem separatorItem]];
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Som dos Vídeos ao Abrir"]];
++    add_choice(menu, @"Ativado",             @selector(pickVideoSound:), kMenuTagVideoSound, 1);
++    add_choice(menu, @"Desativado",          @selector(pickVideoSound:), kMenuTagVideoSound, 2);
++    add_choice(menu, @"Padrão do Instagram", @selector(pickVideoSound:), kMenuTagVideoSound, 0);
+ }
+ 
+ // Rolagem: speed, whose inertia, and the hands-free advance.

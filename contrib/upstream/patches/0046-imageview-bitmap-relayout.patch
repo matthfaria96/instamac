@@ -1,0 +1,32 @@
+ImageView: setImageBitmap requests layout when the intrinsic size changes
+
+AOSP setImageBitmap goes through setImageDrawable -> updateDrawable, which calls requestLayout() when the drawable's width or height changed. Ours only invalidated, so a wrap_content ImageView measured 0x0 before its bitmap arrived stayed 0x0. Measured victim: Instagram's caption-screen thumbnail (photo_media_preview_image_view) kept showing the loading shimmer; now 232x232 with the photo.
+
+diff --git a/runtime/java/android/widget/ImageView.java b/runtime/java/android/widget/ImageView.java
+--- a/runtime/java/android/widget/ImageView.java
++++ b/runtime/java/android/widget/ImageView.java
+@@ -164,6 +167,9 @@ public class ImageView extends View {
+         // Guarded: this is called straight from app/library code (Glide and
+         // friends) on the main thread, so it must not be able to throw where it
+         // previously could not. getResources() needs a live Context.
++        final android.graphics.drawable.Drawable old = this.drawable;
++        final int oldW = old == null ? -1 : old.getIntrinsicWidth();
++        final int oldH = old == null ? -1 : old.getIntrinsicHeight();
+         if (b == null) {
+             this.drawable = null;
+         } else {
+@@ -179,6 +185,14 @@ public class ImageView extends View {
+         // invalidate the new pixels stay invisible until something
+         // else dirties the view tree (which our per-frame full-redraw
+         // makes free, but other paths might not).
++        // AOSP setImageBitmap -> setImageDrawable -> updateDrawable, then
++        //     if (oldWidth != mDrawableWidth || oldHeight != mDrawableHeight) requestLayout();
++        // Without it a wrap_content view that measured 0x0 before its bitmap
++        // arrived stays 0x0 (Instagram's caption-screen thumbnail).
++        final android.graphics.drawable.Drawable now = this.drawable;
++        final int newW = now == null ? -1 : now.getIntrinsicWidth();
++        final int newH = now == null ? -1 : now.getIntrinsicHeight();
++        if (newW != oldW || newH != oldH) requestLayout();
+         invalidate();
+     }
+     public android.graphics.Bitmap getDrawingCache() { return bitmap; }

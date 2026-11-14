@@ -1,0 +1,248 @@
+media: clear a dequeued input buffer, and decode xHE-AAC
+
+1. MediaCodec handed a dequeued input buffer back with the position/limit its
+   previous access unit left. AOSP clears it (dequeueInputBuffer ->
+   validateInputByteBufferLocked -> buffer.clear(); getInputBuffer maps a fresh
+   view). Stock media3 clears the buffer itself; a player that relies on the
+   platform does not. Instagram 455's ExoPlayer fork logged
+       Input buffer guard dropped sample (sample of 186 exceeds destination 184)
+   and for video `codec ... in=11 ... codec_out=0`: the eight fresh slots plus
+   the units that happened to fit, then starvation -- feed videos black, Reels
+   "unavailable". After: VP9 150 in / 150 out per 5 s.
+
+2. media_decode.mm opened every audio/mp4a-latm stream as kAudioFormatMPEG4AAC.
+   audioObjectType 42 (xHE-AAC / USAC), which Android decodes under the same
+   mime, is kAudioFormatMPEGD_USAC in AudioToolbox and wants the full
+   ES_Descriptor as its magic cookie (a bare AudioSpecificConfig is refused
+   with '!dat'). Reels audio is `mp4a.40.42`: the codec took 232 units and
+   returned nothing, the audio renderer never became ready and playback
+   stalled. Now the config's object type selects the format, the cookie is
+   built in AudioFile's own layout (verified against
+   kAudioFilePropertyMagicCookieData for a real track), the ASBD comes from
+   FormatInfo ({usac, 48000 Hz, 2 ch, 2048 frames/packet}), csd-0 may be a bare
+   config or an ES_Descriptor, and the demuxer reports 'usac' as AAC.
+
+   Self-test (MACAPK_MEDIA_SELFTEST) on a real xHE-AAC track:
+       RESULT frames=237568 rms=5901 -> PASS      (116 packets x 2048)
+   HE-AAC and AAC-LC unchanged (PASS). In the app, Reels tab:
+       codec_out=237 track_writes=555 track_bytes=962560      per 5 s
+       [audio-stats] nonsilent_renders=469/469 peak=0.285 underruns=0
+
+Applies to vendor/macapk at 57c9912 with `patch -p1` from vendor/macapk.
+
+diff --git a/runtime/java/android/media/MediaCodec.java b/runtime/java/android/media/MediaCodec.java
+index 3367dfb..ca935f9 100644
+--- a/runtime/java/android/media/MediaCodec.java
++++ b/runtime/java/android/media/MediaCodec.java
+@@ -795,6 +795,7 @@ public final class MediaCodec {
+                         info = tmp;
+                     } else if (!mInFree.isEmpty()) {
+                         inIdx = mInFree.poll();
++                        macapkResetInputBuffer(inIdx);
+                     }
+                 }
+             }
+@@ -1130,7 +1131,32 @@ public final class MediaCodec {
+     public int dequeueInputBuffer(long timeoutUs) {
+         synchronized (mAsyncLock) {
+             if (!mStarted || mInFree.isEmpty()) return INFO_TRY_AGAIN_LATER;
+-            return mInFree.poll();
++            final int index = mInFree.poll();
++            macapkResetInputBuffer(index);
++            return index;
++        }
++    }
++
++    /** AOSP hands every dequeued input buffer back CLEARED: dequeueInputBuffer
++     *  -> validateInputByteBufferLocked -> `buffer.clear()` for the array API,
++     *  and getInputBuffer(index) maps a fresh view (position 0, limit =
++     *  capacity) for the per-buffer API (MediaCodec.java, android14-release
++     *  :3745-3760 and :4690-4712). The eight buffers here are reused as they
++     *  are, so a slot came back with the position/limit its PREVIOUS access
++     *  unit left, and the next unit fit only when it was no larger.
++     *
++     *  Stock media3 never notices -- its renderer calls buffer.clear() itself.
++     *  A player that relies on the platform's guarantee does. MEASURED on
++     *  Instagram 455 (its own ExoPlayer fork):
++     *      MediaCodecRenderer: Input buffer guard dropped sample
++     *          (sample of 186 exceeds destination 184)
++     *  -- a 186-byte AAC unit refused by a slot whose last unit was 184 bytes;
++     *  and for video `[media-stats] codec#3 ... in=11 ... codec_out=0`: the 8
++     *  fresh slots plus the 3 units that happened to fit, then starvation.
++     *  Result: no sound in videos, and reels reported "unavailable". */
++    private void macapkResetInputBuffer(int index) {
++        if (mIn != null && index >= 0 && index < mIn.length && mIn[index] != null) {
++            mIn[index].clear();
+         }
+     }
+     public void queueInputBuffer(int index, int offset, int size, long presentationTimeUs, int flags) {
+diff --git a/runtime/src/media_decode.mm b/runtime/src/media_decode.mm
+index ca24d83..c83b5b3 100644
+--- a/runtime/src/media_decode.mm
++++ b/runtime/src/media_decode.mm
+@@ -142,6 +142,8 @@ int macapk_md_demux_track_count(void* h) {
+ int macapk_md_demux_format_id(void* h) {
+     Demuxer* d=(Demuxer*)h; if (!d) return 0;
+     if (d->asbd.mFormatID == kAudioFormatMPEG4AAC || d->asbd.mFormatID == kAudioFormatMPEG4AAC_HE) return 1;
++    // xHE-AAC is audio/mp4a-latm on Android too (profile AACObjectXHE).
++    if (d->asbd.mFormatID == kAudioFormatMPEGD_USAC) return 1;
+     if (d->asbd.mFormatID == kAudioFormatMPEGLayer3) return 2;
+     return 0;
+ }
+@@ -342,6 +344,84 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
+ void  macapk_vorbis_dec_close(void* h);
+ }
+ 
++// The audioObjectType of an MPEG-4 AudioSpecificConfig (ISO/IEC 14496-3
++// 1.6.2.1): 5 bits, or the escape value 31 followed by 6 more bits (type =
++// 32 + those). 0 when the config is absent or too short to say.
++static int md_asc_object_type(const void* csd, int len) {
++    if (!csd || len < 2) return 0;
++    const uint8_t* p = (const uint8_t*)csd;
++    int aot = p[0] >> 3;
++    if (aot == 31) aot = 32 + (((p[0] & 0x07) << 3) | (p[1] >> 5));
++    return aot;
++}
++
++// csd-0 for AAC reaches the decoder in two shapes: the bare
++// AudioSpecificConfig (what an Android client hands MediaCodec) or a whole
++// ES_Descriptor (what AudioFile calls the magic cookie, and what this file's
++// own demuxer therefore reports). Point at the AudioSpecificConfig in either:
++// an ES_Descriptor starts with tag 0x03, which no config can (that would be
++// audioObjectType 0). Descriptor lengths are 1-4 bytes, 7 bits each, high bit
++// = "more" (ISO/IEC 14496-1 8.3.3).
++static bool md_asc_in_csd(const void* csd, int len, const uint8_t** asc, int* ascLen) {
++    const uint8_t* p = (const uint8_t*)csd;
++    if (!p || len < 2) return false;
++    if (p[0] != 0x03) { *asc = p; *ascLen = len; return true; }
++    const uint8_t* end = p + len;
++    auto read_len = [&](const uint8_t*& q, uint32_t& out) -> bool {
++        out = 0;
++        for (int i = 0; i < 4 && q < end; ++i) {
++            uint8_t b = *q++;
++            out = (out << 7) | (b & 0x7f);
++            if (!(b & 0x80)) return true;
++        }
++        return false;
++    };
++    const uint8_t* q = p + 1;
++    uint32_t n = 0;
++    if (!read_len(q, n) || q + 3 > end) return false;
++    const uint8_t flags = q[2];
++    q += 3;                                             // ES_ID, flags
++    if (flags & 0x80) q += 2;                           // dependsOn_ES_ID
++    if (flags & 0x40) { if (q >= end) return false; q += 1 + *q; }   // URL
++    if (flags & 0x20) q += 2;                           // OCR_ES_Id
++    if (q >= end || *q++ != 0x04) return false;         // DecoderConfigDescriptor
++    if (!read_len(q, n) || q + 13 > end) return false;
++    q += 13;
++    if (q >= end || *q++ != 0x05) return false;         // DecoderSpecificInfo
++    if (!read_len(q, n) || q + n > end || n == 0) return false;
++    *asc = q; *ascLen = (int)n;
++    return true;
++}
++
++// An MPEG-4 ES_Descriptor (ISO/IEC 14496-1 7.2.6.5) around an
++// AudioSpecificConfig: ES_Descriptor{ES_ID 1} > DecoderConfigDescriptor{
++// objectTypeIndication 0x40 = MPEG-4 Audio, streamType audio} >
++// DecoderSpecificInfo{the config}, then SLConfigDescriptor{predefined 2}.
++// Lengths in the 4-byte expandable form, as in an mp4 `esds` box.
++static void md_put_desc_len(std::vector<uint8_t>& v, uint32_t len) {
++    v.push_back((uint8_t)(0x80 | ((len >> 21) & 0x7f)));
++    v.push_back((uint8_t)(0x80 | ((len >> 14) & 0x7f)));
++    v.push_back((uint8_t)(0x80 | ((len >> 7) & 0x7f)));
++    v.push_back((uint8_t)(len & 0x7f));
++}
++static std::vector<uint8_t> md_esds_from_asc(const uint8_t* asc, int ascLen) {
++    std::vector<uint8_t> v;
++    if (!asc || ascLen <= 0) return v;
++    const uint32_t dsi = 1 + 4 + (uint32_t)ascLen;       // tag + length + config
++    const uint32_t dcd = 13 + dsi;                       // 13 fixed bytes + the DSI
++    const uint32_t es  = 3 + (1 + 4 + dcd) + (1 + 4 + 1);
++    v.push_back(0x03); md_put_desc_len(v, es);
++    v.push_back(0x00); v.push_back(0x01); v.push_back(0x00);   // ES_ID 1, no flags
++    v.push_back(0x04); md_put_desc_len(v, dcd);
++    v.push_back(0x40);                                   // MPEG-4 Audio
++    v.push_back(0x15);                                   // streamType audio, reserved bit
++    for (int i = 0; i < 3 + 4 + 4; ++i) v.push_back(0);  // bufferSizeDB, max/avg bitrate
++    v.push_back(0x05); md_put_desc_len(v, (uint32_t)ascLen);
++    v.insert(v.end(), asc, asc + ascLen);
++    v.push_back(0x06); md_put_desc_len(v, 1); v.push_back(0x02);
++    return v;
++}
++
+ extern "C" {
+ 
+ void* macapk_md_dec_open(int formatId, int sampleRate, int channels,
+@@ -384,6 +464,7 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
+     in.mChannelsPerFrame = channels;
+     bool wantsCookie = false;
+     int cbrBpp = 0;
++    std::vector<uint8_t> usacCookie;      // xHE-AAC only: csd-0 wrapped as an ES_Descriptor
+ 
+     switch (formatId) {
+         case 2:  // audio/mpeg (MP3)
+@@ -452,11 +533,51 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
+             in.mFormatID = kAudioFormatULaw; in.mFramesPerPacket = 1;
+             in.mBytesPerPacket = (UInt32)channels; cbrBpp = channels;
+             break;
+-        case 1:  // audio/mp4a-latm (AAC) -- the converter self-selects
++        case 1: {  // audio/mp4a-latm (AAC) -- the converter self-selects
+                  // LC/HE/HEv2/LD/ELD from the AudioSpecificConfig in the
+                  // magic cookie.
+             in.mFormatID = kAudioFormatMPEG4AAC; in.mFramesPerPacket = 1024; wantsCookie = true;
++            // ...but NOT xHE-AAC. audioObjectType 42 (USAC, ISO/IEC 23003-3)
++            // is a different AudioToolbox format, kAudioFormatMPEGD_USAC: an
++            // 'aac ' converter handed a USAC config accepts every access unit
++            // and never produces a sample. Android decodes it under the same
++            // audio/mp4a-latm mime (profile AACObjectXHE, API 28), so a player
++            // has no reason to treat it specially.
++            // MEASURED on Instagram 455: Reels audio is `codecs=mp4a.40.42`,
++            // 48 kHz stereo; the codec took 232 units and returned nothing
++            // ("[media-stats] codec#4 no-output for 5.0s in=232"), the audio
++            // renderer never became ready, and playback stalled with it -- no
++            // sound, then a frozen frame.
++            // The stream's own description (rate, channels, frames per
++            // packet) comes from the config through FormatInfo, since a USAC
++            // packet is not 1024 frames in general (2048 with SBR 2:1).
++            // The USAC decoder also wants the FULL ES_Descriptor as its magic
++            // cookie, not the bare AudioSpecificConfig the 'aac ' one accepts
++            // (a bare config is refused: '!dat', kAudioCodecUnsupportedFormat
++            // Error). Oracle: AudioFile's kAudioFilePropertyMagicCookieData for
++            // a real Reels track is exactly md_esds_from_asc's layout, and its
++            // format is {usac, 48000 Hz, 2 ch, 2048 frames/packet}.
++            const uint8_t* asc = nullptr;
++            int ascLen = 0;
++            if (md_asc_in_csd(csd0, csd0Len, &asc, &ascLen)
++                    && md_asc_object_type(asc, ascLen) == 42) {
++                usacCookie = md_esds_from_asc(asc, ascLen);
++                AudioStreamBasicDescription usac = {};
++                usac.mFormatID = kAudioFormatMPEGD_USAC;
++                UInt32 usacSize = sizeof(usac);
++                OSStatus fs = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo,
++                    (UInt32)usacCookie.size(), usacCookie.data(), &usacSize, &usac);
++                if (fs == noErr && usac.mSampleRate > 0 && usac.mChannelsPerFrame > 0) {
++                    in = usac;
++                }
++                in.mFormatID = kAudioFormatMPEGD_USAC;
++                std::fprintf(stderr, "[media] xHE-AAC (USAC) config: %.0f Hz, %u ch, %u frames/packet%s\n",
++                             in.mSampleRate, (unsigned)in.mChannelsPerFrame,
++                             (unsigned)in.mFramesPerPacket,
++                             fs == noErr ? "" : " (FormatInfo unavailable; caller's rate/channels)");
++            }
+             break;
++        }
+         default:
+             std::fprintf(stderr, "[media] dec_open: unsupported formatId=%d\n", formatId);
+             return nullptr;
+@@ -521,6 +642,10 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
+         cookiePtr = flacCookie.data();
+         cookieLen = (int)flacCookie.size();
+     }
++    if (!usacCookie.empty()) {
++        cookiePtr = usacCookie.data();
++        cookieLen = (int)usacCookie.size();
++    }
+     if (wantsCookie && cookiePtr && cookieLen > 0) {
+         s = AudioConverterSetProperty(conv, kAudioConverterDecompressionMagicCookie,
+                                       (UInt32)cookieLen, cookiePtr);

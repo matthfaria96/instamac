@@ -1,0 +1,71 @@
+x18: install the guest Bionic TLS block on the faulting thread instead of masking
+
+Guest code on a JVM-created thread read [x18+k] with x18 never installed (the
+TLS block was only set up on the loader thread). The null-deref recovery masked
+every such load to 0, so structures built from TLS came out zeroed. When the
+fault is a load through x18 and x18 holds no block, install the block for this
+thread and re-execute the instruction (PC unchanged). Once per thread.
+
+Measured on Instagram 455 (macOS 27.2): reduced, but did not by itself remove,
+the launch hang in CacheKeyGenerator.initializeKeyGenerator -- the remaining
+cause is 0006.
+
+Applies to vendor/macapk at 57c9912 with `patch -p1` from vendor/macapk.
+
+diff --git a/runtime/translator/src/arm64_native.cpp b/runtime/translator/src/arm64_native.cpp
+index f2e974b..ba655f5 100644
+--- a/runtime/translator/src/arm64_native.cpp
++++ b/runtime/translator/src/arm64_native.cpp
+@@ -312,6 +312,18 @@ static void macapk_x18_install_guest_tls() {
+     macapk_x18_probe_set(reinterpret_cast<uint64_t>(s_tls));     // set x18 LAST
+ }
+ 
++// Called from the bionic shim's SEGV recovery when a guest access faults
++// through an UNINSTALLED x18 (Bionic's TLS base). The shim installs the guest
++// TLS block only on the loader thread today, so guest code running on a
++// JVM-created thread reads [x18+k] from a null base: every load faults, the
++// recovery masks it to 0, and code that walks the resulting structure spins.
++// Installing the block here and re-executing the instruction is what a device
++// would have had from the start. Idempotent per thread.
++extern "C" void __macapk_ensure_guest_tls(void) {
++    macapk_enable_x18_preservation();
++    macapk_x18_install_guest_tls();
++}
++
+ // true iff guest x18 will actually survive on this host. Memoized: the probe
+ // costs a few ms and the answer cannot change within a process.
+ static bool macapk_x18_capability_ok() {
+diff --git a/runtime/translator/src/bionic_shim.cpp b/runtime/translator/src/bionic_shim.cpp
+index 9fdd246..17a0dd5 100644
+--- a/runtime/translator/src/bionic_shim.cpp
++++ b/runtime/translator/src/bionic_shim.cpp
+@@ -2296,6 +2296,29 @@ static bool try_recover_arm64_native_null_deref(siginfo_t* info, ucontext_t* uc)
+     bool is_pair = (bits_31_24 & 0x7E) == 0x28   // LDP/STP W/X-pair
+                 || (bits_31_24 & 0x7E) == 0x2C   // LDP/STP S/Q-pair
+                 || (bits_31_24 & 0x7E) == 0x6C;  // LDP/STP D-pair
++    // x18 SELF-HEAL: if this fault is a guest access through x18 and x18 does
++    // not hold an installed Bionic TLS block, install it for THIS thread and
++    // re-execute the instruction (PC unchanged) instead of masking the load to
++    // zero. Masking turns "no TLS here" into a structure full of zeros, which
++    // is what makes libstartup's cache-key init spin (measured: SWPool3 at 98%
++    // CPU in CacheKeyGenerator.initializeKeyGenerator while the app's main
++    // thread waits in isInitialized).
++    {
++        const unsigned Rn = (insn >> 5) & 0x1f;
++        if (is_load && Rn == 18) {
++            const uint64_t x18 = uc->uc_mcontext->__ss.__x[18];
++            if (x18 < 0x10000ull || x18 == 0xdeadbeefcafebabeULL) {
++                extern void __macapk_ensure_guest_tls(void);
++                static thread_local bool s_tried = false;
++                if (!s_tried) {
++                    s_tried = true;
++                    __macapk_ensure_guest_tls();
++                    return true;          // no PC advance: re-execute the load
++                }
++            }
++        }
++    }
++
+     static std::atomic<long> recovered_count{0};
+     long n = recovered_count.fetch_add(1);
+     if (n < 64) {

@@ -1,0 +1,84 @@
+resolve_external: a guest that bundles SQLite binds to its own copy, not macOS's
+
+Same rule the loader already applies to Apple's private crypto dylibs: when the
+global dlsym answers an import from /usr/lib/libsqlite3.dylib and a loaded guest
+ELF defines the symbol, bind to the guest's definition (fall back to the host
+only when no guest provides it). MACAPK_GUEST_SQLITE=0 restores the old binding.
+
+Measured on Instagram 455 (macOS 27.2). libstartup.so defines the whole sqlite3_*
+API; libscrollmerged.so imports it and was bound to macOS's libsqlite3:
+
+  * sqlite3_config is variadic. Bionic passes variadic args in registers, Apple's
+    arm64 ABI reads them from the stack, so the host stored a stack word
+    (0x70422f8c28) as the SQLITE_CONFIG_LOG callback. The first sqlite3_log --
+    a WAL recovery inside sqlite3_exec (walIndexReadHdr) -- jumped to it:
+    SIGILL on SWPool3, breakpad abort, about a minute into a logged-in session.
+  * Two SQLite engines then share the same database, -wal and -shm files with
+    different locking and WAL-index code.
+
+After the patch every sqlite3_* import of libscrollmerged.so resolves to
+libstartup.so ("-> guest libstartup.so (preferred over macOS libsqlite3)").
+
+Applies to vendor/macapk at 57c9912 (after 0005, 0006) with `patch -p1` from
+vendor/macapk.
+
+diff --git a/runtime/translator/src/arm64_native.cpp b/runtime/translator/src/arm64_native.cpp
+index f2e974b..a17ceaf 100644
+--- a/runtime/translator/src/arm64_native.cpp
++++ b/runtime/translator/src/arm64_native.cpp
+@@ -2409,6 +2421,27 @@ static bool host_dylib_is_private_crypto(void* addr) {
+         || std::strncmp(base, "libssl", 6) == 0;
+ }
+ 
++// True when a host symbol pointer lives in macOS's /usr/lib/libsqlite3.dylib.
++// Same reasoning as the private-crypto case: an app that BUNDLES its own SQLite
++// (Instagram's libstartup.so defines the whole sqlite3_* API) must not have
++// some of its libraries bound to Apple's copy. MEASURED on Instagram 455:
++// libscrollmerged.so imports sqlite3_exec/sqlite3_config, they resolved to the
++// host dylib, and two failures followed --
++//   * sqlite3_config is VARIADIC: Bionic passes the variadic args in registers,
++//     Apple's arm64 ABI reads them from the stack, so the host stored a stack
++//     word (0x70422f8c28) as the SQLITE_CONFIG_LOG callback; the first
++//     sqlite3_log (a WAL recovery inside sqlite3_exec) jumped to it: SIGILL on
++//     SWPool3, breakpad abort, about a minute into a logged-in session;
++//   * two SQLite engines then share the same database, -wal and -shm files
++//     with different locking and WAL-index code.
++static bool host_dylib_is_sqlite(void* addr) {
++    Dl_info di;
++    if (!addr || !dladdr(addr, &di) || !di.dli_fname) return false;
++    const char* slash = std::strrchr(di.dli_fname, '/');
++    const char* base = slash ? slash + 1 : di.dli_fname;
++    return std::strncmp(base, "libsqlite3", 10) == 0;
++}
++
+ // True when `addr` is owned by a Cocoa framework bundle (.../Foo.framework/...).
+ // A framework export can never satisfy an Android ELF import: those are
+ // ObjC/Swift app-facing implementations, not a Bionic substitute, and dlsym
+@@ -2914,7 +2947,13 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
+                 }
+             }
+         }
+-        if (host_dylib_is_private_crypto(p)) {
++        const bool host_crypto = host_dylib_is_private_crypto(p);
++        static const bool kGuestSqlite = [] {
++            const char* e = std::getenv("MACAPK_GUEST_SQLITE");   // =0: legacy host binding
++            return !(e && e[0] == '0');
++        }();
++        const bool host_sqlite = !host_crypto && kGuestSqlite && host_dylib_is_sqlite(p);
++        if (host_crypto || host_sqlite) {
+             for (Image* img : loaded_images()) {
+                 if (img == this) continue;
+                 if (void* g = img->lookup(name.c_str())) {
+@@ -2922,8 +2961,10 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
+                     if (n_guest.fetch_add(1) < 128)
+                         std::fprintf(stderr,
+                             "[arm64-native] %s: '%s' -> guest %s (preferred "
+-                            "over Apple's private crypto dylib)\n",
+-                            dbg_name_, name.c_str(), img->name());
++                            "over %s)\n",
++                            dbg_name_, name.c_str(), img->name(),
++                            host_crypto ? "Apple's private crypto dylib"
++                                        : "macOS libsqlite3");
+                     return g;
+                 }
+             }

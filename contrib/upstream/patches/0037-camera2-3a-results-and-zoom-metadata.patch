@@ -1,0 +1,109 @@
+camera2: report 3A state in results and zoom metadata in characteristics
+
+Instagram's camera (Optic) registered the shutter tap and never took the photo.
+The capture task died on list.get(0) of an empty zoom-ratio list: the device
+advertised no SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, so Optic took it for a camera
+without zoom metadata. camera2 requires that key of every device (>= 1.0) and,
+from API 30, CONTROL_ZOOM_RATIO_RANGE; AOSP's legacy shim reports 1.0 for a camera
+without zoom. Both are now advertised as [1.0, 1.0], with SCALER_CROPPING_TYPE
+CENTER_ONLY.
+
+Each capture result now also carries the 3A state camera2 requires of every
+device, as AOSP's LegacyResultMapper fills it for a LEGACY camera: AE CONVERGED
+(PRECAPTURE on the frame carrying the trigger), AF INACTIVE (fixed focus), AWB
+CONVERGED, FLASH UNAVAILABLE, LENS STATIONARY, and the request's AE/AF modes and
+triggers echoed back.
+
+Measured (Instagram 455, Logitech C922): the shutter takes a 1920x1080 JPEG and
+the Story editor opens with it.
+
+diff --git a/runtime/java/android/hardware/camera2/CameraBackend.java b/runtime/java/android/hardware/camera2/CameraBackend.java
+--- a/runtime/java/android/hardware/camera2/CameraBackend.java
++++ b/runtime/java/android/hardware/camera2/CameraBackend.java
+@@ -285,6 +285,19 @@ final class CameraBackend {
+                     new Rect(0, 0, fmt.maxWidth, fmt.maxHeight));
+         }
+ 
++        // Zoom: none, said the way camera2 says it. SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
++        // is present on every device (>= 1.0); AOSP's legacy shim reports 1.0
++        // for a camera without zoom, and from API 30 CONTROL_ZOOM_RATIO_RANGE is
++        // [1.0, that maximum]. Absent, Instagram's camera (Optic) took the
++        // camera for one without zoom metadata at all, left its zoom-ratio list
++        // empty and failed every photo on list.get(0) (IndexOutOfBounds inside
++        // the capture task, measured 2026-11-12).
++        p.put(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, Float.valueOf(1f));
++        p.put(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE,
++                new android.util.Range<>(Float.valueOf(1f), Float.valueOf(1f)));
++        p.put(CameraCharacteristics.SCALER_CROPPING_TYPE,
++                Integer.valueOf(CameraMetadata.SCALER_CROPPING_TYPE_CENTER_ONLY));
++
+         // Deliberately ABSENT: LENS_INFO_AVAILABLE_FOCAL_LENGTHS and
+         // SENSOR_INFO_PHYSICAL_SIZE. AVFoundation does not tell us the focal
+         // length or the sensor's physical dimensions, and those two are
+@@ -312,6 +326,17 @@ final class CameraBackend {
+         // that is the whole honest list.
+         List<CaptureResult.Key<?>> resultKeys = new ArrayList<>();
+         resultKeys.add(CaptureResult.SENSOR_TIMESTAMP);
++        // The 3A state this LEGACY, fixed-focus, always-auto-exposure device has
++        // (CameraCaptureSessionImpl fills them in each result).
++        resultKeys.add(CaptureResult.CONTROL_AE_STATE);
++        resultKeys.add(CaptureResult.CONTROL_AF_STATE);
++        resultKeys.add(CaptureResult.CONTROL_AWB_STATE);
++        resultKeys.add(CaptureResult.FLASH_STATE);
++        resultKeys.add(CaptureResult.LENS_STATE);
++        resultKeys.add(CaptureResult.CONTROL_AE_MODE);
++        resultKeys.add(CaptureResult.CONTROL_AF_MODE);
++        resultKeys.add(CaptureResult.CONTROL_AE_PRECAPTURE_TRIGGER);
++        resultKeys.add(CaptureResult.CONTROL_AF_TRIGGER);
+ 
+         trace("characteristics id=" + cameraId + " index=" + index
+                 + " unique=" + unique
+diff --git a/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java b/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
+--- a/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
++++ b/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
+@@ -1023,14 +1111,39 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
+ 
+         dispatch.run(() -> cb.onCaptureStarted(this, req, timestampNs, deliveredCount));
+ 
+-        // The result carries only what we measured. SENSOR_TIMESTAMP is the
+-        // observation instant described above; exposure time, sensitivity and
+-        // the 3A states are absent because AVFoundation does not report them
+-        // per frame through this path, and a plausible-looking fabricated value
+-        // is worse than a null an app can test for. CameraCharacteristics
+-        // .getAvailableCaptureResultKeys() advertises exactly this one key.
++        // SENSOR_TIMESTAMP is the observation instant described above. Exposure
++        // time and sensitivity stay absent (AVFoundation does not report them per
++        // frame through this path). The 3A STATE is reported, because camera2
++        // requires it of every device -- AOSP's legacy shim fills it for a LEGACY
++        // camera too (LegacyResultMapper) -- and a capture flow waits on it: a
++        // precapture sequence waits for AE_STATE to leave PRECAPTURE, and with
++        // the keys absent Instagram's camera registered the shutter tap and
++        // never took the picture (measured 2026-11-12). This device is what
++        // CameraBackend advertises: fixed focus (AF mode OFF -> INACTIVE),
++        // auto-exposure always on and run by AVFoundation (CONVERGED; PRECAPTURE
++        // on the frame that carries the trigger, as the shim does), AWB
++        // CONVERGED, no flash (UNAVAILABLE), lens STATIONARY. Modes and
++        // triggers are echoed from the request, as AOSP results carry them.
+         Map<CaptureResult.Key<?>, Object> results = new HashMap<>();
+         results.put(CaptureResult.SENSOR_TIMESTAMP, Long.valueOf(timestampNs));
++        if (req != null) {
++            final Integer aeTrigger = req.get(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER);
++            final boolean precapture = aeTrigger != null
++                    && aeTrigger.intValue() == CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START;
++            results.put(CaptureResult.CONTROL_AE_STATE, Integer.valueOf(precapture
++                    ? CameraMetadata.CONTROL_AE_STATE_PRECAPTURE : CameraMetadata.CONTROL_AE_STATE_CONVERGED));
++            results.put(CaptureResult.CONTROL_AF_STATE, Integer.valueOf(CameraMetadata.CONTROL_AF_STATE_INACTIVE));
++            results.put(CaptureResult.CONTROL_AWB_STATE, Integer.valueOf(CameraMetadata.CONTROL_AWB_STATE_CONVERGED));
++            results.put(CaptureResult.FLASH_STATE, Integer.valueOf(CameraMetadata.FLASH_STATE_UNAVAILABLE));
++            results.put(CaptureResult.LENS_STATE, Integer.valueOf(CameraMetadata.LENS_STATE_STATIONARY));
++            final Integer aeMode = req.get(CaptureRequest.CONTROL_AE_MODE);
++            if (aeMode != null) results.put(CaptureResult.CONTROL_AE_MODE, aeMode);
++            final Integer afMode = req.get(CaptureRequest.CONTROL_AF_MODE);
++            if (afMode != null) results.put(CaptureResult.CONTROL_AF_MODE, afMode);
++            if (aeTrigger != null) results.put(CaptureResult.CONTROL_AE_PRECAPTURE_TRIGGER, aeTrigger);
++            final Integer afTrigger = req.get(CaptureRequest.CONTROL_AF_TRIGGER);
++            if (afTrigger != null) results.put(CaptureResult.CONTROL_AF_TRIGGER, afTrigger);
++        }
+         final TotalCaptureResult result = new TotalCaptureResult(results, req, deliveredCount,
+                 mDevice.getId(), seq);
+ 

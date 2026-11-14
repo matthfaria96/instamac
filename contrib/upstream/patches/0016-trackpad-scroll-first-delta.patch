@@ -1,0 +1,388 @@
+trackpad scroll: content follows from the first delta; host event time; one MOVE per loop turn
+
+cocoa_bridge.mm (macapkScrollAt): the synthesized finger of a two-finger scroll
+goes down on the first non-zero delta and starts just past the guest's touch
+slop (9pt along the gesture's axis; TOUCH_SLOP is 8dp), instead of being held
+back for 6pt and then having to cross the slop like a finger on glass. The guest
+enters its drag at once and consumes the slop out of that jump, so every delta
+moves the content 1:1, as a macOS scroll view does, and a slow precise scroll is
+no longer swallowed. MACAPK_SCROLL_SLOP_JUMP=0 restores the held-back DOWN.
+
+TouchDispatcher.dispatch: a pointer event is stamped with the time the host
+delivered it (taken on the AppKit thread), not the time the loop runs it. A loop
+busy with a frame runs its queued moves in a burst; stamped then, they read to
+VelocityTracker as a finger that stood still and teleported, and the fling after
+a scroll came out at a different speed each time. Moves that queue up behind a
+slow loop turn are merged into the newest (what InputConsumer's batching does),
+so a late frame does not scroll and lay the list out again for positions the
+pointer has already left.
+
+Applies on top of 0015 (the Rolagem menu and its settings live there). The
+speed setting multiplies the synthesized finger's travel. Inércia "Do macOS":
+the finger is kept down for 50ms when the fingers lift and the momentum tail, if
+one arrives, continues the same drag; "Do Instagram" (the default) is the old
+behaviour, the guest's own fling. Auto-scroll (Rolagem Automática, or
+MACAPK_AUTOSCROLL=<secs>) runs a two-finger scroll of 45% of the view in 0.4s
+through the same body every N seconds of user idleness, released still moving
+at ~600pt/s: released at rest, a 62% drag returned to the same Reel three times
+out of three; released moving, the Reels tab advanced one video per step, three
+out of three.
+
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -10888,6 +11460,7 @@ - (void)macapkMagnifyPhase:(int)phase magnification:(double)magnification at:(NS
+ - (void)macapkRotatePhase:(int)phase rotation:(double)degrees at:(NSPoint)p;
+ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)precise
+                  phase:(NSEventPhase)ph momentumPhase:(NSEventPhase)mph;
++- (void)macapkScrollLift;
+ - (void)macapkTrackpadReset;
+ - (void)macapkTrackpadClaimForButton;
+ - (void)macapkTrackpadContacts:(int)n ids:(const int*)ids phases:(const int*)phases
+@@ -11135,6 +11708,93 @@ static bool MacApkGuestTextTargetActive() {
+     return active;
+ }
+ 
++// ---- auto-scroll (Rolagem > Rolagem Automática) ----------------------------------
++//
++// Every g_autoscroll_secs the window advances: a two-finger scroll through the
++// body a real one runs (macapkScrollAt), 45% of the view in 0.4s, released while
++// still moving at a gentle ~600pt/s. The release speed is the point: a finger
++// that stops before it lifts is "put it back" to a snapping pager (measured on
++// the Reels tab: a drag of 62% of the view released at rest returned to the same
++// video, three times out of three), while a list only coasts a little further on
++// it. It waits while the user is using the window: a real scroll, click or key
++// restarts the count and ends a step in flight.
++static NSTimer* g_autoscroll_tick = nil;
++static NSTimer* g_autoscroll_step = nil;
++static CFTimeInterval g_autoscroll_idle_since = 0;
++static int g_autoscroll_i = 0;
++static CGFloat g_autoscroll_travel = 0;
++static const int kAutoScrollSteps = 48;   // at 120 Hz
++
++static MacApkMetalView* autoscroll_view(NSPoint* at) {
++    NSWindow* w = macapk::g_placeholder_window;
++    NSView* cv = w ? [w contentView] : nil;
++    if (!cv || [w isMiniaturized] || ![w isVisible]) return nil;
++    const NSRect b = [cv bounds];
++    // The finger starts below the middle, clear of the bottom fifth (where a
++    // full-screen pager keeps its caption and buttons), and stays inside the view.
++    const CGFloat from_top = 0.72;
++    const NSPoint c = NSMakePoint(NSMidX(b), [cv isFlipped]
++        ? b.origin.y + from_top * b.size.height : b.origin.y + (1.0 - from_top) * b.size.height);
++    NSView* hit = [cv hitTest:[cv convertPoint:c toView:[cv superview]]];
++    while (hit && ![hit isKindOfClass:[MacApkMetalView class]]) hit = [hit superview];
++    if (!hit) return nil;
++    if (at) *at = [hit convertPoint:c fromView:cv];
++    return (MacApkMetalView*)hit;
++}
++
++static void autoscroll_end_step(void) {
++    if (!g_autoscroll_step) return;
++    [g_autoscroll_step invalidate];
++    g_autoscroll_step = nil;
++    [autoscroll_view(nullptr) macapkScrollLift];
++    g_autoscroll_idle_since = CACurrentMediaTime();
++}
++
++static void autoscroll_begin_step(void) {
++    NSPoint p;
++    MacApkMetalView* v = autoscroll_view(&p);
++    if (!v) return;
++    g_autoscroll_i = 0;
++    g_autoscroll_travel = -0.45 * [v bounds].size.height / (CGFloat)scroll_effective_speed();
++    std::fprintf(stderr, "[I] cocoa: auto-scroll step from (%.0f,%.0f), %.0fpt\n", p.x, p.y,
++                 (double)g_autoscroll_travel);
++    [v macapkScrollAt:p dx:0 dy:0 precise:YES phase:NSEventPhaseBegan momentumPhase:NSEventPhaseNone];
++    g_autoscroll_step = [NSTimer scheduledTimerWithTimeInterval:1.0 / 120.0 repeats:YES block:^(NSTimer* t) {
++        (void)t;
++        NSPoint q;
++        MacApkMetalView* mv = autoscroll_view(&q);
++        const int i = ++g_autoscroll_i;
++        if (!mv || i > kAutoScrollSteps) { autoscroll_end_step(); return; }
++        // 60% at constant speed (what the release keeps) + 40% eased.
++        auto pos = [](double x) { return 0.6 * x + 0.4 * x * x * (3.0 - 2.0 * x); };
++        const CGFloat d = g_autoscroll_travel * (CGFloat)(pos((double)i / kAutoScrollSteps)
++                                                        - pos((double)(i - 1) / kAutoScrollSteps));
++        [mv macapkScrollAt:q dx:0 dy:d precise:YES phase:NSEventPhaseChanged momentumPhase:NSEventPhaseNone];
++    }];
++}
++
++static void autoscroll_set(double secs) {
++    autoscroll_end_step();
++    [g_autoscroll_tick invalidate];
++    g_autoscroll_tick = nil;
++    g_autoscroll_secs = secs > 0.0 ? secs : 0.0;
++    std::fprintf(stderr, "[I] cocoa: auto-scroll %s (%.0fs)\n", g_autoscroll_secs > 0.0 ? "on" : "off",
++                 g_autoscroll_secs);
++    if (g_autoscroll_secs <= 0.0) return;
++    g_autoscroll_idle_since = CACurrentMediaTime();
++    g_autoscroll_tick = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer* t) {
++        (void)t;
++        if (g_autoscroll_step || g_autoscroll_secs <= 0.0) return;
++        if (CACurrentMediaTime() - g_autoscroll_idle_since >= g_autoscroll_secs) autoscroll_begin_step();
++    }];
++}
++
++static void autoscroll_note_user_input(void) {
++    if (g_autoscroll_secs <= 0.0) return;
++    autoscroll_end_step();
++    g_autoscroll_idle_since = CACurrentMediaTime();
++}
++
+ @implementation MacApkMetalView {
+     double _pinchSpan;   // synthesized finger separation for magnifyWithEvent: (view points)
+     double _pinchAngle;  // synthesized finger axis for rotateWithEvent: (radians, CCW, y up)
+@@ -11149,6 +11809,8 @@ @implementation MacApkMetalView {
+     BOOL    _scrollDownSent;  // the synthetic ACTION_DOWN has been sent
+     NSPoint _scrollAnchor;    // gesture start, view points (Cocoa y-up)
+     NSPoint _scrollAcc;       // accumulated synthetic-finger offset
++    BOOL    _scrollLiftPending;   // fingers lifted; waiting to see a momentum tail
++    NSUInteger _scrollLiftToken;  // which lift the pending timer belongs to
+ 
+     // Host input-method (NSTextInputClient) state. The composition buffer is
+     // ours, not the guest's: we have no read access to the guest editor's text,
+@@ -11429,6 +12091,7 @@ - (void)mouseExited:(NSEvent*)event {
+ }
+ 
+ - (void)mouseDown:(NSEvent*)event {
++    autoscroll_note_user_input();
+     // A click on our window that did not make it key (the owner's grey-traffic-
+     // light report): AppKit normally activates the app and keys the window on
+     // any click, so reaching here non-key means that did not happen. A click
+@@ -11834,6 +12497,7 @@ - (void)dispatchPinchPhase:(int)phase at:(NSPoint)p span:(double)span {
+ // The synthetic DOWN is held back until the gesture clears touch-slop, so a
+ // tiny scroll never lands as a spurious tap/click on the target underneath.
+ - (void)scrollWheel:(NSEvent*)event {
++    autoscroll_note_user_input();
+     [self macapkScrollAt:[self convertPoint:[event locationInWindow] fromView:nil]
+                       dx:event.scrollingDeltaX dy:event.scrollingDeltaY
+                  precise:event.hasPreciseScrollingDeltas
+@@ -11879,14 +12543,11 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+     // liked mostly came from the momentum tail, which is still off.
+     // MACAPK_SCROLL_SCALE=0.5 restores the old travel for an A/B.
+     static const char* kScaleEnv = getenv("MACAPK_SCROLL_SCALE");
+-    static const CGFloat kScrollScale = []{
+-        double v = kScaleEnv ? atof(kScaleEnv) : 1.0;
+-        return (CGFloat)((v >= 0.05 && v <= 4.0) ? v : 1.0);
+-    }();
+-    static const bool kNoMomentum = []{
+-        const char* e = getenv("MACAPK_SCROLL_NO_MOMENTUM");
+-        return !e || e[0] != '0';
+-    }();
++    // The Rolagem menu's choices, unless the run pinned them by environment.
++    static const char* kMomentumEnv = getenv("MACAPK_SCROLL_NO_MOMENTUM");
++    const CGFloat kScrollScale = (CGFloat)scroll_effective_speed();
++    const bool kNoMomentum = (kMomentumEnv && *kMomentumEnv) ? kMomentumEnv[0] != '0'
++                                                             : !g_scroll_host_inertia;
+     // Line-based (classic wheel) deltas are small integers -> amplify so a
+     // notch moves a usable distance. A notch keeps the travel it has had since
+     // v1.0.570 (16 pt per line x the then-global 0.5 = 8 pt; the 24 pt
+@@ -11897,7 +12558,7 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+         dx *= kScrollScale;
+         dy *= kScrollScale;
+     } else {
+-        const CGFloat wheel = 16.0 * (kScaleEnv ? kScrollScale : 0.5);
++        const CGFloat wheel = 16.0 * (kScaleEnv ? kScrollScale : 0.5 * kScrollScale);
+         dx *= wheel;
+         dy *= wheel;
+     }
+@@ -11958,7 +12619,13 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+     BOOL ended  = (ph == NSEventPhaseEnded)   || (ph == NSEventPhaseCancelled)
+                || (mph == NSEventPhaseEnded)  || (mph == NSEventPhaseCancelled);
+ 
+-    if (began) {
++    // Inércia do macOS: the momentum tail continues the SAME drag -- the finger
++    // was kept down when the fingers lifted (see `ended`).
++    const BOOL resumes = _scrollLiftPending && mph == NSEventPhaseBegan
++                      && _scrollActive && _scrollDownSent;
++    if (resumes) _scrollLiftPending = NO;
++    if (began && !resumes) {
++        _scrollLiftPending = NO;
+         // A recognized two-finger SCROLL owns the fingers: a trackpad hold on
+         // them ends (CANCEL) and cannot start for the rest of this contact.
+         if (ph == NSEventPhaseBegan) [self macapkTrackpadClaimForScroll];
+@@ -11974,6 +12641,29 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+         _scrollAcc = NSZeroPoint;
+     }
+     if (change && _scrollActive) {
++        // The content follows the fingers from the FIRST delta, as a macOS
++        // scroll view does. A finger on a touchscreen has to travel the guest's
++        // touch slop (ViewConfiguration TOUCH_SLOP, 8dp = 8pt here) before a
++        // list starts to move, and the list then discards that travel; with the
++        // DOWN also held back 6pt, a two-finger scroll moved nothing for its
++        // first ~14pt and a slow, precise one never moved at all (measured on
++        // Instagram's feed). So the synthesized finger goes down on the first
++        // delta and is placed just past the slop along the gesture's axis: the
++        // guest enters its drag at once, consumes the slop out of that jump,
++        // and every delta after it moves the content 1:1. A gesture that has
++        // cleared the slop is never a tap. MACAPK_SCROLL_SLOP_JUMP=0 restores
++        // the held-back DOWN.
++        static const bool kSlopJump = []{
++            const char* e = getenv("MACAPK_SCROLL_SLOP_JUMP");
++            return !e || e[0] != '0';
++        }();
++        static const CGFloat kSlopJumpPt = 9.0;
++        if (kSlopJump && !_scrollDownSent && (dx != 0.0 || dy != 0.0)) {
++            [self dispatchTouchAction:0 atPoint:_scrollAnchor];  // DOWN
++            _scrollDownSent = YES;
++            if (fabs(dy) >= fabs(dx)) _scrollAcc.y = dy > 0.0 ? -kSlopJumpPt : kSlopJumpPt;
++            else                      _scrollAcc.x = dx > 0.0 ? kSlopJumpPt : -kSlopJumpPt;
++        }
+         _scrollAcc.x += dx;
+         _scrollAcc.y -= dy;
+         if (!_scrollDownSent
+@@ -11988,27 +12678,47 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+         }
+     }
+     if (ended && _scrollActive) {
+-        if (_scrollDownSent) {
+-            // A scroll must never land as a tap. DOWN waits for 6pt of travel,
+-            // but the guest's slop is 8dp (~8pt), so a short two-finger nudge
+-            // that ended between the two lifted as a TAP on whatever was under
+-            // the pointer. End such a gesture with CANCEL, which every Android
+-            // gesture detector treats as "no click". MACAPK_WHEEL_MIN_TRAVEL=0
+-            // restores the UP.
+-            static const bool kScrollNoTap = []{
+-                const char* e = getenv("MACAPK_WHEEL_MIN_TRAVEL");
+-                return !e || e[0] != '0';
+-            }();
+-            const bool tapSized = hypot(_scrollAcc.x, _scrollAcc.y) < 12.0;
+-            [self dispatchTouchAction:(kScrollNoTap && tapSized) ? 3 : 1
+-                atPoint:NSMakePoint(_scrollAnchor.x + _scrollAcc.x,
+-                                    _scrollAnchor.y + _scrollAcc.y)];  // UP (or CANCEL)
++        // Inércia do macOS: the fingers lifted, but the momentum tail (when the
++        // lift had any speed) arrives a frame or two later and continues this
++        // drag. Hold the finger down that long; with no tail it lifts then.
++        if (!kNoMomentum && ph == NSEventPhaseEnded && _scrollDownSent) {
++            _scrollLiftPending = YES;
++            const NSUInteger token = ++_scrollLiftToken;
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
++                           dispatch_get_main_queue(), ^{
++                if (self->_scrollLiftPending && token == self->_scrollLiftToken) [self macapkScrollLift];
++            });
++            return;
+         }
+-        _scrollActive = NO;
+-        _scrollDownSent = NO;
++        [self macapkScrollLift];
++    }
++}
++
++// Lift the synthesized finger where it is.
++- (void)macapkScrollLift {
++    _scrollLiftPending = NO;
++    if (!_scrollActive) return;
++    if (_scrollDownSent) {
++        // A scroll must never land as a tap. DOWN waits for 6pt of travel,
++        // but the guest's slop is 8dp (~8pt), so a short two-finger nudge
++        // that ended between the two lifted as a TAP on whatever was under
++        // the pointer. End such a gesture with CANCEL, which every Android
++        // gesture detector treats as "no click". MACAPK_WHEEL_MIN_TRAVEL=0
++        // restores the UP.
++        static const bool kScrollNoTap = []{
++            const char* e = getenv("MACAPK_WHEEL_MIN_TRAVEL");
++            return !e || e[0] != '0';
++        }();
++        const bool tapSized = hypot(_scrollAcc.x, _scrollAcc.y) < 12.0;
++        [self dispatchTouchAction:(kScrollNoTap && tapSized) ? 3 : 1
++            atPoint:NSMakePoint(_scrollAnchor.x + _scrollAcc.x,
++                                _scrollAnchor.y + _scrollAcc.y)];  // UP (or CANCEL)
+     }
++    _scrollActive = NO;
++    _scrollDownSent = NO;
+ }
+ 
++
+ // Forward a host keyboard event to the Java input bridge as an Android
+ // KeyEvent. action: 0=ACTION_DOWN, 1=ACTION_UP. Reuses the touch
+ // dispatcher object (registered via registerTouchDispatcher) and resolves
+@@ -12103,6 +12813,7 @@ - (void)macapkMenuRotate:(id)sender { macapk::CocoaRotateRender(); }
+ // bound, InputMethodManager.java:4284-4316) and what keeps gameplay keys on the
+ // literal-key-code path.
+ - (void)keyDown:(NSEvent*)event {
++    autoscroll_note_user_input();
+     if (MacApkIsRotateShortcut(event)) { macapk::CocoaRotateRender(); return; }
+     // v1.0.1658 (review issue 2, clipboard-bridge lane): a fresh keyDown: of
+     // THIS key supersedes any pending "late UP" a PREVIOUS Command chord on
+diff --git a/runtime/java/com/macapk/loader/TouchDispatcher.java b/runtime/java/com/macapk/loader/TouchDispatcher.java
+--- a/runtime/java/com/macapk/loader/TouchDispatcher.java
++++ b/runtime/java/com/macapk/loader/TouchDispatcher.java
+@@ -2811,11 +2811,57 @@ public final class TouchDispatcher {
+                 s_hostPointerDown = false;
+             }
+         }
++        // The event's time is when the HOST delivered it (this call, on the
++        // AppKit thread), not when the loop gets to it: a loop busy with a frame
++        // runs its queued moves in a burst, and moves stamped at that moment
++        // read to the guest's VelocityTracker as a finger that stood still and
++        // then teleported -- the fling after a two-finger scroll came out with a
++        // different speed every time.
++        final long hostTime = android.os.SystemClock.uptimeMillis();
+         if (routeToLoop(ActivityHost.peek())) {
+-            loopHandler().post(() -> doDispatch(action, x, y, viewW, viewH));
++            if (action == MotionEvent.ACTION_MOVE) {
++                // One MOVE per loop turn, the newest (InputConsumer batches a
++                // stream the same way): moves that queued up behind a slow frame
++                // would each scroll and lay out the list again, for positions
++                // the pointer has already left.
++                synchronized (mMoveLock) {
++                    if (mPendingMove != null) {
++                        mPendingMove[0] = x; mPendingMove[1] = y;
++                        mPendingMove[2] = viewW; mPendingMove[3] = viewH;
++                        mPendingMoveTime = hostTime;
++                        return;
++                    }
++                    mPendingMove = new float[]{ x, y, viewW, viewH };
++                    mPendingMoveTime = hostTime;
++                }
++                loopHandler().post(() -> {
++                    final float[] m; final long t;
++                    synchronized (mMoveLock) { m = mPendingMove; t = mPendingMoveTime; mPendingMove = null; }
++                    if (m != null) doDispatchAt(MotionEvent.ACTION_MOVE, m[0], m[1], m[2], m[3], t);
++                });
++                return;
++            }
++            loopHandler().post(() -> doDispatchAt(action, x, y, viewW, viewH, hostTime));
+             return;
+         }
+-        doDispatch(action, x, y, viewW, viewH);
++        doDispatchAt(action, x, y, viewW, viewH, hostTime);
++    }
++    private final Object mMoveLock = new Object();
++    private float[] mPendingMove;       // guarded by mMoveLock
++    private long mPendingMoveTime;      // guarded by mMoveLock
++    /** The host delivery time of the pointer event being dispatched on this
++     *  thread, 0 outside doDispatchAt (an injected event is stamped "now"). */
++    private static final ThreadLocal<long[]> s_hostEventTime = ThreadLocal.withInitial(() -> new long[1]);
++    private void doDispatchAt(int action, float x, float y, float viewW, float viewH, long hostTime) {
++        final long[] slot = s_hostEventTime.get();
++        final long outer = slot[0];
++        slot[0] = hostTime;
++        try { doDispatch(action, x, y, viewW, viewH); }
++        finally { slot[0] = outer; }
++    }
++    private static long pointerEventTime() {
++        final long t = s_hostEventTime.get()[0];
++        return t != 0L ? t : android.os.SystemClock.uptimeMillis();
+     }
+     private void doDispatch(int action, float x, float y, float viewW, float viewH) {
+         // Input recorder (docs/input-recorder_2026-10-01.md), AT DELIVERY: on the
+@@ -2852,7 +2898,7 @@ public final class TouchDispatcher {
+         // belongs to. Every event of one press-drag-release then carries the
+         // same downTime, which is what long-press and fling classification
+         // read.
+-        if (action == 0 /* DOWN */) s_gestureDownTime = android.os.SystemClock.uptimeMillis();
++        if (action == 0 /* DOWN */) s_gestureDownTime = pointerEventTime();
+ 
+         // The drawable's real backing scale (was hardcoded 2.0f -- correct on retina, but on a 1x
+         // external display every touch landed at twice its true coordinate). See macapkBackingScale.
+@@ -2974,7 +3020,7 @@ public final class TouchDispatcher {
+                 return;  // consumed by an overlay; do NOT also hit the Activity
+             }
+         }
+-        long t = android.os.SystemClock.uptimeMillis();
++        long t = pointerEventTime();
+         long down = s_gestureDownTime != 0L ? s_gestureDownTime : t;
+         MotionEvent ev = touchEvent(down, t, action, px, py, 0);
+         try {

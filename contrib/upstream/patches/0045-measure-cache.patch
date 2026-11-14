@@ -1,0 +1,72 @@
+View: measure cache (AOSP forceLayout || needsLayout)
+
+onMeasure runs only when the view asked for layout or its spec changed (not exact / size mismatch), as AOSP measure(); otherwise the last measurement stands. Measured in the creation flow: layout 4.1 -> 1.5 ms (gallery), 6.2 -> 3.4 ms (music); p90 14 -> 6.9 ms. MACAPK_MEASURE_CACHE=0 restores measuring every pass.
+
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -3514,6 +3515,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *      if (!li.mOnLayoutChangeListeners.contains(listener)) {
+      *          li.mOnLayoutChangeListeners.add(listener);
+      *      } */
++    /** AOSP mOldWidthMeasureSpec / mOldHeightMeasureSpec (initially MIN_VALUE)
++     *  and PFLAG_LAYOUT_REQUIRED: see measure() and layout(). */
++    private int mMacapkOldWidthSpec = Integer.MIN_VALUE, mMacapkOldHeightSpec = Integer.MIN_VALUE;
++    private boolean mMacapkLayoutRequired;
++    private boolean mMacapkMeasuredOnce;
++    static final boolean MACAPK_MEASURE_CACHE = !"0".equals(System.getenv("MACAPK_MEASURE_CACHE"));
+     public void addOnLayoutChangeListener(OnLayoutChangeListener listener) {
+         if (!MACAPK_LAYOUT_CHANGE_LISTENERS) return;
+         if (mOnLayoutChangeListeners == null) {
+@@ -5090,6 +5184,43 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         try { resolveRtlPropertiesIfNeeded(); } catch (Throwable ignored) {}
+         int w = MeasureSpec.getSize(wSpec);
+         int h = MeasureSpec.getSize(hSpec);
++        // AOSP View.measure (android14 View.java:27393-27415) decides here whether
++        // the coming layout() must run onLayout and the layout-change listeners
++        // even when the frame does not move (PFLAG_LAYOUT_REQUIRED):
++        //     final boolean specChanged = widthMeasureSpec != mOldWidthMeasureSpec
++        //             || heightMeasureSpec != mOldHeightMeasureSpec;
++        //     final boolean isSpecExactly = <both modes EXACTLY>;
++        //     final boolean matchesSpecSize = getMeasuredWidth() == <spec width size>
++        //             && getMeasuredHeight() == <spec height size>;
++        //     final boolean needsLayout = specChanged
++        //             && (sAlwaysRemeasureExactly || !isSpecExactly || !matchesSpecSize);
++        //     if (forceLayout || needsLayout) { ... mPrivateFlags |= PFLAG_LAYOUT_REQUIRED; }
++        // We only had the forceLayout half (layoutRequested), so a view re-measured
++        // by its parent with a different spec never fired its listeners. Measured
++        // victim: Instagram's gallery grid. It hands a cell its thumbnail only when
++        // the cell's parent has no layout pending, else it waits for the cell's
++        // next onLayoutChange -- which on a device comes from the ConstraintLayout
++        // parent re-measuring the cell (height UNSPECIFIED, then EXACTLY 97). Ours
++        // passed the cell by, so the most recent photos stayed grey placeholders.
++        // (sAlwaysRemeasureExactly is targetSdk <= 23 only.)
++        final boolean needsMeasure;
++        {
++            final boolean specChanged = wSpec != mMacapkOldWidthSpec || hSpec != mMacapkOldHeightSpec;
++            final boolean isSpecExactly = MeasureSpec.getMode(wSpec) == MeasureSpec.EXACTLY
++                    && MeasureSpec.getMode(hSpec) == MeasureSpec.EXACTLY;
++            final boolean matchesSpecSize = (measuredWidth & MEASURED_SIZE_MASK) == w
++                    && (measuredHeight & MEASURED_SIZE_MASK) == h;
++            needsMeasure = layoutRequested || (specChanged && (!isSpecExactly || !matchesSpecSize));
++            if (needsMeasure) mMacapkLayoutRequired = true;
++        }
++        mMacapkOldWidthSpec = wSpec;
++        mMacapkOldHeightSpec = hSpec;
++        // MACAPK_MEASURE_CACHE: AOSP measure() runs onMeasure only under that same
++        // condition (forceLayout || needsLayout) and otherwise keeps the last
++        // measurement. Ours measured every view on every layout pass; in
++        // Instagram's creation flow that was most of each frame (layout 4-6 ms
++        // avg, p90 14-19 ms, against 2-3 ms of drawing).
++        if (MACAPK_MEASURE_CACHE && !needsMeasure && mMacapkMeasuredOnce) return;
+         // v1.0.438: RESILIENT measure -- a child whose onMeasure throws must NOT
+         // abort the parent's whole measure pass (which leaves the ENTIRE content
+         // tree 0x0 -> totally blank). The trigger: androidx AbstractComposeView.
+@@ -5166,6 +5297,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+             if ((measuredWidth & MEASURED_SIZE_MASK) == 0)  measuredWidth  = w;
+             if ((measuredHeight & MEASURED_SIZE_MASK) == 0) measuredHeight = h;
+         }
++        mMacapkMeasuredOnce = true;
+         // Targeted compose-measure trace (MACAPK_TRACE_COMPOSE_FALLBACK=1):
+         // log measure of any ComposeView/AndroidComposeView (the renamed
+         // AndroidComposeView is androidx.compose.ui.platform.c). Confirms

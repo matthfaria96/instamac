@@ -1,0 +1,350 @@
+canary backstop: only treat a +0x28 load as the guard when its compare
+reloads the slot the prologue saved the guard in
+
+The stack-canary neutralization pass rewrites `ldr Xt,[Xn,#0x28]` to
+`mov Xt,#0` when it believes Xn holds TPIDR_EL0. Its BACKSTOP arm (used when
+the dataflow lost track of Xn) accepts any such load in a stack-protected
+function that is followed by `ldr Xu,[sp,#M] ; cmp Xt,Xu ; b.cond`. A
+std::map emptiness test has exactly that shape when end() is spilled:
+
+  libstartup.so (Instagram 455.0.0.51.72), CDN cache-key init
+  0x4445a0  ldr  x8,[x11,#0x28] ; 0x4445a4 str x8,[sp,#0x228]  <- prologue guard save
+  0x445258  ldr  x20,[x10,#0x28]                               <- inner map begin()
+  0x445270  ldr  x8,[sp,#0x70]                                 <- spilled end()
+  0x445274  cmp  x20,x8 ; b.eq 0x445160
+
+The backstop wrote `mov x20,#0` (confirmed by reading the live code at the
+fault: d2800014 where the file has f9401554). The walk then dereferenced
+NULL+0x50, the null-recovery masked every following fault, and the thread
+(SWPool3, CacheKeyGenerator.initializeKeyGenerator) spun at 98% CPU while
+the main thread waited in isInitialized: a black window on every launch with
+a logged-in session (only then is the cache-key JSON parsed).
+
+Fix: remember, per function, the frame slot where the prologue saves the
+guard it read (the store that follows the dataflow-patched prologue read;
+reset at each frame push and each `sub sp,sp,#N`). The backstop declines a
+candidate whose compare reloads a different offset off the same base.
+Declining is the safe direction: a genuine guard read left unpatched still
+faults on the TPIDR magic and is answered at fault time by the shim's
+canary backstop. MACAPK_CANARY_GUARD_SLOT=0 restores the previous behavior;
+the knob is part of the canary-plan cache key.
+
+Measured: across the 42 images the pass ran on in one Instagram launch it now declines exactly one
+site (libstartup+0x445258); an offline audit of the 5,764 backstop sites
+that remain finds every one feeding a __stack_chk_fail check or a
+straight-line epilogue. Six saved data trees that hung 6/6 now open 6/6 in
+InstagramMainActivity (8-10 s).
+
+Also adds MACAPK_FAULT_DUMP=N (default off): for the first N near-null
+faults the recovery is about to mask, print the register file, the live
+code before pc, 0x300 bytes above sp and 0x80 bytes behind every register
+that points at readable memory (read with mach_vm_read_overwrite, so it is
+fault-free inside the handler). This is how the rewrite above was found;
+without a debugger (SIP, no get-task-allow) it is the only snapshot.
+
+Applies to vendor/macapk at 57c9912 (after 0005) with `patch -p1` from
+vendor/macapk.
+
+diff --git a/runtime/translator/src/arm64_native.cpp b/runtime/translator/src/arm64_native.cpp
+index f2e974b..ba655f5 100644
+--- a/runtime/translator/src/arm64_native.cpp
++++ b/runtime/translator/src/arm64_native.cpp
+@@ -11893,8 +11905,8 @@ size_t Image::apply_midr_el1_neutralization() {
+ //     which hash, and the version tag that names it, is the plan-key hash
+ //     block's MACAPK_PLAN_KEY_FASTHASH);
+ //   * the PLT relocations it uses to find the __stack_chk_fail stub;
+-//   * the five env knobs that change what it writes (WIDE_RELOAD, MARKER_FIX,
+-//     MARK, NO_CANARY_LOOP_CLEAR, OUTLINED_MRS), verbatim;
++//   * the six env knobs that change what it writes (WIDE_RELOAD, MARKER_FIX,
++//     MARK, NO_CANARY_LOOP_CLEAR, OUTLINED_MRS, GUARD_SLOT), verbatim;
+ //   * THE PASS'S OWN CODE: this dylib's LC_UUID, which ld64 derives from the
+ //     output bytes, so any rebuild that changes the shim invalidates every plan
+ //     by itself -- nobody has to remember to bump a version (kX18PlanVersion
+@@ -11969,7 +11981,7 @@ size_t Image::apply_stack_canary_neutralization() {
+     std::string knobs;
+     for (const char* k : { "MACAPK_CANARY_WIDE_RELOAD", "MACAPK_CANARY_MARKER_FIX",
+                            "MACAPK_CANARY_MARK", "MACAPK_NO_CANARY_LOOP_CLEAR",
+-                           "MACAPK_CANARY_OUTLINED_MRS" }) {
++                           "MACAPK_CANARY_OUTLINED_MRS", "MACAPK_CANARY_GUARD_SLOT" }) {
+         const char* v = std::getenv(k);
+         knobs += k; knobs += '='; knobs += v ? v : "\x01"; knobs += ';';
+     }
+@@ -12293,6 +12305,37 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+     // misses the epilogue load done through the copy.
+     bool func_has_tpidr_mrs = false;
+ 
++    // MACAPK_CANARY_GUARD_SLOT (default ON; =0 restores the previous backstop).
++    // The frame slot where THIS function's prologue saved the guard it read
++    // (`ldr Xt,[tp,#0x28] ; str Xt,[sp,#M]`), as {base register, byte offset};
++    // base -1 = not seen. A canary CHECK compares the epilogue's guard read with
++    // exactly that slot, so a backstop candidate whose compare reloads a
++    // DIFFERENT slot off the same base is an ordinary field load that happens to
++    // sit at +0x28 and be compared with a spilled value.
++    //
++    // MEASURED 2026-11-11, Instagram 455 libstartup.so (CDN cache-key init,
++    // CacheKeyGenerator.initializeKeyGenerator): the prologue saves the guard
++    // at [sp,#0x228]; the body walks a std::map<int, std::map<..>> and does
++    //   0x445258  ldr  x20,[x10,#0x28]   ; inner map begin (node value @+0x28)
++    //   0x445270  ldr  x8, [sp,#0x70]    ; spilled end()
++    //   0x445274  cmp  x20,x8 ; b.eq     ; "inner map empty?"
++    // The backstop matched it and wrote `mov x20,#0`; the walk then dereferenced
++    // NULL, the null-recovery masked every fault, and the thread spun forever:
++    // every launch with a logged-in session (only then is the config JSON
++    // parsed) hung on a black window with the main thread in isInitialized.
++    //
++    // Declining is the safe direction: a genuine guard read this leaves
++    // unpatched still faults on the TPIDR magic and is answered at fault time
++    // by the shim's canary backstop, whereas a wrong patch silently zeroes a
++    // live field.
++    static const bool kGuardSlot = [] {
++        const char* e = std::getenv("MACAPK_CANARY_GUARD_SLOT");
++        return !(e && e[0] == '0');
++    }();
++    int guard_slot_base = -1;
++    int guard_slot_off = 0;
++    size_t guard_slot_declined = 0;
++
+     // Recognise the stack-canary epilogue CHECK reachable from a `ldr Xt,[Xn,#0x28]`
+     // at `p`: within a short window, a reload of the spilled guard
+     // `ldr Xu,[sp,#M]` (Xu != Xt) followed by `cmp Xt,Xu` (64-bit SUBS, Rd=XZR)
+@@ -12472,11 +12515,12 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+     }();
+ 
+     auto epilogue_guard_check = [](uint32_t* p, uint32_t* lo, uint32_t* end,
+-                                   uint32_t xt) -> bool {
++                                   uint32_t xt, uint32_t* reload_out = nullptr) -> bool {
+         uint32_t* q = p + 1;              // first instruction after the guard ldr
+         int follow_budget = 1;            // hops across at most one unconditional `b`
+         for (;;) {
+             int sp_loaded = -1;           // Xu from the spilled-guard reload, or -1
++            uint32_t reload_insn = 0;     // the reload instruction itself
+             bool hopped = false;
+             for (int k = 0; k < 8 && (q + k) < end; ++k) {
+                 uint32_t j = *(q + k);
+@@ -12502,6 +12546,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+                     uint32_t u = j & 0x1Fu;
+                     if (u == xt) return false;    // reloads Xt -> guard value gone
+                     sp_loaded = (int)u;
++                    reload_insn = j;
+                     continue;
+                 }
+                 // cmp Xt,Xu : SUBS (shifted register, 64-bit), Rd=XZR
+@@ -12511,7 +12556,10 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+                         && (rn == xt || rm == xt)
+                         && (rn == (uint32_t)sp_loaded || rm == (uint32_t)sp_loaded)) {
+                         for (int m = 1; m <= 2 && (q + k + m) < end; ++m)
+-                            if ((*(q + k + m) & 0xFF000010u) == 0x54000000u) return true;  // b.cond
++                            if ((*(q + k + m) & 0xFF000010u) == 0x54000000u) {     // b.cond
++                                if (reload_out) *reload_out = reload_insn;
++                                return true;
++                            }
+                         return false;
+                     }
+                     continue;   // a DIFFERENT compare (e.g. the return-value cmp that
+@@ -12556,6 +12604,53 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+         }
+     };
+ 
++    // Base register and byte offset of a 64-bit `ldr/str Xt,[Xn,#imm12*8]` or
++    // `ldur/stur Xt,[Xn,#simm9]` whose base is sp or x29; false otherwise.
++    auto frame_slot_of = [](uint32_t j, int& base, int& off) -> bool {
++        const uint32_t rn = (j >> 5) & 0x1Fu;
++        if (rn != 31u && rn != 29u) return false;
++        if ((j & 0xFF800000u) == 0xF9000000u) {          // LDR/STR (unsigned offset)
++            base = (int)rn; off = (int)(((j >> 10) & 0xFFFu) * 8u);
++            return true;
++        }
++        if ((j & 0xFFA00C00u) == 0xF8000000u) {          // LDUR/STUR (unscaled)
++            int imm9 = (int)((j >> 12) & 0x1FFu);
++            if (imm9 & 0x100) imm9 -= 0x200;
++            base = (int)rn; off = imm9;
++            return true;
++        }
++        return false;
++    };
++    // After the prologue's guard read at p (now `mov Xt,#0`), the next few
++    // instructions store Xt to its frame slot. Stop at anything that rewrites
++    // Xt or leaves the straight line.
++    auto record_guard_slot = [&](uint32_t* p, uint32_t* end, uint32_t xt) {
++        for (uint32_t* q = p + 1; q < end && q <= p + 8; ++q) {
++            const uint32_t j = *q;
++            int base, off;
++            const bool is_str = (j & 0xFFC00000u) == 0xF9000000u
++                             || (j & 0xFFE00C00u) == 0xF8000000u;
++            if (is_str && (j & 0x1Fu) == xt && frame_slot_of(j, base, off)) {
++                guard_slot_base = base;
++                guard_slot_off = off;
++                return;
++            }
++            if ((j & 0x7C000000u) == 0x14000000u          // b / bl
++                || (j & 0xFF000010u) == 0x54000000u       // b.cond
++                || (j & 0xFE1F0000u) == 0xD61F0000u)      // br / blr / ret
++                return;
++            if (!is_str && (j & 0x1Fu) == xt) return;     // Xt rewritten
++        }
++    };
++    // True when the backstop's compare reloads a slot off the SAME base as the
++    // prologue's guard save but at a different offset: that is not the canary.
++    auto reload_misses_guard_slot = [&](uint32_t reload) -> bool {
++        if (!kGuardSlot || guard_slot_base < 0 || reload == 0) return false;
++        int base, off;
++        if (!frame_slot_of(reload, base, off) || base != guard_slot_base) return false;
++        return off != guard_slot_off;
++    };
++
+     // Gated TLSDESC tp-zeroing: in a pure-TLSDESC image, rewrite every
+     // `mrs Xt, TPIDR_EL0` to `mov Xt, #0` so the guest's `tp + x0` yields our
+     // resolver's ABSOLUTE per-thread address (the resolver returns the absolute
+@@ -12845,6 +12940,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+ 
+         clear_all();
+         func_has_tpidr_mrs = false;
++        guard_slot_base = -1;
+ 
+         // Loop-redef pre-scan (see MACAPK_NO_CANARY_LOOP_CLEAR above): for every
+         // backward branch S->T (loop head T, back-edge at S), record which GP
+@@ -12967,6 +13063,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+                 && (insn & 0x1Fu) == 29u && ((insn >> 10) & 0x1Fu) == 30u
+                 && ((insn >> 5) & 0x1Fu) == 31u) {
+                 func_has_tpidr_mrs = false;
++                guard_slot_base = -1;
+             }
+ 
+             // mrs Xt, TPIDR_EL0
+@@ -12990,6 +13087,10 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+             if (((insn >> 24) == 0x91u || (insn >> 24) == 0xD1u)
+                 && (insn & 0x1Fu) == 31u && ((insn >> 5) & 0x1Fu) == 31u) {
+                 tpidr_slot_off = -1;
++                // `sub sp,sp,#N` allocates a frame: a new function's prologue
++                // (functions that do not open with a pre-index frame push), so
++                // the previous function's guard slot no longer applies.
++                if ((insn >> 24) == 0xD1u) guard_slot_base = -1;
+                 continue;
+             }
+             // ldr Xt, [sp, #imm] (unsigned-offset, 64-bit): a reload from the
+@@ -13055,6 +13156,12 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+                     pass1_neutralized.insert(reinterpret_cast<uintptr_t>(p));
+                     is_tpidr[rt] = false;
+                     ++patched;
++                    // A prologue's guard read is followed by the save of the
++                    // value to its frame slot (a few insns ahead, before Xt is
++                    // reused): remember that slot for the backstop below. An
++                    // epilogue's read is followed by a compare, not a save, so
++                    // it never overwrites the slot.
++                    if (kGuardSlot) record_guard_slot(p, end, rt);
+                     continue;
+                 }
+                 // BACKSTOP: the linear is_tpidr[] tracking above lost Xn (a
+@@ -13066,7 +13173,24 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+                 // against a stack-spilled value + branch). See func_has_tpidr_mrs.
+                 // epilogue_guard_check follows one unconditional `b` so a guard load
+                 // that branches to a SHARED compare block (renoir 0x7c1f2bc) matches.
+-                if (func_has_tpidr_mrs && epilogue_guard_check(p, lo, end, rt)) {
++                uint32_t reload = 0;
++                const bool check_shape = func_has_tpidr_mrs
++                    && epilogue_guard_check(p, lo, end, rt, &reload);
++                const bool other_slot = check_shape && reload_misses_guard_slot(reload);
++                if (other_slot) {
++                    ++guard_slot_declined;
++                    if (kCanaryTrace)
++                        std::fprintf(stderr,
++                            "[canary-trace] %s backstop-declined 0x%llx (x%u<-[x%u,#0x28]; "
++                            "compare reloads [x%d,#%d], guard saved at [x%d,#%d])\n",
++                            dbg_name_,
++                            (unsigned long long)(reinterpret_cast<uint8_t*>(p) - base_),
++                            rt, rn, (int)((reload >> 5) & 0x1Fu),
++                            (reload & 0xFF800000u) == 0xF9000000u
++                                ? (int)(((reload >> 10) & 0xFFFu) * 8u) : 0,
++                            guard_slot_base, guard_slot_off);
++                }
++                if (check_shape && !other_slot) {
+                     if (kCanaryTrace)
+                         std::fprintf(stderr,
+                             "[canary-trace] %s backstop 0x%llx (x%u<-[x%u,#0x28])\n",
+@@ -13555,6 +13679,11 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
+         std::fprintf(stderr,
+             "[arm64-native] %s: TLSDESC tp-zero rewrote %zu mrs TPIDR_EL0 "
+             "site(s) to mov #0\n", dbg_name_, tp_zeroed);
++    if (guard_slot_declined)
++        std::fprintf(stderr,
++            "[arm64-native] %s: canary backstop declined %zu field load(s) at +0x28 "
++            "(compare reloads a slot other than the prologue's guard save)\n",
++            dbg_name_, guard_slot_declined);
+     // MACAPK_LOAD_TIMING=1 also prints a digest of every executable segment as
+     // this pass leaves it, so an optimisation of the pass can be proven
+     // output-identical on a real image (compare the line across two builds).
+diff --git a/runtime/translator/src/bionic_shim.cpp b/runtime/translator/src/bionic_shim.cpp
+index 9fdd246..17a0dd5 100644
+--- a/runtime/translator/src/bionic_shim.cpp
++++ b/runtime/translator/src/bionic_shim.cpp
+@@ -2306,6 +2329,70 @@ static bool try_recover_arm64_native_null_deref(siginfo_t* info, ucontext_t* uc)
+             is_load ? "LDR" : "STR", is_simd ? "(simd)" : "", Rt,
+             is_pair ? "(pair)" : "", is_simd ? "V" : "X");
+     }
++    // MACAPK_FAULT_DUMP=N (default off): for the first N near-null faults this
++    // handler is about to mask, print the full integer register file and the
++    // 0x300 bytes above sp. A device would have died at this instruction, so
++    // the state here is the earliest point where ours and a device's diverge;
++    // without a debugger (SIP + no get-task-allow) this is the only snapshot.
++    if (!tpidr_magic_fault) {
++        static const long s_dump_n = [] {
++            const char* e = std::getenv("MACAPK_FAULT_DUMP");
++            return e ? std::strtol(e, nullptr, 0) : 0L;
++        }();
++        static std::atomic<long> s_dumped{0};
++        if (s_dump_n > 0 && s_dumped.fetch_add(1) < s_dump_n) {
++            const auto& ss = uc->uc_mcontext->__ss;
++            std::fprintf(stderr, "[fault-dump] pc=%p lr=%p sp=%p fp=%p fault=%p insn=0x%08x\n",
++                         reinterpret_cast<void*>(pc), reinterpret_cast<void*>(ss.__lr),
++                         reinterpret_cast<void*>(ss.__sp), reinterpret_cast<void*>(ss.__fp),
++                         fault_addr, insn);
++            for (int r = 0; r < 29; r += 4) {
++                std::fprintf(stderr, "[fault-dump]  x%-2d=%016llx", r, (unsigned long long)ss.__x[r]);
++                for (int k = 1; k < 4 && r + k < 29; ++k)
++                    std::fprintf(stderr, "  x%-2d=%016llx", r + k, (unsigned long long)ss.__x[r + k]);
++                std::fprintf(stderr, "\n");
++            }
++            const uint64_t* s = reinterpret_cast<const uint64_t*>(ss.__sp);
++            for (int i = 0; i < 0x300 / 8; i += 4) {
++                std::fprintf(stderr, "[fault-dump]  sp+%03x: %016llx %016llx %016llx %016llx\n",
++                             i * 8, (unsigned long long)s[i], (unsigned long long)s[i + 1],
++                             (unsigned long long)s[i + 2], (unsigned long long)s[i + 3]);
++            }
++            // The LIVE code before the fault: load-time passes rewrite guest
++            // .text, so the file's bytes are not necessarily what ran.
++            {
++                uint32_t code[48];
++                mach_vm_size_t got = 0;
++                const uint64_t from = pc - 0xa0;
++                if (mach_vm_read_overwrite(mach_task_self(), from, sizeof code,
++                                           reinterpret_cast<mach_vm_address_t>(code), &got) == KERN_SUCCESS
++                    && got == sizeof code) {
++                    for (int i = 0; i < 48; i += 8) {
++                        std::fprintf(stderr, "[fault-dump]  code pc-%02llx:", (unsigned long long)(0xa0 - i * 4));
++                        for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %08x", code[i + k]);
++                        std::fprintf(stderr, "\n");
++                    }
++                }
++            }
++            // Memory behind every register that points somewhere readable.
++            // mach_vm_read_overwrite reports an unmapped source as an error
++            // instead of faulting, so this is safe inside the SEGV handler.
++            for (int r = 0; r < 29; ++r) {
++                const uint64_t a = ss.__x[r] & 0x00ffffffffffffffull;   // drop the Android heap tag byte
++                if (a < 0x100000ull || a >= (1ull << 47)) continue;
++                uint64_t m[16];
++                mach_vm_size_t got = 0;
++                if (mach_vm_read_overwrite(mach_task_self(), a, sizeof m,
++                                           reinterpret_cast<mach_vm_address_t>(m), &got) != KERN_SUCCESS
++                    || got != sizeof m) continue;
++                for (int i = 0; i < 16; i += 4)
++                    std::fprintf(stderr, "[fault-dump]  *x%-2d+%02x: %016llx %016llx %016llx %016llx\n",
++                                 r, i * 8, (unsigned long long)m[i], (unsigned long long)m[i + 1],
++                                 (unsigned long long)m[i + 2], (unsigned long long)m[i + 3]);
++            }
++            std::fflush(stderr);
++        }
++    }
+     if (is_load && Rt < 31) {
+         // MACAPK_PAIRIP_TLS_CANARY (default OFF): libpairipcore reads the Bionic stack canary via
+         // `mrs TPIDR_EL0; ldr Xt,[Xn,#0x28]` (TLS_SLOT_STACK_GUARD). On macOS TPIDR_EL0 is the

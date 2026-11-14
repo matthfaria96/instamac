@@ -1,0 +1,81 @@
+ValueAnimator never answers null for a float/int animator; TextureView.getBitmap copies the content
+
+- ValueAnimator.getAnimatedValue(): before the first frame, AOSP's
+  Float/IntPropertyValuesHolder answer from a primitive field (0), never null.
+  Ours answered null, and Facebook's Shimmer unboxes it in draw() -- every
+  ShimmerFrameLayout.dispatchDraw threw a NullPointerException (Instagram's
+  loading placeholders). Object animators keep AOSP's null.
+- TextureView.getBitmap(Bitmap) was a stub returning the bitmap untouched
+  (blank). It now draws the surface texture's latest latched frame (camera or
+  decoded video) or the lockCanvas content into it, scaled from the view size
+  with setTransform applied -- what draw() shows.
+
+diff --git a/runtime/java/android/animation/ValueAnimator.java b/runtime/java/android/animation/ValueAnimator.java
+--- a/runtime/java/android/animation/ValueAnimator.java
++++ b/runtime/java/android/animation/ValueAnimator.java
+@@ -142,8 +142,24 @@ public class ValueAnimator extends Animator {
+     }
+     public long getCurrentPlayTime() { return (long) (currentFraction * durationMs); }
+     public float getAnimatedFraction() { return currentFraction; }
+-    public Object getAnimatedValue() { return animatedValue; }
+-    public Object getAnimatedValue(String propertyName) { return animatedValue; }
++    public Object getAnimatedValue() { return animatedValue != null ? animatedValue : macapkUnstartedValue(); }
++    public Object getAnimatedValue(String propertyName) { return getAnimatedValue(); }
++
++    /** Before the first frame computes a value. AOSP's Float/IntPropertyValuesHolder
++     *  answer getAnimatedValue() from a primitive field (mFloatAnimatedValue /
++     *  mIntAnimatedValue), so an ofFloat/ofInt animator never answers null: 0 until it
++     *  runs. Facebook's Shimmer unboxes it in draw() -- (float) animator
++     *  .getAnimatedValue() -- and the null threw in every ShimmerFrameLayout
++     *  dispatchDraw, so its children (Instagram's loading gallery cells) were never
++     *  drawn (measured 2026-11-12). Object animators keep AOSP's null. */
++    private Object macapkUnstartedValue() {
++        switch (valueType) {
++            case T_FLOAT: return 0f;
++            case T_INT:
++            case T_ARGB:  return 0;
++            default:      return null;
++        }
++    }
+ 
+     @Override public void setInterpolator(android.animation.TimeInterpolator value) { this.interpolator = value; }
+     @Override public android.animation.TimeInterpolator getInterpolator() { return interpolator; }
+diff --git a/runtime/java/android/view/TextureView.java b/runtime/java/android/view/TextureView.java
+--- a/runtime/java/android/view/TextureView.java
++++ b/runtime/java/android/view/TextureView.java
+@@ -288,9 +290,35 @@ public class TextureView extends View {
+         return getBitmap(Bitmap.createBitmap(Math.max(1, width), Math.max(1, height),
+                 Bitmap.Config.ARGB_8888));
+     }
++    /** AOSP: a copy of the surface texture's current content, as the view shows
++     *  it (setTransform applied), scaled into `bitmap`. Was a stub returning the
++     *  bitmap untouched -- blank -- so an app that snapshots its preview (a camera
++     *  capture taken from the TextureView) got an empty picture. The content is
++     *  the latest latched frame (camera or decoded video) or the lockCanvas
++     *  content, the same image draw() puts on screen. */
+     public Bitmap getBitmap(Bitmap bitmap) {
++        if (bitmap == null) return null;
++        Bitmap frame = null;
++        if (mSurfaceTexture != null) {
++            try { frame = mSurfaceTexture.macapkLatchBitmap(); } catch (Throwable ignored) { }
++        }
++        if (frame == null) frame = mCanvasContent;
++        if (sGetBitmapLogged < 3) {
++            sGetBitmapLogged++;
++            com.macapk.loader.NativeLog.i("TextureView", "getBitmap " + bitmap.getWidth() + "x" + bitmap.getHeight()
++                + " <- " + (frame == null ? "nothing" : frame.getWidth() + "x" + frame.getHeight()));
++        }
++        if (frame == null || frame.getWidth() <= 0 || frame.getHeight() <= 0) return bitmap;
++        final int vw = Math.max(1, getWidth()), vh = Math.max(1, getHeight());
++        final android.graphics.Canvas c = new android.graphics.Canvas(bitmap);
++        c.scale(bitmap.getWidth() / (float) vw, bitmap.getHeight() / (float) vh);
++        if (!mMatrix.isIdentity()) c.concat(mMatrix);
++        final android.graphics.Paint pt = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
++        c.drawBitmap(frame, new android.graphics.Rect(0, 0, frame.getWidth(), frame.getHeight()),
++                new android.graphics.Rect(0, 0, vw, vh), pt);
+         return bitmap;
+     }
++    private static int sGetBitmapLogged;
+ 
+     // AOSP: `public Canvas lockCanvas()` / `public Canvas lockCanvas(Rect)`.
+     // The return TYPE is linkable ABI -- app bytecode compiled against the SDK

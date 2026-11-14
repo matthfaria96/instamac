@@ -1,0 +1,561 @@
+draw cache, fast opaque hole, cached text shaping: the pixels a scroll redraws without change
+
+Measured on Instagram's feed scroll with MACAPK_DRAW_SAMPLER=1 (a daemon thread
+that samples the drawing thread's stack every millisecond during rootView.draw):
+~40% of the draw went to avatars filled with a BitmapShader and photos drawn
+scaled, 12% to the SurfaceView/TextureView hole (DST_OUT through Java2D's
+general loop), 10% to re-shaping every string with HarfBuzz.
+- Canvas DRAW_CACHE: a scaled drawBitmap (Rect, Matrix, or (x, y) under a
+  scaling CTM) and an ellipse/rounded-rect/rect fill with a BitmapShader are
+  kept as device pixels, keyed by the bitmap and its generation id, the source
+  rect or shader matrix and tile modes, the shape, filter/AA, and the sub-pixel
+  phase; later frames copy them 1:1 under their own clip and composite. Admitted
+  only the second time a draw is seen identical (first-sight admission churned
+  ~700 MB a minute and GC stalled frames for seconds); sightings are remembered
+  weakly per source object, so a noted bitmap is never kept alive. A cache of
+  plain AA shapes (solid/gradient ovals, arcs) was measured and dropped: the key
+  cost more than drawing them. Bounded LRU
+  (MACAPK_DRAW_CACHE_MB, 24), at most 1.2 MP per image. MACAPK_DRAW_CACHE=0 off.
+- Canvas PUNCH_FAST: an opaque rectangular hole on whole device pixels under a
+  rectangular clip is written as row clears (the DST_OUT fill's exact result).
+  MACAPK_PUNCH_FAST=0 off.
+- MacApkFont QUANTIZE_CACHE: the shaped, quantized GlyphVector is kept per
+  thread by (font, text, liga); the letter-spacing path, which moves glyphs,
+  uses quantizeUncached. MACAPK_QUANTIZE_CACHE=0 off.
+A/B on the same scroll script: draw-only frames 5.16 -> 2.69 ms, full frames
+7.67 -> 5.82 ms, 354 -> 1646 frames produced; the owner's profile screen
+differs in 0.26% of pixels, none by more than 24/255.
+
+diff --git a/runtime/java/android/graphics/Canvas.java b/runtime/java/android/graphics/Canvas.java
+--- a/runtime/java/android/graphics/Canvas.java
++++ b/runtime/java/android/graphics/Canvas.java
+@@ -2186,7 +2186,8 @@ public class Canvas {
+         if (p.getStyle() == Paint.Style.STROKE) {
+             g.draw(macapkSkiaGeom(s, p));
+         } else {
+-            g.fill(macapkSkiaGeom(s, p));
++            final Shape fs = macapkSkiaGeom(s, p);
++            if (!dcShaderFill(fs, p)) g.fill(fs);
+             if (p.getStyle() == Paint.Style.FILL_AND_STROKE) g.draw(macapkSkiaGeom(s, p));
+         }
+     }
+@@ -2202,7 +2203,7 @@ public class Canvas {
+         if (hasShadow(p)) drawShapeShadow(s, p, false);
+         applyPaint(p);
+         if (p.getStyle() == Paint.Style.STROKE) g.draw(s);
+-        else g.fill(s);
++        else if (!dcShaderFill(s, p)) g.fill(s);
+     }
+     /** AOSP `drawArc(RectF, startAngle, sweepAngle, useCenter, Paint)`.
+      *  Used by SwipeRefreshLayout's CircleImageView for the progress
+@@ -2340,7 +2381,7 @@ public class Canvas {
+         if (hasShadow(p)) drawShapeShadow(s, p, false);
+         applyPaint(p);
+         if (p.getStyle() == Paint.Style.STROKE) g.draw(s);
+-        else g.fill(s);
++        else if (!dcShaderFill(s, p)) g.fill(s);
+     }
+     // API 21+ 6-float overload. Compose / Material3 draw rounded cards + buttons
+     // via this signature; without it rootView.draw threw NoSuchMethodError and the
+@@ -2588,8 +2630,9 @@ public class Canvas {
+         // vector, same cluster rule (MacApkFont.spacingClusterOrdinals) as the
+         // measure side, so measure and draw agree by construction.
+         if (MacApkFont.SHAPED_SPACING && MacApkFont.firstSpecial(text, primary) < 0) {
+-            MacApkFont.Quantized q = MacApkFont.quantize(g.getFont(), text,
+-                                                         MacApkFont.ligaFor(ls));
++            // Uncached: the glyphs are moved below (quantize's vectors are shared).
++            MacApkFont.Quantized q = MacApkFont.quantizeUncached(g.getFont(), text,
++                                                                 MacApkFont.ligaFor(ls));
+             int[] ord = (q == null) ? null : MacApkFont.spacingClusterOrdinals(q.glyphs, text);
+             if (ord != null) {
+                 java.awt.font.GlyphVector gv = q.glyphs;
+@@ -3027,6 +3114,10 @@ public class Canvas {
+         if (g == null || shape == null) return;
+         float a = alpha < 0f ? 0f : (alpha > 1f ? 1f : alpha);
+         if (a <= 0f) return;   // a fully transparent SurfaceView punches nothing
++        if (a >= 1f && macapkClearRectHole(shape)) {
++            macapkPropagatePunch(shape, a);
++            return;
++        }
+         java.awt.Composite oldComp = g.getComposite();
+         java.awt.Paint oldPaint = g.getPaint();
+         try {
+@@ -3055,6 +3146,37 @@ public class Canvas {
+                 + " dev=" + dev.x + "," + dev.y + " " + dev.width + "x" + dev.height
+                 + " a=" + a);
+         }
++        macapkPropagatePunch(shape, a);
++    }
++
++    /** MACAPK_PUNCH_FAST (default on): an opaque hole that is a rectangle on whole
++     *  device pixels, under a rectangular clip, is the DST_OUT fill's exact result
++     *  -- every covered pixel becomes 0 -- written as row clears. DST_OUT went
++     *  through Java2D's general composite loop, pixel by pixel, every frame, over
++     *  the whole video (12% of the feed's draw, measured 2026-11-12). */
++    static final boolean PUNCH_FAST = !"0".equals(System.getenv("MACAPK_PUNCH_FAST"));
++    private boolean macapkClearRectHole(java.awt.Shape shape) {
++        if (!PUNCH_FAST || !(shape instanceof Rectangle2D r) || image == null) return false;
++        final AffineTransform t = g.getTransform();
++        if ((t.getType() & ~AffineTransform.TYPE_TRANSLATION) != 0) return false;
++        final double x0 = r.getMinX() + t.getTranslateX(), y0 = r.getMinY() + t.getTranslateY();
++        final double x1 = r.getMaxX() + t.getTranslateX(), y1 = r.getMaxY() + t.getTranslateY();
++        final int X0 = (int) Math.rint(x0), Y0 = (int) Math.rint(y0), X1 = (int) Math.rint(x1), Y1 = (int) Math.rint(y1);
++        if (Math.abs(x0 - X0) > 1e-6 || Math.abs(y0 - Y0) > 1e-6
++                || Math.abs(x1 - X1) > 1e-6 || Math.abs(y1 - Y1) > 1e-6) return false;
++        final int[] clip = new int[4];
++        if (!macapkDeviceClipRect(clip)) return false;
++        final int[] dd = stockArgbData(image);
++        if (dd == null) return false;
++        final int W = image.getWidth();
++        final int cx0 = Math.max(X0, clip[0]), cy0 = Math.max(Y0, clip[1]);
++        final int cx1 = Math.min(X1, clip[2]), cy1 = Math.min(Y1, clip[3]);
++        for (int y = cy0; y < cy1; y++) java.util.Arrays.fill(dd, y * W + cx0, y * W + Math.max(cx0, cx1), 0);
++        return true;
++    }
++
++    /** The recording half of a punch (see macapkPunchShape). */
++    private void macapkPropagatePunch(java.awt.Shape shape, float a) {
+         if (!PUNCH_PROPAGATE) return;
+         if (this instanceof RecordingCanvas) {
+             RenderNode owner = ((RecordingCanvas) this).macapkOwner();
+@@ -3558,8 +3680,10 @@ public class Canvas {
+             AffineTransform blit = AffineTransform.getTranslateInstance(x, y);
+             // Sprite unless the CTM scales: a fractional translate alone stays
+             // nearest, which is the property the paragraph above depends on.
+-            Object rest = macapkBeginFilter(
+-                macapkFilterBlit(p, blit, src.getWidth(), src.getHeight()));
++            final boolean filtXY = macapkFilterBlit(p, blit, src.getWidth(), src.getHeight());
++            if (dcScaledBlit(b, src, p, filtXY, 0, 0, src.getWidth(), src.getHeight(),
++                             x, y, x + src.getWidth(), y + src.getHeight())) return;
++            Object rest = macapkBeginFilter(filtXY);
+             try { g.drawImage(src, blit, null); }
+             finally { macapkEndFilter(rest); }
+         }
+@@ -3591,6 +3715,10 @@ public class Canvas {
+             blit.scale(dstR.width() / (double) sw, dstR.height() / (double) sh);
+         }
+         final boolean filt = macapkFilterBlit(p, blit, sw, sh);
++        if (sw > 0 && sh > 0
++                && dcScaledBlit(b, src, p, filt, srcR != null ? srcR.left : 0, srcR != null ? srcR.top : 0,
++                                (srcR != null ? srcR.left : 0) + sw, (srcR != null ? srcR.top : 0) + sh,
++                                dstR.left, dstR.top, dstR.right, dstR.bottom)) return;
+         if (filt && sw > 0 && sh > 0
+                 && macapkScaledBlit(src, srcR != null ? srcR.left : 0, srcR != null ? srcR.top : 0,
+                                     (srcR != null ? srcR.left : 0) + sw, (srcR != null ? srcR.top : 0) + sh,
+@@ -3626,6 +3754,13 @@ public class Canvas {
+         if (src == null) return;
+         AffineTransform tx = (matrix != null) ? matrix.macapkToAffine() : new AffineTransform();
+         final boolean filt = macapkFilterBlit(p, tx, src.getWidth(), src.getHeight());
++        if ((tx.getType() & ~(AffineTransform.TYPE_TRANSLATION
++                | AffineTransform.TYPE_GENERAL_SCALE | AffineTransform.TYPE_UNIFORM_SCALE)) == 0
++                && tx.getScaleX() > 0 && tx.getScaleY() > 0
++                && dcScaledBlit(b, src, p, filt, 0, 0, src.getWidth(), src.getHeight(),
++                        tx.getTranslateX(), tx.getTranslateY(),
++                        tx.getTranslateX() + src.getWidth() * tx.getScaleX(),
++                        tx.getTranslateY() + src.getHeight() * tx.getScaleY())) return;
+         // A positive scale + translate matrix is a src-to-dst rect mapping, the same
+         // blit the Rect overload makes (Skia: SkDraw::drawBitmap concats it into the CTM).
+         if (filt && (tx.getType() & ~(AffineTransform.TYPE_TRANSLATION
+@@ -5328,6 +5463,260 @@ public class Canvas {
+     // fails the timing row, and a pre-fix div8 table and a late-starting band each
+     // fail their own row. MACAPK_BITMAP_SCALE_FAST=0 restores g.drawImage.
+     // Doc: docs/telegram-wallpaper-scaled-blit_2026-10-01.md.
++    // ---- MACAPK_DRAW_CACHE: pixels a scroll redraws without anything changing ----
++    // MEASURED 2026-11-12 (Instamac, Instagram's feed scrolled, MACAPK_DRAW_SAMPLER=1
++    // in ViewCanvasDriver): ~40% of rootView.draw went to pixels that are the same
++    // frame after frame -- avatars filled with a BitmapShader (MacApkBitmapShaderPaint
++    // samples every covered pixel through the shader matrix in Java, then MaskBlit
++    // composites it) and photos drawn scaled (TransformHelper resamples the whole
++    // photo; macapkScaledBlit refuses most of them: non-stock source, shaped clip).
++    // Both are kept here, keyed by everything that decides their pixels: the bitmap
++    // and its generation id (bumped on every pixel change, inBitmap reuse and
++    // reconfigure included), the source rect or shader matrix and tile modes, the
++    // shape, the filter and AA flags, and the sub-pixel phase on the device grid.
++    // A later frame copies the kept pixels 1:1 to an integer device position under
++    // its own clip and composite (SrcOver with the paint alpha, as the direct draw
++    // applies it). Only under a translate-only CTM, SrcOver and no colour filter;
++    // edge pixels may differ from the direct draw by a rounding step (the kept
++    // pixels are stored once before being composited).
++    // Bounded LRU, MACAPK_DRAW_CACHE_MB (default 24). MACAPK_DRAW_CACHE=0 draws
++    // everything directly, as before.
++    static final boolean DRAW_CACHE =
++        !"0".equals(System.getenv("MACAPK_DRAW_CACHE")) && Bitmap.GENID;
++    private static final long DC_BUDGET = dcBudget();
++    private static long dcBudget() {
++        try {
++            String e = System.getenv("MACAPK_DRAW_CACHE_MB");
++            if (e != null) return Math.max(1L, Long.parseLong(e.trim())) << 20;
++        } catch (Throwable ignored) { }
++        return 24L << 20;
++    }
++    private static final int DC_MAX_SIDE = 4096;
++    private static final long DC_MAX_PIXELS = 1_200_000L;   // ~4.8 MB kept per image at most
++    /** `src` is what the pixels come from, compared by identity: the Bitmap (with
++     *  its generation id), the Shader (Android shaders are immutable but for their
++     *  local matrix, which is in geo), or null for a solid colour (in geo). */
++    private static final class DcKey {
++        final Object src; final int gen; final long[] geo; final int hash;
++        DcKey(Object src, int gen, long[] geo) {
++            this.src = src; this.gen = gen; this.geo = geo;
++            this.hash = (System.identityHashCode(src) * 31 + gen) * 31 + java.util.Arrays.hashCode(geo);
++        }
++        @Override public int hashCode() { return hash; }
++        @Override public boolean equals(Object o) {
++            return o instanceof DcKey k && k.src == src && k.gen == gen && java.util.Arrays.equals(k.geo, geo);
++        }
++    }
++    private static final java.util.LinkedHashMap<DcKey, BufferedImage> sDc =
++        new java.util.LinkedHashMap<>(64, 0.75f, true);
++    private static long sDcBytes;
++    /** Diagnostic counters (ViewCanvasDriver's draw sampler reports them): a
++     *  miss is either a first sighting (New: drawn directly, only noted) or a
++     *  second identical sighting that is then kept. */
++    public static long sDcHits, sDcMisses, sDcMissNew, sDcMissGen, sDcMissGeo;
++    /** Admission: a draw is kept only the SECOND time it is seen identical. A first
++     *  sighting draws directly and is only noted -- a bitmap drawn once while
++     *  scrolling past, or whose pixels change between frames, never costs an
++     *  allocation (keeping them on first sight churned ~700 MB a minute and the
++     *  GC pauses stalled frames for seconds, measured 2026-11-12). Sightings of a
++     *  source object are remembered weakly (the 4 most recent per object), so a
++     *  noted bitmap is never kept alive; solid colours, which have no object,
++     *  in a bounded LRU. */
++    private static final java.util.WeakHashMap<Object, long[][]> sDcSeen = new java.util.WeakHashMap<>();
++    private static final java.util.LinkedHashMap<DcKey, Boolean> sDcSeenSolid =
++        new java.util.LinkedHashMap<DcKey, Boolean>(256, 0.75f, true) {
++            @Override protected boolean removeEldestEntry(java.util.Map.Entry<DcKey, Boolean> e) {
++                return size() > 1024;
++            }
++        };
++    private static boolean dcAdmit(DcKey key) {
++        if (key.src == null) {
++            synchronized (sDcSeenSolid) {
++                if (sDcSeenSolid.remove(key) != null) return true;
++                sDcSeenSolid.put(key, Boolean.TRUE);
++                sDcMissNew++;
++                return false;
++            }
++        }
++        final long[] now = new long[1 + key.geo.length];
++        now[0] = key.gen;
++        System.arraycopy(key.geo, 0, now, 1, key.geo.length);
++        synchronized (sDcSeen) {
++            long[][] seen = sDcSeen.get(key.src);
++            if (seen == null) sDcSeen.put(key.src, seen = new long[4][]);
++            for (int i = 0; i < seen.length; i++) {
++                if (seen[i] != null && java.util.Arrays.equals(seen[i], now)) {
++                    seen[i] = null;
++                    return true;
++                }
++            }
++            System.arraycopy(seen, 0, seen, 1, seen.length - 1);
++            seen[0] = now;
++            sDcMissNew++;
++            return false;
++        }
++    }
++    public static long macapkDrawCacheBytes() { synchronized (sDc) { return sDcBytes; } }
++
++    private static BufferedImage dcGet(DcKey k) { synchronized (sDc) { return sDc.get(k); } }
++    private static void dcPut(DcKey k, BufferedImage img) {
++        synchronized (sDc) {
++            BufferedImage old = sDc.put(k, img);
++            if (old != null) sDcBytes -= 4L * old.getWidth() * old.getHeight();
++            sDcBytes += 4L * img.getWidth() * img.getHeight();
++            java.util.Iterator<java.util.Map.Entry<DcKey, BufferedImage>> it = sDc.entrySet().iterator();
++            while (sDcBytes > DC_BUDGET && it.hasNext()) {
++                BufferedImage v = it.next().getValue();
++                it.remove();
++                sDcBytes -= 4L * v.getWidth() * v.getHeight();
++            }
++        }
++    }
++    private static long dcQ(double v) { return Math.round(v * 256.0); }
++
++    /** The kept pixels to integer device (ix, iy), under this frame's clip and composite. */
++    private void dcBlit(BufferedImage px, int ix, int iy) {
++        final AffineTransform save = g.getTransform();
++        try {
++            g.setTransform(new AffineTransform());
++            g.drawImage(px, ix, iy, null);
++        } finally {
++            g.setTransform(save);
++        }
++    }
++
++    /** True when this draw may use the cache: SrcOver (any alpha) under a
++     *  translate-only CTM, or with `scaled` an axis-aligned positive scale too
++     *  (ImageView draws a photo through canvas.concat(drawMatrix)). */
++    private boolean dcUsable(boolean scaled) {
++        if (!DRAW_CACHE || g == null || image == null) return false;
++        if (!(g.getComposite() instanceof AlphaComposite ac) || ac.getRule() != AlphaComposite.SRC_OVER) return false;
++        final AffineTransform t = g.getTransform();
++        final int allowed = scaled
++            ? AffineTransform.TYPE_TRANSLATION | AffineTransform.TYPE_UNIFORM_SCALE | AffineTransform.TYPE_GENERAL_SCALE
++            : AffineTransform.TYPE_TRANSLATION;
++        return (t.getType() & ~allowed) == 0 && t.getScaleX() > 0 && t.getScaleY() > 0;
++    }
++
++    /** A scaled drawBitmap of `b` (whose pixels are `src`): src's [sx0,sx1) x
++     *  [sy0,sy1) onto the user rect [ux0,ux1) x [uy0,uy1), kept. False = not
++     *  handled; the caller draws it. */
++    private boolean dcScaledBlit(Bitmap b, BufferedImage src, Paint p, boolean filt,
++                                 int sx0, int sy0, int sx1, int sy1,
++                                 double ux0, double uy0, double ux1, double uy1) {
++        if (b == null || src == null || src == image || !dcUsable(true)) return false;
++        if (p != null && p.getColorFilter() != null) return false;
++        if (sx1 <= sx0 || sy1 <= sy0 || !(ux1 > ux0) || !(uy1 > uy0)) return false;
++        if (sx0 < 0 || sy0 < 0 || sx1 > src.getWidth() || sy1 > src.getHeight()) return false;
++        // The destination in DEVICE pixels: the CTM is translate + positive scale.
++        final AffineTransform t = g.getTransform();
++        final double dx0 = ux0 * t.getScaleX() + t.getTranslateX(), dy0 = uy0 * t.getScaleY() + t.getTranslateY();
++        final double dw = (ux1 - ux0) * t.getScaleX(), dh = (uy1 - uy0) * t.getScaleY();
++        if (Math.abs(dw - (sx1 - sx0)) < 1e-9 && Math.abs(dh - (sy1 - sy0)) < 1e-9) return false;
++        final int ix = (int) Math.floor(dx0), iy = (int) Math.floor(dy0);
++        final int w = (int) Math.ceil(dx0 + dw) - ix, h = (int) Math.ceil(dy0 + dh) - iy;
++        if (w < 8 || h < 8 || w > DC_MAX_SIDE || h > DC_MAX_SIDE || (long) w * h > DC_MAX_PIXELS) return false;
++        final int gen = b.getGenerationId();
++        if (gen == 0) return false;
++        final long[] geo = { 1, sx0, sy0, sx1, sy1, dcQ(dx0 - ix), dcQ(dy0 - iy),
++                             Double.doubleToLongBits(dw), Double.doubleToLongBits(dh),
++                             filt ? 1 : 0 };
++        final DcKey key = new DcKey(b, gen, geo);
++        BufferedImage px = dcGet(key);
++        if (px == null) {
++            if (!dcAdmit(key)) return false;
++            px = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
++            final Graphics2D cg = px.createGraphics();
++            try {
++                cg.setComposite(AlphaComposite.Src);
++                cg.setRenderingHint(RenderingHints.KEY_INTERPOLATION, filt
++                    ? RenderingHints.VALUE_INTERPOLATION_BILINEAR
++                    : g.getRenderingHint(RenderingHints.KEY_INTERPOLATION) != null
++                        ? g.getRenderingHint(RenderingHints.KEY_INTERPOLATION)
++                        : RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
++                final AffineTransform m = AffineTransform.getTranslateInstance(dx0 - ix, dy0 - iy);
++                m.scale(dw / (sx1 - sx0), dh / (sy1 - sy0));
++                m.translate(-sx0, -sy0);
++                cg.setClip(0, 0, w, h);
++                cg.drawImage(src, m, null);
++            } finally {
++                cg.dispose();
++            }
++            dcPut(key, px);
++            sDcMisses++;
++        } else {
++            sDcHits++;
++        }
++        dcBlit(px, ix, iy);
++        return true;
++    }
++
++    /** A fill of an ellipse, rounded rect or rect with a BitmapShader paint (the
++     *  installed MacApkBitmapShaderPaint), kept. False = not handled. */
++    private boolean dcShaderFill(Shape s, Paint p) {
++        if (s == null || p == null || !dcUsable(false)) return false;
++        if (!(g.getPaint() instanceof MacApkBitmapShaderPaint)) return false;
++        if (!(p.getShader() instanceof BitmapShader bs) || bs.bitmap == null || p.getColorFilter() != null) return false;
++        final long kind; final double[] sp;
++        if (s instanceof java.awt.geom.Ellipse2D e) {
++            kind = 1; sp = new double[] { e.getX(), e.getY(), e.getWidth(), e.getHeight() };
++        } else if (s instanceof RoundRectangle2D r) {
++            kind = 2; sp = new double[] { r.getX(), r.getY(), r.getWidth(), r.getHeight(), r.getArcWidth(), r.getArcHeight() };
++        } else if (s instanceof Rectangle2D r) {
++            kind = 3; sp = new double[] { r.getX(), r.getY(), r.getWidth(), r.getHeight() };
++        } else {
++            return false;
++        }
++        final int gen = bs.bitmap.getGenerationId();
++        if (gen == 0) return false;
++        final Rectangle2D lb = s.getBounds2D();
++        if (lb.isEmpty()) return false;
++        final AffineTransform t = g.getTransform();
++        final double tx = t.getTranslateX(), ty = t.getTranslateY();
++        final int ix = (int) Math.floor(lb.getMinX() + tx) - 1, iy = (int) Math.floor(lb.getMinY() + ty) - 1;
++        final int w = (int) Math.ceil(lb.getMaxX() + tx) + 1 - ix, h = (int) Math.ceil(lb.getMaxY() + ty) + 1 - iy;
++        if (w <= 0 || h <= 0 || w > DC_MAX_SIDE || h > DC_MAX_SIDE || (long) w * h > DC_MAX_PIXELS) return false;
++        final double ox = tx - ix, oy = ty - iy;
++        final AffineTransform lm = bs.macapkLocalAffine();
++        final double[] m = { 1, 0, 0, 1, 0, 0 };
++        if (lm != null) lm.getMatrix(m);
++        final long[] geo = new long[8 + sp.length + m.length];
++        int i = 0;
++        geo[i++] = 2;
++        geo[i++] = kind;
++        geo[i++] = dcQ(ox);
++        geo[i++] = dcQ(oy);
++        geo[i++] = bs.tileX.ordinal() * 16L + bs.tileY.ordinal();
++        geo[i++] = bs.getFilterMode() * 2L + (p.isFilterBitmap() ? 1 : 0);
++        geo[i++] = RenderingHints.VALUE_ANTIALIAS_ON.equals(
++            g.getRenderingHint(RenderingHints.KEY_ANTIALIASING)) ? 1 : 0;
++        geo[i++] = w * 65536L + h;
++        for (double v : sp) geo[i++] = Double.doubleToLongBits(v);
++        for (double v : m) geo[i++] = Double.doubleToLongBits(v);
++        final DcKey key = new DcKey(bs.bitmap, gen, geo);
++        BufferedImage px = dcGet(key);
++        if (px == null) {
++            if (!dcAdmit(key)) return false;
++            px = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
++            final Graphics2D cg = px.createGraphics();
++            try {
++                cg.setRenderingHints(g.getRenderingHints());
++                cg.setComposite(AlphaComposite.SrcOver);
++                cg.setPaint(g.getPaint());
++                cg.translate(ox, oy);
++                cg.fill(s);
++            } finally {
++                cg.dispose();
++            }
++            dcPut(key, px);
++            sDcMisses++;
++        } else {
++            sDcHits++;
++        }
++        dcBlit(px, ix, iy);
++        return true;
++    }
++
+     static final boolean BITMAP_SCALE_FAST =
+         !"0".equals(System.getenv("MACAPK_BITMAP_SCALE_FAST"));
+     /** How many draws the fast path served (diagnostic; the gate reads it). */
+diff --git a/runtime/java/android/graphics/MacApkFont.java b/runtime/java/android/graphics/MacApkFont.java
+--- a/runtime/java/android/graphics/MacApkFont.java
++++ b/runtime/java/android/graphics/MacApkFont.java
+@@ -632,8 +632,38 @@ public final class MacApkFont {
+         return quantize(sized, text, STD_LIGATURES);
+     }
+ 
+-    /** `liga`: shape with standard ligatures (ligaFor(letterSpacing)). */
++    /** `liga`: shape with standard ligatures (ligaFor(letterSpacing)).
++     *
++     *  MACAPK_QUANTIZE_CACHE (default on): the result is kept per thread, keyed by
++     *  the font (Font.equals: family, style, size, transform, attributes), the text
++     *  and `liga` -- shaping is a function of exactly those, and a frame redraws the
++     *  same strings: re-shaping every caption, name and count on every frame was 10%
++     *  of the Instagram feed's draw (MACAPK_DRAW_SAMPLER, 2026-11-12). The vector is
++     *  shared: a caller that moves glyphs must use quantizeUncached. Per thread, so
++     *  a vector is never drawn by two threads at once. */
+     public static Quantized quantize(Font sized, String text, boolean liga) {
++        if (!QUANTIZE_CACHE) return quantizeUncached(sized, text, liga);
++        if (!GLYPH_QUANTIZE || sized == null || text == null || text.isEmpty()) return null;
++        final QKey k = new QKey(sized, text, liga);
++        final java.util.LinkedHashMap<QKey, Quantized> m = sQuantized.get();
++        Quantized q = m.get(k);
++        if (q == null) {
++            q = quantizeUncached(sized, text, liga);
++            if (q != null) m.put(k, q);
++        }
++        return q;
++    }
++    static final boolean QUANTIZE_CACHE = !"0".equals(System.getenv("MACAPK_QUANTIZE_CACHE"));
++    private record QKey(Font font, String text, boolean liga) { }
++    private static final ThreadLocal<java.util.LinkedHashMap<QKey, Quantized>> sQuantized =
++        ThreadLocal.withInitial(() -> new java.util.LinkedHashMap<QKey, Quantized>(256, 0.75f, true) {
++            @Override protected boolean removeEldestEntry(java.util.Map.Entry<QKey, Quantized> e) {
++                return size() > 2048;
++            }
++        });
++
++    /** quantize without the cache: a vector the caller may change. */
++    public static Quantized quantizeUncached(Font sized, String text, boolean liga) {
+         if (!GLYPH_QUANTIZE || sized == null || text == null || text.isEmpty()) return null;
+         try {
+             // layoutGlyphVector also runs GSUB, so ligatures make getNumGlyphs()
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -488,6 +500,83 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+     // "laggy" decomposes into pump/prep/layout/draw/bar/present numbers.
+     private static final boolean PHASE_TRACE =
+             "1".equals(System.getenv("MACAPK_FRAME_PHASE_TRACE"));
++
++    /** MACAPK_DRAW_SAMPLER=1 (diagnostic): where rootView.draw spends its time,
++     *  by Java method. A daemon thread looks at the drawing thread's stack every
++     *  millisecond while a draw is in progress and counts (a) the top frame and
++     *  (b) the innermost android.graphics / android.text / android.widget /
++     *  android.view frame -- the framework call the app's draw is waiting on.
++     *  Every 10 s: one line per top-25 entry of each, then the counts reset. */
++    private static final boolean DRAW_SAMPLER = "1".equals(System.getenv("MACAPK_DRAW_SAMPLER"));
++    static final class DrawSampler {
++        private static volatile Thread drawing;
++        private static volatile boolean inDraw;
++        private static final java.util.HashMap<String, int[]> top = new java.util.HashMap<>();
++        private static final java.util.HashMap<String, int[]> fw = new java.util.HashMap<>();
++        private static int samples;
++        private static Thread sampler;
++
++        static void enter() {
++            drawing = Thread.currentThread();
++            inDraw = true;
++            if (sampler == null) {
++                sampler = new Thread(DrawSampler::run, "macapk-draw-sampler");
++                sampler.setDaemon(true);
++                sampler.start();
++            }
++        }
++        static void exit() { inDraw = false; }
++
++        private static void run() {
++            long nextReport = System.nanoTime() + 10_000_000_000L;
++            while (true) {
++                try { Thread.sleep(1); } catch (InterruptedException e) { return; }
++                Thread t = drawing;
++                if (inDraw && t != null) {
++                    StackTraceElement[] st = t.getStackTrace();
++                    if (inDraw && st.length > 0) {
++                        samples++;
++                        count(top, st[0].getClassName() + "." + st[0].getMethodName());
++                        for (StackTraceElement e : st) {
++                            String c = e.getClassName();
++                            if (c.startsWith("android.graphics.") || c.startsWith("android.text.")
++                                    || c.startsWith("android.widget.") || c.startsWith("android.view.")) {
++                                count(fw, c + "." + e.getMethodName());
++                                break;
++                            }
++                        }
++                    }
++                }
++                if (System.nanoTime() >= nextReport) {
++                    nextReport = System.nanoTime() + 10_000_000_000L;
++                    report("top", top);
++                    report("framework", fw);
++                    NativeLog.i(TAG, "[draw-sampler] draw cache hits=" + android.graphics.Canvas.sDcHits
++                        + " misses=" + android.graphics.Canvas.sDcMisses
++                        + " (new=" + android.graphics.Canvas.sDcMissNew + " gen=" + android.graphics.Canvas.sDcMissGen
++                        + " geo=" + android.graphics.Canvas.sDcMissGeo + ") kept="
++                        + (android.graphics.Canvas.macapkDrawCacheBytes() >> 10) + " KB");
++                    samples = 0;
++                    top.clear();
++                    fw.clear();
++                }
++            }
++        }
++        private static void count(java.util.HashMap<String, int[]> m, String k) {
++            m.computeIfAbsent(k, x -> new int[1])[0]++;
++        }
++        private static void report(String what, java.util.HashMap<String, int[]> m) {
++            if (samples == 0) return;
++            java.util.List<java.util.Map.Entry<String, int[]>> l = new java.util.ArrayList<>(m.entrySet());
++            l.sort((a, b) -> b.getValue()[0] - a.getValue()[0]);
++            StringBuilder sb = new StringBuilder("[draw-sampler] " + what + " samples=" + samples);
++            for (int i = 0; i < Math.min(25, l.size()); i++) {
++                sb.append("\n[draw-sampler]   ").append(l.get(i).getValue()[0] * 100 / samples)
++                  .append("% ").append(l.get(i).getKey());
++            }
++            NativeLog.i(TAG, sb.toString());
++        }
++    }
+     private long ptSumPre, ptSumPrep, ptSumLayout, ptSumDraw, ptSumBar, ptSumPresent;
+     private long ptMaxTotal; private int ptFrames, ptOver17, ptOver33, ptLayoutFrames;
+     private long ptSumCkpt;
+@@ -1756,9 +1856,11 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             macapkRootCanvas = canvas;
+             macapkPartialDraw = partialSave >= 0;   // FRAMESPEED S2 (see the field)
+             final int opsBefore = canvas.macapkDrawOps;
++            if (DRAW_SAMPLER) DrawSampler.enter();
+             try {
+                 rootView.draw(canvas);
+             } finally {
++                if (DRAW_SAMPLER) DrawSampler.exit();
+                 macapkRootCanvas = null;
+                 macapkPartialDraw = false;
+             }

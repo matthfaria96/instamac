@@ -1,0 +1,1178 @@
+window: two modes that open at a device's size, a rebuilt menu bar, and a user rotation that relaunches
+
+cocoa_bridge.mm, window_policy.{h,cpp}. The window has two modes, picked from
+the View menu (Visualizar): Celular (the per-app portrait preference) and Tablet
+(the default one). MACAPK_WINDOW_SIZE_PORTRAIT / MACAPK_WINDOW_SIZE_DEFAULT =
+<W>x<H> give each the content size it opens with -- at launch, on a rotation and
+from View > Tamanho Padrão -- applied as the resize a window manager makes
+(ApplyUserResize) chained onto the transition that picked the preference, so the
+app is given one Configuration. Without it the portrait box is the display
+turned on its side (500x800 on a 1280x800 budget). With MACAPK_RESOLUTION_UI=1
+each mode stays resizable inside its own layout class (portrait content width
+320..599pt, default at least 720x480; Android's phone/tablet line is 600dp),
+never fullscreen, and View > Travar Tamanho da Janela pins the current size (off
+unless <root>/.macapk/resolution says "locked"). MACAPK_DEBUG_AUTOORIENT drives
+the menu's orientation items in an unattended run.
+
+The menu bar is rebuilt: the app menu (Sobre, Proxy de Rede, Limpar Cache,
+Ocultar, Ocultar Outros, Mostrar Todos, Encerrar), Visualizar, Rolagem (scroll speed, whose
+inertia, auto-scroll: the settings 0016 reads, kept in the user defaults),
+Navegar (Voltar, Cmd+[), Idioma, Janela. MACAPK_MENU_CONTROLS=0 hides the
+game-controls menu; MACAPK_MENU_DUMP=1 prints the bar as text.
+Limpar Cache does what Settings > Storage > Clear cache does on a device: the
+contents of every package's cache/ and code_cache/ under the Android root (the
+link out of the bundle is followed), after a dialog that states the size.
+Measured with the app running: 3781 files, 298.4 MB -> 2 MB, the app kept going
+(MACAPK_DEBUG_CLEAR_CACHE=<secs> for an unattended run).
+
+Measured on Instagram 455: opens 412x915 (window 412x947), Cmd+R -> 1280x800 ->
+412x915, each by one relaunch; boot 10/10.
+
+MACAPK_ROTATE_RELAUNCH=1 (off by default): a rotation the USER asked for
+relaunches the activities alive at that moment instead of reporting the change
+to them, and drops the orientation the app requested for the old display
+(window_policy ToggleUserPref, DisplayConfig.macapkNoteUserRotation,
+Activity.macapkClearRecordRequest). An app that declares
+orientation|screenSize handles the change in place on a device, but one that
+derives its size class only in onCreate is left half-converted: Instagram 455
+went tablet -> phone with the tab bar back and the feed still on tablet insets,
+and could not leave portrait at all once it had requested it for a phone-sized
+display ("preference -> default (with the app's request portrait): box
+unchanged").
+
+DisplayConfig / Resources.updateConfiguration: the display's fields belong to
+the display. Mac.apk serves the Application and every Activity from one
+Resources, so an app that replays a Configuration it captured earlier (a locale
+wrapper) also replays that moment's screen size into the configuration the next
+activity launches with; on a device the activity's Resources get the window's
+override configuration applied over whatever the app passed. A Resources that
+was following the committed display keeps its display fields when the incoming
+configuration carries a display that was committed before and is gone.
+Measured: relaunched on 1280x800dp, Instagram left the shared configuration at
+the boot display's 500x800dp sw500 and laid the tablet window out as a phone
+(bottom tab bar, media 1280 px wide), and the rotation back saw diff=0x0 and did
+nothing. With the guard the log reads "app updateConfiguration replayed a past
+display (500x800dp sw500); kept 1280x800dp sw800 land"; portrait -> landscape
+comes up with the side rail and the centred feed, landscape -> portrait with the
+tab bar and phone insets, both by relaunch (MACAPK_DEBUG_AUTOROTATE=30,60).
+
+Activity.onConfigurationChanged failures now log where they stopped.
+
+diff --git a/runtime/include/macapk/window_policy.h b/runtime/include/macapk/window_policy.h
+--- a/runtime/include/macapk/window_policy.h
++++ b/runtime/include/macapk/window_policy.h
+@@ -295,6 +295,16 @@ struct DeviceSettings {
+     // (AllowedUserResize), and a window-manager size, a Split View tile or a
+     // request on such a window letterboxes it on it (LiveState::held_side).
+     bool  relaunch_on_resize = false;
++    // MACAPK_ROTATE_RELAUNCH=1 (DisplayConfig.ROTATE_RELAUNCH_ON): the user's
++    // rotate command relaunches the activity on the other display, so the
++    // orientation the app requested for THIS one is not carried into the new
++    // box (ToggleUserPref). While it is OFF (the default) the request stands,
++    // as AOSP keeps it across a user aspect-ratio change. Without this an app
++    // that asks for PORTRAIT exactly when the display is phone-sized could
++    // never be rotated back: the default preference resolved with that request
++    // is the same portrait letterbox (measured on Instagram: "preference ->
++    // default (with the app's request portrait): box unchanged").
++    bool  user_rotation_drops_request = false;
+ };
+ 
+ // The display the decision is made for. Mac.apk passes its content budget
+diff --git a/runtime/src/window_policy.cpp b/runtime/src/window_policy.cpp
+--- a/runtime/src/window_policy.cpp
++++ b/runtime/src/window_policy.cpp
+@@ -930,6 +930,10 @@ DeviceSettings SettingsFromEnv(std::string* warnings) {
+     // below and the relaunch it stands in for cannot disagree.
+     if (const char* e = std::getenv("MACAPK_RESIZE_RELAUNCH"); e && std::strcmp(e, "1") == 0)
+         s.relaunch_on_resize = true;
++    // The SAME switch DisplayConfig.ROTATE_RELAUNCH_ON reads ("1" only): the
++    // request is dropped exactly when the activity that made it is relaunched.
++    if (const char* e = std::getenv("MACAPK_ROTATE_RELAUNCH"); e && std::strcmp(e, "1") == 0)
++        s.user_rotation_drops_request = true;
+     return s;
+ }
+ 
+@@ -963,14 +967,14 @@ std::string FormatSettings(const DeviceSettings& s) {
+     else std::snprintf(ur, sizeof ur, "%g", s.unresizable_min_aspect);
+     std::snprintf(buf, sizeof buf,
+         "letterbox=%s unresizable=%s universal=%s ignoreOrientationRequest=%s "
+-        "position=%g,%g sizeCompatUpscale=%s relaunch=%d", fo, ur,
++        "position=%g,%g sizeCompatUpscale=%s relaunch=%d rotateRelaunch=%d", fo, ur,
+         s.universal == UniversalMode::kSdk36 ? "sdk36"
+             : s.universal == UniversalMode::kAll ? "all" : "off",
+         s.ignore_orientation_request == IgnoreOrientationMode::kAuto ? "auto"
+             : s.ignore_orientation_request == IgnoreOrientationMode::kOn ? "1" : "0",
+         s.letterbox_horizontal_position, s.letterbox_vertical_position,
+         s.size_compat_upscale == SizeCompatUpscale::kAlways ? "always" : "bywindowingmode",
+-        s.relaunch_on_resize ? 1 : 0);
++        s.relaunch_on_resize ? 1 : 0, s.user_rotation_drops_request ? 1 : 0);
+     return buf;
+ }
+ 
+@@ -1281,8 +1285,11 @@ LiveOutcome ToggleUserPref(const WindowTraits& t, const DeviceSettings& s,
+     out.next = cur;
+     const UserWindowPref next = cur.pref == UserWindowPref::kPortrait
+         ? UserWindowPref::kDefault : UserWindowPref::kPortrait;
++    // DeviceSettings::user_rotation_drops_request: the activity is relaunched
++    // on the new display and states its own request there.
++    const bool drop_request = cur.has_request && s.user_rotation_drops_request;
+     RequestOverride req;
+-    if (cur.has_request && !WP_MUTANT(16)) {
++    if (cur.has_request && !drop_request && !WP_MUTANT(16)) {
+         req.active = true;
+         req.screen_orientation = cur.request;
+     }
+@@ -1330,8 +1337,14 @@ LiveOutcome ToggleUserPref(const WindowTraits& t, const DeviceSettings& s,
+     out.next.compat_restart_offered = false;
+     out.next.small_display = false;
+     out.next.held_side = kConfigOrientUndefined;   // the user chose this box
+-    const std::string with_req = cur.has_request
+-        ? std::string(" (with the app's request ") + OrientationName(cur.request) + ")" : std::string();
++    if (drop_request) {
++        out.next.has_request = false;
++        out.next.request = kOrientUnspecified;
++    }
++    const std::string with_req = !cur.has_request ? std::string()
++        : drop_request ? std::string(" (the app's request ") + OrientationName(cur.request)
++                         + " dropped: relaunch on rotation)"
++        : std::string(" (with the app's request ") + OrientationName(cur.request) + ")";
+     if (fs && !WP_MUTANT(25)) {
+         // Mutant 25: the fullscreen window takes the box (a setFrame on a
+         // fullscreen window).
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -3929,6 +3964,15 @@ - (void)handleGetURLEvent:(NSAppleEventDescriptor*)event
+ }
+ @end
+ 
++// The fixed window size: defined later in this file, used by CocoaInit and by
++// every reshape.
++static void resolution_load(void);
++static void resolution_apply(NSWindow* w);
++static void window_mode_limits(NSWindow* w);
++static void scroll_settings_load(void);
++static void resolution_release_for_reshape(NSWindow* w);
++static BOOL resolution_locked(void);
++
+ namespace macapk {   // reopened after MacapkHostUrlHandler
+ 
+ static MacapkHostUrlHandler* g_host_url_handler = nil;
+@@ -4089,6 +4133,10 @@ bool CocoaInit() {
+         // Before finishLaunching: see "Host URL intake" above.
+         macapk_install_host_url_handler();
+         [g_app finishLaunching];
++        // The size lock: read before the View menu is built and before the
++        // window exists, so both start from the remembered choice.
++        resolution_load();
++        scroll_settings_load();
+         // Give the runtime window a real menu bar (app menu + View > Rotate/Cmd+R)
+         // instead of AppKit's default empty one.
+         install_menu_bar(titleStr);
+@@ -4099,7 +4147,10 @@ bool CocoaInit() {
+         // doesn't clip the title bar / Dock area. Visible frame
+         // excludes the menu bar / Dock so the resulting window fits
+         // entirely on-screen.
+-        NSRect screenVis = [[NSScreen mainScreen] visibleFrame];
++        NSRect screenVis = [macapk_launch_screen() visibleFrame];
++        if (screenVis.size.width < 64 || screenVis.size.height < 64) {
++            screenVis = [[NSScreen mainScreen] visibleFrame];
++        }
+         // v1.0.503: ASPECT-PRESERVING clamp (was per-dimension, which could
+         // square an over-tall request). Shrink the app's w:h to fit the visible
+         // frame, never enlarge (scale capped at 1.0). For the --orientation auto
+@@ -4210,7 +4261,11 @@ bool CocoaInit() {
+         // the user sees, and "a window is up" is a different fact from "the
+         // app drew something" -- measuring them apart is the whole point of
+         // the boot-time budget, so the boundary has to be in the log.
+-        std::fprintf(stderr, "[macapk] window: placeholder shown\n");
++        // The window exists at the policy's box: pin it there (no handle, no
++        // zoom, no fullscreen). The pin never resizes; a reshape re-pins.
++        resolution_apply(g_placeholder_window);
++        std::fprintf(stderr, "[macapk] window: placeholder shown%s\n",
++                     resolution_locked() ? " (tamanho fixo)" : "");
+         // Correct the position once AppKit has applied the aspect-ratio fit-shrink
+         // (see recenter_placeholder_next_cycle) so the window opens centered.
+         recenter_placeholder_next_cycle();
+@@ -5137,6 +5192,46 @@ static void globals_from_live() {
+     g_phone_h = g_wp.live.app_h_pt;
+ }
+ 
++// ---- the two window modes open at a device's size -------------------------------
++//
++// MACAPK_WINDOW_SIZE_PORTRAIT / MACAPK_WINDOW_SIZE_DEFAULT = <W>x<H>, points: the
++// content size the window takes when it enters that preference -- at launch, on
++// a rotation, and from View > Tamanho Padrão. The policy's own portrait box is
++// the display turned on its side (500x800 on a 1280x800 budget), which is no
++// device anyone holds; a phone is 412x915. The size is applied as the resize a
++// window manager makes (ApplyUserResize: the window becomes the display and the
++// box is re-resolved on it), chained onto the transition that picked the
++// preference, so the app is given one Configuration, not two. It is fitted to
++// the screen's content area with its shape kept.
++static bool mode_default_size(winpolicy::UserWindowPref pref, int* w, int* h) {
++    const char* e = std::getenv(pref == winpolicy::UserWindowPref::kPortrait
++                                    ? "MACAPK_WINDOW_SIZE_PORTRAIT" : "MACAPK_WINDOW_SIZE_DEFAULT");
++    int sw = 0;
++    if (!e || !*e || !winpolicy::ParseBudgetOverride(e, w, h, &sw) || *w <= 0 || *h <= 0) return false;
++    const CocoaContentBudget cb = CocoaQueryContentBudget();
++    if (cb.ok && (*w > cb.w_pt || *h > cb.h_pt)) {
++        const double k = std::min((double)cb.w_pt / *w, (double)cb.h_pt / *h);
++        *w = (int)std::floor(*w * k);
++        *h = (int)std::floor(*h * k);
++    }
++    return *w > 0 && *h > 0;
++}
++
++static winpolicy::LiveWindow with_mode_default_size(const winpolicy::LiveWindow& w) {
++    int dw = 0, dh = 0;
++    if (w.fullscreen || !mode_default_size(w.pref, &dw, &dh)) return w;
++    if (dw == w.win_w_pt && dh == w.win_h_pt) return w;
++    const winpolicy::LiveOutcome o =
++        winpolicy::ApplyUserResize(g_wp.traits, g_wp.settings, w, dw, dh);
++    if (o.change == winpolicy::LiveChange::kRefused) {
++        std::fprintf(stderr, "[I] cocoa: window mode size %dx%d not applied: %s\n", dw, dh, o.why.c_str());
++        return w;
++    }
++    std::fprintf(stderr, "[I] cocoa: window mode %s opens at %dx%d (the policy box was %dx%d)\n",
++                 winpolicy::UserPrefName(w.pref), o.next.win_w_pt, o.next.win_h_pt, w.win_w_pt, w.win_h_pt);
++    return o.next;
++}
++
+ void CocoaInstallWindowPolicy(const winpolicy::WindowTraits& traits,
+                               const winpolicy::DeviceSettings& settings,
+                               const std::string& pref_path,
+@@ -5181,9 +5276,8 @@ void CocoaApplyWindowDecision(const winpolicy::WindowDecision& d,
+         std::fprintf(stderr, "[I] cocoa: window decision applied inside fullscreen: app %dx%d in a "
+                      "%dx%d screen (%s)\n", g_phone_w, g_phone_h, g_win_w, g_win_h, o.why.c_str());
+     } else {
+-        g_wp.live = w;
+-        g_phone_w = g_win_w = d.box_w_pt;
+-        g_phone_h = g_win_h = d.box_h_pt;
++        g_wp.live = with_mode_default_size(w);
++        globals_from_live();
+     }
+     publish_live_xthread();
+     g_explicit_size = false;
+@@ -5191,7 +5285,7 @@ void CocoaApplyWindowDecision(const winpolicy::WindowDecision& d,
+     // decision, not from whichever app request happens to run first -- the
+     // exact bug the seed-once code in CocoaSetPhoneSize* exists to prevent.
+     g_user_orient_seeded = true;
+-    g_user_landscape = d.box_w_pt > d.box_h_pt;
++    g_user_landscape = g_win_w > g_win_h;
+     g_wp.seeded_rotation = true;
+ }
+ 
+@@ -5245,11 +5339,45 @@ static void apply_requested_orientation_policy_main(int screen_orientation) {
+                  g_phone_w, g_phone_h, g_win_w, g_win_h, o.why.c_str());
+ }
+ 
++static JNIEnv* MacapkMainThreadEnv();   // defined with the video-sink helpers below
++
++// MACAPK_ROTATE_RELAUNCH: the user is turning the device. Told to the Java side
++// BEFORE the window takes the other box, so the display commit that reshape
++// causes finds the live activities marked and relaunches the top one instead of
++// reporting the change to it (DisplayConfig.macapkNoteUserRotation).
++static void note_user_rotation_main() {
++    if (!g_wp.settings.user_rotation_drops_request) return;
++    JNIEnv* env = MacapkMainThreadEnv();
++    if (!env) return;
++    jclass c = env->FindClass("com/macapk/loader/DisplayConfig");
++    jmethodID m = c ? env->GetStaticMethodID(c, "macapkNoteUserRotation", "()V") : nullptr;
++    if (m) env->CallStaticVoidMethod(c, m);
++    if (env->ExceptionCheck()) {
++        env->ExceptionClear();
++        std::fprintf(stderr, "[W] cocoa: DisplayConfig.macapkNoteUserRotation unavailable -- the "
++                             "rotation is delivered in place (the loader jar is older than this binary)\n");
++    }
++    if (c) env->DeleteLocalRef(c);
++}
++
++// Which side a rotate command asks for: the other one (Cmd+R), or a named one
++// (the View menu's Retrato / Paisagem items), which is a no-op when the window
++// is already there.
++enum class PrefTarget { kToggle, kDefault, kPortrait };
++
+ // Cmd+R under the policy: toggle this app's user aspect-ratio preference
+ // between its policy box and the PORTRAIT box, re-resolve on the screen the
+-// window is on now WITH the app's current requested orientation, persist
+-// (unless `persist` is false or the run pinned MACAPK_WINDOW_PREF), reshape.
+-static void toggle_window_pref_main(bool persist) {
++// window is on now WITH the app's current requested orientation (unless the
++// rotation relaunches the activity: DeviceSettings::user_rotation_drops_request),
++// persist (unless `persist` is false or the run pinned MACAPK_WINDOW_PREF), reshape.
++static void set_window_pref_main(PrefTarget target, bool persist) {
++    const bool is_portrait = g_wp.live.pref == winpolicy::UserWindowPref::kPortrait;
++    if ((target == PrefTarget::kPortrait && is_portrait)
++        || (target == PrefTarget::kDefault && !is_portrait)) {
++        std::fprintf(stderr, "[I] cocoa: window preference already %s\n",
++                     winpolicy::UserPrefName(g_wp.live.pref));
++        return;
++    }
+     winpolicy::DisplayBudget screen;
+     std::string desc;
+     if (g_wp.live.fullscreen) {
+@@ -5261,8 +5389,12 @@ static void toggle_window_pref_main(bool persist) {
+         std::fprintf(stderr, "[I] cocoa: Cmd+R: window preference unchanged -- %s\n", desc.c_str());
+         return;
+     }
+-    const winpolicy::LiveOutcome o =
++    winpolicy::LiveOutcome o =
+         winpolicy::ToggleUserPref(g_wp.traits, g_wp.settings, g_wp.live, screen);
++    // The mode opens at its own size (MACAPK_WINDOW_SIZE_*), in the same reshape.
++    if (o.pref_changed && o.change == winpolicy::LiveChange::kReshapeWindow)
++        o.next = with_mode_default_size(o.next);
++    if (o.pref_changed) note_user_rotation_main();
+     apply_live_outcome_main(o);
+     const char* saved = "not saved (preference unchanged)";
+     if (o.pref_changed) {
+@@ -5277,6 +5409,8 @@ static void toggle_window_pref_main(bool persist) {
+                  winpolicy::ClassName(g_wp.live.decision.cls), o.why.c_str(), saved);
+ }
+ 
++static void toggle_window_pref_main(bool persist) { set_window_pref_main(PrefTarget::kToggle, persist); }
++
+ void CocoaApplyWindowOrientation(int screen_orientation) {
+     dispatch_main_async_void(^{
+         if (!g_wp.active) return;
+@@ -5468,6 +5602,7 @@ static void apply_window_locks_main(double box_w, double box_h, double cur_w, do
+             double mn = min_short;
+             if (cur_w > 0 && cur_h > 0) mn = MIN(mn, MIN(cur_w, cur_h));
+             [w setContentMinSize:NSMakeSize(mn, mn)];
++            ::window_mode_limits(w);
+             return;
+         }
+     }
+@@ -5704,6 +5839,17 @@ static void window_did_fail_fullscreen_main(bool entering) {
+ }
+ 
+ // ---- phase 2a: user resizes (MacApkWindowDelegate) ---------------------------
++// View > Tamanho Padrão: the current mode back at the size it opens with.
++static void window_default_size_main() {
++    if (!g_wp.active || !g_placeholder_window || g_fs_transition || window_is_fullscreen()) return;
++    winpolicy::LiveOutcome o;
++    o.next = with_mode_default_size(g_wp.live);
++    if (o.next.win_w_pt == g_wp.live.win_w_pt && o.next.win_h_pt == g_wp.live.win_h_pt) return;
++    o.change = winpolicy::LiveChange::kReshapeWindow;
++    o.why = "the mode's default size";
++    apply_live_outcome_main(o);
++}
++
+ // windowWillResize:toSize: -- the live drag, clamped by the pure range. The
+ // classes that keep their aspect are left to contentAspectRatio. ONLY a live
+ // drag: AppKit also asks for some programmatic resizes (zoom), and a
+@@ -9827,7 +9973,7 @@ - (void)macapkPickLanguage:(NSMenuItem*)item {
+ - (void)menuNeedsUpdate:(NSMenu*)menu {
+     [menu removeAllItems];
+     NSString* sel = macapk::lang_selected_tag();
+-    NSMenuItem* sys = [[NSMenuItem alloc] initWithTitle:@"System Default"
++    NSMenuItem* sys = [[NSMenuItem alloc] initWithTitle:@"Padrão do Sistema"
+                                                  action:@selector(macapkPickLanguage:)
+                                           keyEquivalent:@""];
+     [sys setTarget:self];
+@@ -9897,6 +10043,388 @@ @implementation MacApkBackAccessory
+ - (void)macapkBack:(id)sender { (void)sender; CocoaDispatchBack(); }
+ @end
+ 
++// ---- orientation (Retrato / Paisagem) and the fixed window size ---------------
++//
++// Owner decision: the window has TWO shapes and the user picks one from the
++// View menu, like turning a phone:
++//   Retrato   -- upright: the app sees a phone (500dp wide) and puts its
++//                navigation at the bottom;
++//   Paisagem  -- lying down: the app sees a wide display (1280dp) and puts its
++//                navigation on the side.
++// The shape itself is the window policy's box for the per-app preference
++// (portrait / default), so launch, Cmd+R and the menu all go through the same
++// decision and the app's Configuration always describes the window it is in.
++//
++// On top of that the window SIZE is fixed by default: no resize handle, no zoom
++// button, no fullscreen. The lock never chooses a size -- it pins whatever box
++// the policy gave the current orientation, and follows it on a rotation. The
++// menu can lift it, labelled as not recommended; the choice is remembered in
++// <android_root>/.macapk/resolution ("locked" / "free").
++namespace macapk {
++static void set_orientation_pref(bool portrait);
++static bool orientation_pref_is_portrait();
++}
++
++static BOOL g_size_locked = NO;
++
++static BOOL resolution_ui_on(void) {
++    static const BOOL on = [] {
++        const char* e = std::getenv("MACAPK_RESOLUTION_UI");
++        return (BOOL)(e && e[0] == '1');
++    }();
++    return on;
++}
++
++static BOOL resolution_locked(void) { return resolution_ui_on() && g_size_locked; }
++
++static NSString* resolution_path(void) {
++    const char* root = std::getenv("MACAPK_ANDROID_ROOT");
++    if (!root || !root[0]) return nil;
++    return [NSString stringWithFormat:@"%s/.macapk/resolution", root];
++}
++
++static void resolution_load(void) {
++    NSString* path = resolution_path();
++    NSString* mode = path ? [NSString stringWithContentsOfFile:path
++                                                      encoding:NSUTF8StringEncoding
++                                                         error:NULL] : nil;
++    mode = [mode stringByTrimmingCharactersInSet:
++                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
++    // Free unless the user locked it (View > Travar Tamanho da Janela).
++    g_size_locked = [mode isEqualToString:@"locked"];
++}
++
++static void resolution_save(void) {
++    NSString* path = resolution_path();
++    if (!path) return;
++    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
++                              withIntermediateDirectories:YES attributes:nil error:NULL];
++    [(g_size_locked ? @"locked" : @"free") writeToFile:path atomically:YES
++                                              encoding:NSUTF8StringEncoding error:NULL];
++}
++
++// Pin (or release) the window at the content size it has NOW. Called once the
++// window exists and again after every reshape, so the pinned size is always the
++// policy's box for the current orientation. Never resizes the window: a resize
++// made here during boot is what once left the Android configuration describing
++// one size and the surface another.
++static void resolution_apply(NSWindow* w) {
++    if (!w || !resolution_ui_on()) return;
++    if (([w styleMask] & NSWindowStyleMaskFullScreen) != 0) return;   // AppKit owns it
++    NSWindowStyleMask mask = [w styleMask];
++    NSWindowCollectionBehavior behaviour = [w collectionBehavior];
++    NSButton* zoom = [w standardWindowButton:NSWindowZoomButton];
++    if (g_size_locked) {
++        const NSSize cur = [w contentRectForFrameRect:[w frame]].size;
++        mask &= ~NSWindowStyleMaskResizable;
++        behaviour &= ~NSWindowCollectionBehaviorFullScreenPrimary;
++        behaviour |= NSWindowCollectionBehaviorFullScreenNone;
++        [w setCollectionBehavior:behaviour];
++        [w setStyleMask:mask];
++        [w setContentMinSize:cur];
++        [w setContentMaxSize:cur];
++        [zoom setHidden:YES];
++    } else {
++        // Resizable, never fullscreen: the green button zooms inside the mode's
++        // limits.
++        mask |= NSWindowStyleMaskResizable;
++        behaviour &= ~NSWindowCollectionBehaviorFullScreenPrimary;
++        behaviour |= NSWindowCollectionBehaviorFullScreenNone;
++        [w setCollectionBehavior:behaviour];
++        [w setStyleMask:mask];
++        [zoom setHidden:NO];
++        [zoom setEnabled:YES];
++        window_mode_limits(w);
++    }
++}
++// Each mode stays what it is while the user resizes it. Android's line between
++// a phone and a tablet layout is 600dp of width (1dp = 1pt here): Retrato never
++// reaches it, Paisagem never drops near it. The side itself (taller than wide,
++// or wider than tall) is held by the policy's resize range.
++static void window_mode_limits(NSWindow* w) {
++    if (!w || !resolution_ui_on() || g_size_locked) return;
++    if (([w styleMask] & NSWindowStyleMaskFullScreen) != 0) return;
++    if (macapk::orientation_pref_is_portrait()) {
++        [w setContentMinSize:NSMakeSize(320, 480)];
++        [w setContentMaxSize:NSMakeSize(599, FLT_MAX)];
++    } else {
++        [w setContentMinSize:NSMakeSize(720, 480)];
++        [w setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
++    }
++}
++
++// A reshape is about to give the window another box: the pin must not hold the
++// old one against it. resolution_apply re-pins once the new frame is set.
++static void resolution_release_for_reshape(NSWindow* w) {
++    if (!w || !resolution_ui_on()) return;
++    [w setContentMinSize:NSMakeSize(1, 1)];
++    [w setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
++}
++
++// ---- scroll settings (the Rolagem menu) -----------------------------------------
++//
++// Speed multiplies the travel of the synthesized finger. Inertia picks whose
++// physics run once the fingers lift: the guest's own fling, or the macOS momentum
++// tail fed to the same finger. Both are kept in the user defaults. Auto-scroll
++// advances one screenful every N seconds while the user leaves the window alone;
++// it lasts for the session. MACAPK_SCROLL_SCALE / MACAPK_SCROLL_NO_MOMENTUM, when
++// set, still win for that run.
++static double g_scroll_speed = 1.0;
++static BOOL   g_scroll_host_inertia = NO;
++static double g_autoscroll_secs = 0.0;
++static void autoscroll_set(double secs);          // defined with the input view
++static void autoscroll_note_user_input(void);
++static void app_cache_clear_async(void);         // defined below, with the menu
++static NSString* const kScrollSpeedKey = @"ScrollSpeed";
++static NSString* const kScrollHostInertiaKey = @"ScrollHostInertia";
++static void scroll_settings_load(void) {
++    NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
++    const double v = [d doubleForKey:kScrollSpeedKey];
++    g_scroll_speed = (v >= 0.25 && v <= 4.0) ? v : 1.0;
++    g_scroll_host_inertia = [d boolForKey:kScrollHostInertiaKey];
++    // MACAPK_DEBUG_CLEAR_CACHE=<secs>: clear the cache that long after launch.
++    if (const char* e = std::getenv("MACAPK_DEBUG_CLEAR_CACHE"); e && atof(e) > 0.0) {
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(e) * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{ app_cache_clear_async(); });
++    }
++    // MACAPK_AUTOSCROLL=<secs>: auto-scroll on from launch (an unattended run).
++    if (const char* e = std::getenv("MACAPK_AUTOSCROLL"); e && atof(e) > 0.0) {
++        const double secs = atof(e);
++        dispatch_async(dispatch_get_main_queue(), ^{ autoscroll_set(secs); });
++    }
++}
++static void scroll_settings_save(void) {
++    NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
++    [d setDouble:g_scroll_speed forKey:kScrollSpeedKey];
++    [d setBool:g_scroll_host_inertia forKey:kScrollHostInertiaKey];
++}
++static double scroll_effective_speed(void) {
++    static const double pinned = [] {
++        const char* e = std::getenv("MACAPK_SCROLL_SCALE");
++        const double v = e ? atof(e) : 0.0;
++        return (v >= 0.05 && v <= 4.0) ? v : 0.0;
++    }();
++    return pinned > 0.0 ? pinned : g_scroll_speed;
++}
++
++enum { kMenuTagScrollSpeed = 1, kMenuTagScrollInertia = 2, kMenuTagAutoScroll = 3 };
++
++// ---- the app's cache (app menu > Limpar Cache…) ----------------------------------
++//
++// What Settings > Storage > Clear cache does on a device: the CONTENTS of every
++// package's cache/ and code_cache/ under the Android root. An app may lose them
++// at any moment and rebuilds what it needs; accounts, databases and preferences
++// live elsewhere and are not touched. `remove` NO only measures.
++static unsigned long long app_cache_sweep(BOOL remove, NSUInteger* files_out) {
++    const char* root = std::getenv("MACAPK_ANDROID_ROOT");
++    unsigned long long bytes = 0;
++    NSUInteger files = 0;
++    if (root && root[0]) {
++        NSFileManager* fm = [NSFileManager defaultManager];
++        NSString* data = [NSString stringWithFormat:@"%s/data/data", root];
++        NSArray<NSURLResourceKey>* keys = @[ NSURLIsRegularFileKey, NSURLTotalFileAllocatedSizeKey ];
++        for (NSString* pkg in [fm contentsOfDirectoryAtPath:data error:NULL]) {
++            for (NSString* sub in @[ @"cache", @"code_cache" ]) {
++                // cache/ may be a link out of the bundle (~/Library/Caches).
++                NSString* dir = [[[data stringByAppendingPathComponent:pkg]
++                    stringByAppendingPathComponent:sub] stringByResolvingSymlinksInPath];
++                NSDirectoryEnumerator<NSURL*>* e =
++                    [fm enumeratorAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
++                        includingPropertiesForKeys:keys options:0 errorHandler:nil];
++                for (NSURL* u in e) {
++                    NSNumber *regular = nil, *size = nil;
++                    [u getResourceValue:&regular forKey:NSURLIsRegularFileKey error:NULL];
++                    if (![regular boolValue]) continue;
++                    [u getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:NULL];
++                    bytes += [size unsignedLongLongValue];
++                    ++files;
++                }
++                if (!remove) continue;
++                for (NSString* name in [fm contentsOfDirectoryAtPath:dir error:NULL])
++                    [fm removeItemAtPath:[dir stringByAppendingPathComponent:name] error:NULL];
++            }
++        }
++    }
++    if (files_out) *files_out = files;
++    return bytes;
++}
++static void app_cache_clear_async(void) {
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        NSUInteger files = 0;
++        const unsigned long long bytes = app_cache_sweep(YES, &files);
++        std::fprintf(stderr, "[I] cocoa: cache cleared: %lu file(s), %.1f MB\n",
++                     (unsigned long)files, (double)bytes / 1048576.0);
++    });
++}
++
++@interface MacApkViewMenuTarget : NSObject <NSMenuDelegate>
++@property(nonatomic, strong) NSMenuItem* portraitItem;
++@property(nonatomic, strong) NSMenuItem* landscapeItem;
++@property(nonatomic, strong) NSMenuItem* lockItem;
++@property(nonatomic, strong) NSMenu* scrollMenu;
++@property(nonatomic, copy)   NSString* appTitle;
++- (void)pickPortrait:(id)sender;
++- (void)pickLandscape:(id)sender;
++- (void)defaultSize:(id)sender;
++- (void)toggleSizeLock:(id)sender;
++- (void)pickScrollSpeed:(id)sender;
++- (void)pickScrollInertia:(id)sender;
++- (void)pickAutoScroll:(id)sender;
++- (void)goBack:(id)sender;
++- (void)showAbout:(id)sender;
++- (void)clearCache:(id)sender;
++@end
++
++@implementation MacApkViewMenuTarget
++- (void)pickPortrait:(id)sender  { (void)sender; macapk::set_orientation_pref(true); }
++- (void)pickLandscape:(id)sender { (void)sender; macapk::set_orientation_pref(false); }
++- (void)defaultSize:(id)sender   { (void)sender; macapk::window_default_size_main(); }
++- (void)toggleSizeLock:(id)sender {
++    (void)sender;
++    g_size_locked = !g_size_locked;
++    resolution_save();
++    resolution_apply(macapk::g_placeholder_window);
++    std::fprintf(stderr, "[I] cocoa: window size %s\n", g_size_locked ? "locked" : "free");
++}
++- (void)pickScrollSpeed:(id)sender {
++    g_scroll_speed = [[(NSMenuItem*)sender representedObject] doubleValue];
++    scroll_settings_save();
++    std::fprintf(stderr, "[I] cocoa: scroll speed %.2fx\n", g_scroll_speed);
++}
++- (void)pickScrollInertia:(id)sender {
++    g_scroll_host_inertia = [[(NSMenuItem*)sender representedObject] boolValue];
++    scroll_settings_save();
++    std::fprintf(stderr, "[I] cocoa: scroll inertia %s\n", g_scroll_host_inertia ? "macOS" : "guest");
++}
++- (void)pickAutoScroll:(id)sender {
++    autoscroll_set([[(NSMenuItem*)sender representedObject] doubleValue]);
++}
++- (void)goBack:(id)sender { (void)sender; CocoaDispatchBack(); }
++- (void)clearCache:(id)sender {
++    (void)sender;
++    NSUInteger files = 0;
++    const unsigned long long bytes = app_cache_sweep(NO, &files);
++    NSAlert* alert = [[NSAlert alloc] init];
++    [alert setMessageText:@"Limpar o cache?"];
++    [alert setInformativeText:[NSString stringWithFormat:
++        @"O cache ocupa %@ (%lu arquivos): vídeos e imagens já baixados. Sua conta, suas "
++        @"mensagens e seus ajustes não são apagados; o que for preciso é baixado de novo.",
++        [NSByteCountFormatter stringFromByteCount:(long long)bytes
++                                       countStyle:NSByteCountFormatterCountStyleFile],
++        (unsigned long)files]];
++    [alert addButtonWithTitle:@"Limpar Cache"];
++    [alert addButtonWithTitle:@"Cancelar"];
++    [NSApp activateIgnoringOtherApps:YES];
++    if ([alert runModal] == NSAlertFirstButtonReturn) app_cache_clear_async();
++}
++- (void)showAbout:(id)sender {
++    (void)sender;
++    [NSApp activateIgnoringOtherApps:YES];
++    [NSApp orderFrontStandardAboutPanelWithOptions:
++        @{ NSAboutPanelOptionApplicationName : (self.appTitle ?: @"") }];
++}
++// The checkmarks are read when a menu opens, so they are right whichever way the
++// setting last changed (menu, shortcut, or what was read at launch).
++- (void)menuNeedsUpdate:(NSMenu*)menu {
++    (void)menu;
++    const BOOL portrait = macapk::orientation_pref_is_portrait();
++    [self.portraitItem  setState:portrait ? NSControlStateValueOn : NSControlStateValueOff];
++    [self.landscapeItem setState:portrait ? NSControlStateValueOff : NSControlStateValueOn];
++    [self.lockItem setState:g_size_locked ? NSControlStateValueOn : NSControlStateValueOff];
++    for (NSMenuItem* it in [self.scrollMenu itemArray]) {
++        const double v = [[it representedObject] doubleValue];
++        BOOL on = NO;
++        switch ([it tag]) {
++            case kMenuTagScrollSpeed:   on = fabs(v - g_scroll_speed) < 0.01; break;
++            case kMenuTagScrollInertia: on = (v != 0.0) == (g_scroll_host_inertia != NO); break;
++            case kMenuTagAutoScroll:    on = fabs(v - g_autoscroll_secs) < 0.01; break;
++            default: continue;
++        }
++        [it setState:on ? NSControlStateValueOn : NSControlStateValueOff];
++    }
++}
++@end
++
++static MacApkViewMenuTarget* g_view_menu_target = nil;
++
++static NSMenu* add_menu(NSMenu* mainMenu, NSString* title) {
++    NSMenuItem* slot = [[NSMenuItem alloc] init];
++    [mainMenu addItem:slot];
++    NSMenu* menu = [[NSMenu alloc] initWithTitle:title];
++    [slot setSubmenu:menu];
++    return menu;
++}
++static NSMenuItem* add_item(NSMenu* menu, NSString* title, SEL action, NSString* key,
++                            NSEventModifierFlags mods, id target) {
++    NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
++    [it setKeyEquivalentModifierMask:mods];
++    [it setTarget:target];
++    [menu addItem:it];
++    return it;
++}
++static void add_choice(NSMenu* menu, NSString* title, SEL action, NSInteger tag, double value) {
++    NSMenuItem* it = add_item(menu, title, action, @"", 0, g_view_menu_target);
++    [it setTag:tag];
++    [it setRepresentedObject:@(value)];
++}
++
++// Visualizar: the two modes, the rotate shortcut, the mode's size.
++static void install_view_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Visualizar");
++    [menu setDelegate:g_view_menu_target];
++    g_view_menu_target.portraitItem = add_item(menu, @"Celular — em pé", @selector(pickPortrait:),
++        @"1", NSEventModifierFlagCommand, g_view_menu_target);
++    g_view_menu_target.landscapeItem = add_item(menu, @"Tablet — deitado", @selector(pickLandscape:),
++        @"2", NSEventModifierFlagCommand, g_view_menu_target);
++    // target nil: the responder chain takes it to MacApkMetalView.
++    add_item(menu, @"Girar", @selector(macapkMenuRotate:), @"r", NSEventModifierFlagCommand, nil);
++    if (resolution_ui_on()) {
++        [menu addItem:[NSMenuItem separatorItem]];
++        add_item(menu, @"Tamanho Padrão", @selector(defaultSize:), @"0", NSEventModifierFlagCommand,
++                 g_view_menu_target);
++        g_view_menu_target.lockItem = add_item(menu, @"Travar Tamanho da Janela",
++            @selector(toggleSizeLock:), @"", 0, g_view_menu_target);
++    }
++}
++
++// Rolagem: speed, whose inertia, and the hands-free advance.
++static void install_scroll_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Rolagem");
++    [menu setDelegate:g_view_menu_target];
++    g_view_menu_target.scrollMenu = menu;
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Velocidade"]];
++    add_choice(menu, @"Lenta — 0,5×",        @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 0.5);
++    add_choice(menu, @"Reduzida — 0,75×",    @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 0.75);
++    add_choice(menu, @"Normal — 1×",         @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 1.0);
++    add_choice(menu, @"Rápida — 1,5×",       @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 1.5);
++    add_choice(menu, @"Muito Rápida — 2×",   @selector(pickScrollSpeed:), kMenuTagScrollSpeed, 2.0);
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Inércia ao Soltar"]];
++    add_choice(menu, @"Do Instagram",        @selector(pickScrollInertia:), kMenuTagScrollInertia, 0.0);
++    add_choice(menu, @"Do macOS",            @selector(pickScrollInertia:), kMenuTagScrollInertia, 1.0);
++    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Rolagem Automática"]];
++    add_choice(menu, @"Desligada",           @selector(pickAutoScroll:), kMenuTagAutoScroll, 0.0);
++    add_choice(menu, @"A Cada 3 Segundos",   @selector(pickAutoScroll:), kMenuTagAutoScroll, 3.0);
++    add_choice(menu, @"A Cada 5 Segundos",   @selector(pickAutoScroll:), kMenuTagAutoScroll, 5.0);
++    add_choice(menu, @"A Cada 10 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 10.0);
++    add_choice(menu, @"A Cada 15 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 15.0);
++    add_choice(menu, @"A Cada 30 Segundos",  @selector(pickAutoScroll:), kMenuTagAutoScroll, 30.0);
++}
++
++static void install_go_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Navegar");
++    add_item(menu, @"Voltar", @selector(goBack:), @"[", NSEventModifierFlagCommand, g_view_menu_target);
++}
++
++static void install_window_menu(NSMenu* mainMenu) {
++    NSMenu* menu = add_menu(mainMenu, @"Janela");
++    add_item(menu, @"Minimizar", @selector(performMiniaturize:), @"m", NSEventModifierFlagCommand, nil);
++    add_item(menu, @"Zoom", @selector(performZoom:), @"", 0, nil);
++    [menu addItem:[NSMenuItem separatorItem]];
++    add_item(menu, @"Trazer Todas para a Frente", @selector(arrangeInFront:), @"", 0, nil);
++    [NSApp setWindowsMenu:menu];
++}
++
++
+ namespace macapk {   // reopened after the ObjC class above
+ 
+ /** v1.0.1047: register the live-appearance KVO observer. Registered for the
+@@ -10048,7 +10576,7 @@ static void InstallBackTitlebarAccessory(NSWindow* w) {
+ static void install_language_menu(NSMenu* mainMenu) {
+     NSMenuItem* item = [[NSMenuItem alloc] init];
+     [mainMenu addItem:item];
+-    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Language"];
++    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Idioma"];
+     if (!g_language_target) g_language_target = [[MacApkLanguageTarget alloc] init];
+     [menu setDelegate:g_language_target];
+     [item setSubmenu:menu];
+@@ -10057,45 +10585,70 @@ static void install_language_menu(NSMenu* mainMenu) {
+ static void install_menu_bar(NSString* appTitle) {
+     NSMenu* mainMenu = [[NSMenu alloc] init];
+ 
+-    // App menu (bold, first slot): Hide + Quit.
++    // App menu (bold, first slot): Hide + Quit. The slot's TITLE is set
++    // explicitly: left empty, AppKit fills it from the process name, which is
++    // the engine's, and the product would show someone else's name up there.
+     NSMenuItem* appItem = [[NSMenuItem alloc] init];
++    [appItem setTitle:appTitle];
+     [mainMenu addItem:appItem];
+-    NSMenu* appMenu = [[NSMenu alloc] init];
+-    [appMenu addItemWithTitle:[NSString stringWithFormat:@"Hide %@", appTitle]
+-                       action:@selector(hide:) keyEquivalent:@"h"];
+-    [appMenu addItem:[NSMenuItem separatorItem]];
+-    // v1.0.1047: target our own quit rather than AppKit's terminate:, which
+-    // would reach exit(0) and re-open the __cxa_finalize deadlock. See
+-    // -[MacApkControlsTarget macapkQuit:] and macapk_terminate_now.
++    NSMenu* appMenu = [[NSMenu alloc] initWithTitle:appTitle];
++    // AppKit rewrites the FIRST slot's title with the process name at launch
++    // (measured: a plain "macapk-runtime" child process shows the engine's
++    // name). Re-assert the product name once the loop is up, and again on every
++    // activation, so the menu bar can never show anything but Instamac.
++    [mainMenu setTitle:appTitle];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [appItem setTitle:appTitle];
++        [appMenu setTitle:appTitle];
++    });
+     if (!g_controls_target) g_controls_target = [[MacApkControlsTarget alloc] init];
+-    NSMenuItem* proxyItem = [appMenu addItemWithTitle:@"Network Proxy…"
+-        action:@selector(macapkProxySettings:) keyEquivalent:@","];
+-    [proxyItem setTarget:g_controls_target];
++    if (!g_view_menu_target) g_view_menu_target = [[MacApkViewMenuTarget alloc] init];
++    g_view_menu_target.appTitle = appTitle;
++    add_item(appMenu, [NSString stringWithFormat:@"Sobre o %@", appTitle], @selector(showAbout:),
++             @"", 0, g_view_menu_target);
++    [appMenu addItem:[NSMenuItem separatorItem]];
++    add_item(appMenu, @"Proxy de Rede…", @selector(macapkProxySettings:), @",",
++             NSEventModifierFlagCommand, g_controls_target);
++    add_item(appMenu, @"Limpar Cache…", @selector(clearCache:), @"", 0, g_view_menu_target);
+     [appMenu addItem:[NSMenuItem separatorItem]];
+-    NSMenuItem* quitItem =
+-        [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", appTitle]
+-                           action:@selector(macapkQuit:) keyEquivalent:@"q"];
+-    [quitItem setTarget:g_controls_target];
++    add_item(appMenu, [NSString stringWithFormat:@"Ocultar %@", appTitle], @selector(hide:), @"h",
++             NSEventModifierFlagCommand, nil);
++    add_item(appMenu, @"Ocultar Outros", @selector(hideOtherApplications:), @"h",
++             NSEventModifierFlagCommand | NSEventModifierFlagOption, nil);
++    add_item(appMenu, @"Mostrar Todos", @selector(unhideAllApplications:), @"", 0, nil);
++    [appMenu addItem:[NSMenuItem separatorItem]];
++    // v1.0.1047: our own quit rather than AppKit's terminate:, which would reach
++    // exit(0) and re-open the __cxa_finalize deadlock. See
++    // -[MacApkControlsTarget macapkQuit:] and macapk_terminate_now.
++    add_item(appMenu, [NSString stringWithFormat:@"Encerrar %@", appTitle], @selector(macapkQuit:),
++             @"q", NSEventModifierFlagCommand, g_controls_target);
+     [appItem setSubmenu:appMenu];
+ 
+-    // View menu: the software Rotate button + its Cmd+R shortcut.
+-    NSMenuItem* viewItem = [[NSMenuItem alloc] init];
+-    [mainMenu addItem:viewItem];
+-    NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+-    NSMenuItem* rotate =
+-        [[NSMenuItem alloc] initWithTitle:@"Rotate"
+-                                   action:@selector(macapkMenuRotate:)
+-                            keyEquivalent:@"r"];
+-    [rotate setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+-    [rotate setTarget:nil];   // responder chain -> MacApkMetalView
+-    [viewMenu addItem:rotate];
+-    [viewItem setSubmenu:viewMenu];
+-
+-    // Controls menu: pick the keyboard-binding profile.
+-    install_controls_menu(mainMenu);
+-
+-    // Language menu: per-app override of the macOS language (System Default).
++    install_view_menu(mainMenu);
++    install_scroll_menu(mainMenu);
++    install_go_menu(mainMenu);
++    // Controls (keyboard-binding profiles for games): MACAPK_MENU_CONTROLS=0 hides it.
++    {
++        const char* e = std::getenv("MACAPK_MENU_CONTROLS");
++        if (!(e && e[0] == '0')) install_controls_menu(mainMenu);
++    }
++    // Idioma: per-app override of the macOS language.
+     install_language_menu(mainMenu);
++    install_window_menu(mainMenu);
++    [g_view_menu_target menuNeedsUpdate:g_view_menu_target.scrollMenu];
++    // MACAPK_MENU_DUMP=1: the menu bar as text, for a run nobody is clicking.
++    if (const char* e = std::getenv("MACAPK_MENU_DUMP"); e && e[0] == '1') {
++        for (NSMenuItem* top in [mainMenu itemArray]) {
++            std::fprintf(stderr, "[menu] %s\n", [[[top submenu] title] UTF8String] ?: "");
++            for (NSMenuItem* it in [[top submenu] itemArray])
++                std::fprintf(stderr, "[menu]     %s%s%s%s\n",
++                             [it isSeparatorItem] ? "--------" : ([[it title] UTF8String] ?: ""),
++                             [it state] == NSControlStateValueOn ? "  [x]" : "",
++                             [[it keyEquivalent] length] ? "  cmd+" : "",
++                             [[it keyEquivalent] UTF8String] ?: "");
++        }
++    }
+ 
+     [g_app setMainMenu:mainMenu];
+ }
+@@ -10199,7 +10752,9 @@ static void reshape_placeholder_to_globals_main(ReshapeAnchor anchor) {
+         newFrame.origin.y = vis.origin.y + (vis.size.height - newFrame.size.height) / 2.0;
+     }
+     ++g_own_frame_change;   // ours, not a user resize (windowDidResize)
++    ::resolution_release_for_reshape(g_placeholder_window);
+     [g_placeholder_window setFrame:newFrame display:YES animate:NO];
++    ::resolution_apply(g_placeholder_window);   // the fixed size follows the new box
+     --g_own_frame_change;
+     // Re-center after AppKit's aspect-fit shrink settles (an orientation change /
+     // rotate resizes the window, and the aspect lock may then shrink it to fit the
+@@ -10254,6 +10809,23 @@ static void rotate_render(bool persist_pref) {
+ 
+ void CocoaRotateRender() { rotate_render(true); }
+ 
++// The View menu's Retrato / Paisagem items: the same rotation as Cmd+R, toward a
++// NAMED side, so picking the side the window already has does nothing.
++static void set_orientation_pref(bool portrait) {
++    dispatch_main_async_void(^{
++        if (!g_placeholder_window) return;
++        if (g_wp.active) {
++            set_window_pref_main(portrait ? PrefTarget::kPortrait : PrefTarget::kDefault, true);
++            return;
++        }
++        if ((g_phone_h > g_phone_w) != portrait) rotate_render(true);
++    });
++}
++static bool orientation_pref_is_portrait() {
++    return g_wp.active ? g_wp.live.pref == winpolicy::UserWindowPref::kPortrait
++                       : g_phone_h > g_phone_w;
++}
++
+ // MACAPK_DEBUG_AUTOROTATE's entry: the same rotate, but a self-test must not
+ // leave a per-app Cmd+R preference behind for the next launch to read.
+ static void CocoaRotateRenderSelfTest() { rotate_render(false); }
+@@ -13649,6 +14360,43 @@ static void (*presentCreditDC)(void) = (void (*)(void))
+         }
+     }
+ 
++    // MACAPK_DEBUG_AUTOORIENT=<secs>:<p|l>[,<secs>:<p|l>...]: the View menu's
++    // Retrato (p) / Paisagem (l) items fired at each elapsed time -- the SAME
++    // entry the menu calls, preference saved, for a headless check of the menu
++    // path and of what the next launch reads. Default OFF.
++    {
++        struct OrientStep { double t; bool portrait; bool fired; };
++        static std::vector<OrientStep> orientSteps = []() -> std::vector<OrientStep> {
++            std::vector<OrientStep> v;
++            if (const char* e = std::getenv("MACAPK_DEBUG_AUTOORIENT")) {
++                const char* p = e; char* end = nullptr;
++                while (*p) {
++                    while (*p == ' ' || *p == ',' || *p == ';') ++p;
++                    if (!*p) break;
++                    double t = std::strtod(p, &end);
++                    if (end == p || *end != ':') break;
++                    const char side = end[1];
++                    if (side != 'p' && side != 'l') break;
++                    p = end + 2;
++                    if (t >= 0.0) v.push_back({t, side == 'p', false});
++                }
++            }
++            return v;
++        }();
++        if (!orientSteps.empty()) {
++            static double orientBase = 0.0;
++            if (orientBase == 0.0) orientBase = now;
++            const double elapsed = now - orientBase;
++            for (OrientStep& st : orientSteps) {
++                if (st.fired || elapsed < st.t) continue;
++                st.fired = true;
++                std::fprintf(stderr, "[I] cocoa_v2: autoorient -> %s at %.1fs\n",
++                             st.portrait ? "portrait" : "landscape", elapsed);
++                macapk::set_orientation_pref(st.portrait);
++            }
++        }
++    }
++
+     // v1.0.1637: gated auto-RESIZE self-test, the resize analogue of the block
+     // above. MACAPK_DEBUG_AUTORESIZE=<secs>:<scale>[,<secs>:<scale>...] sets the
+     // primary window's content to <scale> x its size at the first frame, at
+diff --git a/runtime/java/com/macapk/loader/DisplayConfig.java b/runtime/java/com/macapk/loader/DisplayConfig.java
+--- a/runtime/java/com/macapk/loader/DisplayConfig.java
++++ b/runtime/java/com/macapk/loader/DisplayConfig.java
+@@ -63,6 +63,116 @@ public final class DisplayConfig {
+     static final boolean RELAUNCH_ON =
+         "1".equals(System.getenv("MACAPK_RESIZE_RELAUNCH"));
+ 
++    /** RELAUNCH ON A USER ROTATION, default OFF (`MACAPK_ROTATE_RELAUNCH=1`).
++     *
++     *  The View-menu rotate command switches the window between two displays of
++     *  different size CLASS (a 500dp-wide phone and a 1280dp-wide tablet). An
++     *  activity that declares orientation|screenSize|smallestScreenSize handles
++     *  that in onConfigurationChanged on a device, and so it does here by
++     *  default. Measured on Instagram 455, that in-place path is one-way: its
++     *  size-class flag (X.01rq.A00) is only re-derived in onCreate
++     *  (X.01rq.A0F), so after tablet -> phone the tab bar comes back but the
++     *  feed keeps the tablet item insets. A relaunch re-runs onCreate on the
++     *  new display, which is also what Android does for every activity that
++     *  does NOT declare `orientation`: the classic "recreated on rotation".
++     *
++     *  Only a rotation the USER asked for is relaunched (macapkNoteUserRotation
++     *  marks the activities alive at that moment); a side change the app
++     *  requested itself, or a drag resize, keeps AOSP's declared-configChanges
++     *  rule. The same switch makes the native policy drop the app's standing
++     *  orientation request at the rotation (window_policy.cpp ToggleUserPref),
++     *  and the relaunched record is cleared to match. */
++    static final boolean ROTATE_RELAUNCH_ON =
++        "1".equals(System.getenv("MACAPK_ROTATE_RELAUNCH"));
++
++    /** Activities alive when the user rotated, not yet relaunched. Weak: a
++     *  destroyed activity must stay collectable. Guarded by sRotateLock. */
++    private static final java.util.Set<android.app.Activity> sRotatePending =
++        java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
++    private static final Object sRotateLock = new Object();
++
++    /** NATIVE ENTRY (cocoa_bridge.mm, the rotate command, AppKit thread), just
++     *  before the window takes the other orientation's box: every activity
++     *  alive now was built for the old one. The top one is relaunched by the
++     *  display commit that follows, a buried one when it is revealed. */
++    public static void macapkNoteUserRotation() {
++        if (!ROTATE_RELAUNCH_ON) return;
++        final android.app.Activity[] live = ActivityHost.macapkLiveActivities();
++        synchronized (sRotateLock) {
++            for (android.app.Activity a : live) if (a != null) sRotatePending.add(a);
++        }
++        NativeLog.i(TAG, "user rotation: " + live.length + " activit"
++            + (live.length == 1 ? "y" : "ies") + " will be relaunched on the new display");
++    }
++
++    private static boolean takeRotatePending(android.app.Activity a) {
++        synchronized (sRotateLock) { return sRotatePending.remove(a); }
++    }
++
++    // ---- display fields are the display's, not the app's ------------------------
++
++    /** The configuration of the display as last committed, and the display
++     *  fields of the ones before it ({wDp, hDp, swDp, orientation}, bounded).
++     *
++     *  Mac.apk serves the Application and every Activity from ONE Resources, so
++     *  an app that replays a Configuration it captured earlier through
++     *  Resources.updateConfiguration (a locale wrapper does exactly that) also
++     *  replays that moment's screen size into the configuration every activity
++     *  launches with. On a device the activity's own Resources have the window's
++     *  override configuration applied over whatever the app passed
++     *  (ResourcesManager.applyConfigurationToResources), so the app never moves
++     *  its display. Measured on Instagram 455: relaunched on a 1280x800dp
++     *  display after a rotation, it left the shared configuration at the boot
++     *  display's 500x800dp sw500 and laid the tablet window out as a phone. */
++    private static volatile Configuration sCommittedDisplay;
++    private static final java.util.ArrayDeque<int[]> sPastDisplays = new java.util.ArrayDeque<>();
++    private static volatile Thread sCommitThread;
++
++    private static boolean sameDisplay(Configuration c, int[] d) {
++        return c.screenWidthDp == d[0] && c.screenHeightDp == d[1]
++            && c.smallestScreenWidthDp == d[2] && c.orientation == d[3];
++    }
++    private static int[] displayOf(Configuration c) {
++        return new int[]{ c.screenWidthDp, c.screenHeightDp, c.smallestScreenWidthDp, c.orientation };
++    }
++
++    /** True when `c` carries the committed display's fields: a Resources that
++     *  follows the display, as opposed to a createConfigurationContext override. */
++    public static boolean macapkFollowsDisplay(Configuration c) {
++        final Configuration d = sCommittedDisplay;
++        return d != null && c != null && sameDisplay(c, displayOf(d));
++    }
++
++    /** After an update of a Resources that followed the display: if `incoming`
++     *  moved it back to a display that no longer exists, the committed display's
++     *  fields stand. An override to any other size is the caller's business. */
++    public static void macapkReassertDisplay(Configuration live, Configuration incoming) {
++        final Configuration d = sCommittedDisplay;
++        if (d == null || live == null || incoming == null) return;
++        if (sCommitThread == Thread.currentThread() || sameDisplay(live, displayOf(d))) return;
++        boolean stale = false;
++        synchronized (sPastDisplays) {
++            for (int[] past : sPastDisplays) if (sameDisplay(incoming, past)) { stale = true; break; }
++        }
++        if (!stale) return;
++        final String was = live.screenWidthDp + "x" + live.screenHeightDp + "dp sw" + live.smallestScreenWidthDp;
++        if (adoptDisplayFields(d, live))
++            NativeLog.i(TAG, "app updateConfiguration replayed a past display (" + was + "); kept "
++                + d.screenWidthDp + "x" + d.screenHeightDp + "dp sw" + d.smallestScreenWidthDp
++                + " " + orientName(d.orientation));
++    }
++
++    private static void noteCommitted(Configuration prev, Configuration next) {
++        synchronized (sPastDisplays) {
++            final int[] p = displayOf(prev);
++            final int[] n = displayOf(next);
++            sPastDisplays.removeIf(e -> java.util.Arrays.equals(e, p) || java.util.Arrays.equals(e, n));
++            if (!java.util.Arrays.equals(p, n)) sPastDisplays.addLast(p);
++            while (sPastDisplays.size() > 8) sPastDisplays.removeFirst();
++        }
++        sCommittedDisplay = new Configuration(next);
++    }
++
+     // ---- the committed display ------------------------------------------------
+ 
+     private static volatile int sRealW, sRealH;   // px; 0 until Boot seeds
+@@ -367,7 +477,10 @@ public final class DisplayConfig {
+                     + ((System.nanoTime() - t0) / 1_000_000L) + "ms");
+             }
+         }
+-        res.updateConfiguration(next, m);
++        noteCommitted(cur, next);
++        sCommitThread = Thread.currentThread();
++        try { res.updateConfiguration(next, m); }
++        finally { sCommitThread = null; }
+         // AOSP ResourcesManager.applyConfigurationToResources (android14-release
+         // :1337-1369) pushes the PROCESS configuration + app-area display metrics
+         // into Resources.getSystem() on every global change as well. The gap this
+@@ -436,6 +549,23 @@ public final class DisplayConfig {
+         final int handled = a.macapkRealConfigChanged();
+         final int[][] buckets = appBuckets();
+ 
++        // MACAPK_ROTATE_RELAUNCH: an activity that was alive when the user
++        // rotated is rebuilt on the new display instead of being told about it.
++        // The mark is consumed either way, so an unrelated later change is
++        // delivered by the rules below.
++        if (ROTATE_RELAUNCH_ON && takeRotatePending(a)
++                && (serverDiff & android.content.pm.ActivityInfo.CONFIG_ORIENTATION) != 0) {
++            a.macapkSetLastReportedConfig(next);
++            a.macapkClearRecordRequest();
++            if (ActivityHost.macapkRecreate(a)) {
++                NativeLog.i(TAG, "relaunching " + a.getClass().getName()
++                    + " for the user rotation (" + orientName(next.orientation) + " "
++                    + next.screenWidthDp + "x" + next.screenHeightDp + "dp sw"
++                    + next.smallestScreenWidthDp + ")");
++                return true;
++            }
++        }
++
+         // SERVER SIDE FIRST (ActivityRecord.ensureActivityConfiguration): the
+         // activity is relaunched when a changed bit that survives the bucket
+         // filter is not declared. android11-release ActivityRecord
+diff --git a/runtime/java/com/macapk/loader/ActivityHost.java b/runtime/java/com/macapk/loader/ActivityHost.java
+--- a/runtime/java/com/macapk/loader/ActivityHost.java
++++ b/runtime/java/com/macapk/loader/ActivityHost.java
+@@ -92,6 +92,18 @@ public final class ActivityHost {
+ 
+     public static Activity peek() { return stack.peek(); }
+ 
++    /** A snapshot of the live activities, top first. Read off the owner thread
++     *  by DisplayConfig.macapkNoteUserRotation (AppKit thread), where a stack
++     *  mutating underneath only means the snapshot is retried. */
++    public static Activity[] macapkLiveActivities() {
++        for (int attempt = 0; attempt < 4; attempt++) {
++            try { return stack.toArray(new Activity[0]); }
++            catch (RuntimeException concurrentChange) { /* retry */ }
++        }
++        final Activity top = stack.peek();
++        return top != null ? new Activity[]{top} : new Activity[0];
++    }
++
+     /** True while `a` is STOPPED because another activity covers it
+      *  (stopForNewTop). Read by GLSurfaceView's GL-BEHIND-TOP detector. */
+     public static boolean macapkIsStoppedUnderTop(Activity a) {
+diff --git a/runtime/java/android/app/Activity.java b/runtime/java/android/app/Activity.java
+--- a/runtime/java/android/app/Activity.java
++++ b/runtime/java/android/app/Activity.java
+@@ -3203,6 +3203,16 @@ public class Activity extends ContextThemeWrapper
+         macapkOwnsWindowBox = ownsBox;
+     }
+     public final int macapkRecordOrientation() { return macapkRecordOrientation; }
++    /** MACAPK_ROTATE_RELAUNCH (DisplayConfig): the user rotated, so the request
++     *  this activity made for the OTHER display no longer stands -- the native
++     *  policy dropped it when it resolved the new box. Back to the manifest's
++     *  orientation, for the relaunched instance to inherit; that instance
++     *  states its own request in onCreate if it has one. */
++    public final void macapkClearRecordRequest() {
++        macapkRecordOrientation = macapkManifestOrientation();
++        macapkRecordRequested = false;
++        mLastRequestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSET;
++    }
+     public final boolean macapkRecordRequested() { return macapkRecordRequested; }
+     public final int macapkWindowToken() { return macapkWindowToken; }
+     public final boolean macapkOwnsWindowBox() { return macapkOwnsWindowBox; }
+@@ -4154,6 +4164,11 @@ public class Activity extends ContextThemeWrapper
+             catch (Throwable t) {
+                 com.macapk.loader.NativeLog.w("Mac.apk.Activity",
+                     getClass().getName() + ".onConfigurationChanged threw: " + t);
++                // A half-applied configuration change is visible to the user
++                // (a rail left over a phone-sized window); say where it stopped.
++                StackTraceElement[] st = t.getStackTrace();
++                for (int i = 0; i < st.length && i < 24; i++)
++                    com.macapk.loader.NativeLog.w("Mac.apk.Activity", "    at " + st[i]);
+             }
+         }
+         try {
+diff --git a/runtime/java/android/content/res/Resources.java b/runtime/java/android/content/res/Resources.java
+--- a/runtime/java/android/content/res/Resources.java
++++ b/runtime/java/android/content/res/Resources.java
+@@ -7412,6 +7562,14 @@ public class Resources {
+         Configuration.macapkMergeFamilyGate("MACAPK_RES_CONFIG_MERGE");
+ 
+     public void updateConfiguration(Configuration config, DisplayMetrics metrics) {
++        // The display's fields are the display's (DisplayConfig.macapkReassertDisplay).
++        final boolean followed = com.macapk.loader.DisplayConfig.macapkFollowsDisplay(this.config);
++        macapkUpdateConfigurationAsGiven(config, metrics);
++        if (followed && config != null && config != this.config)
++            com.macapk.loader.DisplayConfig.macapkReassertDisplay(this.config, config);
++    }
++
++    private void macapkUpdateConfigurationAsGiven(Configuration config, DisplayMetrics metrics) {
+         if (MACAPK_RES_CONFIG_MERGE) {
+             macapkUpdateConfigurationMerge(config, metrics);
+             return;

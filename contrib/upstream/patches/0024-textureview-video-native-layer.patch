@@ -1,0 +1,430 @@
+TextureView video on its own CALayer: the decoded CVPixelBuffer as layer contents, no copy and no repaint
+
+A TextureView's decoded video took this path per frame: CocoaPresentVideoFrame
+copied the CVPixelBuffer into a new int[] of the frame's size (6.5 MB for a
+960x1706 Reel), SurfaceTexture turned it into a Bitmap, onFrameAvailable
+invalidated the TextureView and the whole view tree was repainted in Java2D --
+26-41% of a core on the Android main thread with a Reel playing.
+
+Now (MACAPK_TEXTUREVIEW_LAYER, default on) the frame goes to a per-surface layer,
+the same kind SurfaceView lockCanvas frames use: CocoaPresentVideoFrame asks
+SurfaceTexture.macapkNativeVideoKey() which layer the frame belongs to, and the
+CVPixelBuffer's IOSurface becomes that layer's contents (retained while on
+screen so the decoder pool cannot refill it). TextureView registers in
+SurfaceView's key space; the compositor pulls its rect per tick (the visible
+part, through setTransform) and, through the new macapkSurfaceCropPacked, the
+part of the buffer it shows, applied as contentsRect. TextureView.draw punches
+the hole once; a frame invalidates nothing, and onSurfaceTextureUpdated is
+still delivered, coalesced, on the main thread. Camera and GL producers keep
+the old path.
+
+Measured on Instagram 455, Reels, the video playing in both runs (frames differ
+between captures): process CPU 38-135% -> 15-18% of a core, RSS 1064 -> 849 MB;
+the Java threads 40% -> 14% (the rest JIT warm-up). A feed video half off the
+screen shows its top half. Boot 10/10.
+
+diff --git a/runtime/java/android/view/TextureView.java b/runtime/java/android/view/TextureView.java
+--- a/runtime/java/android/view/TextureView.java
++++ b/runtime/java/android/view/TextureView.java
+@@ -186,6 +186,7 @@ public class TextureView extends View {
+     private void ensureSurfaceTexture() {
+         if (mSurfaceTexture == null) {
+             mSurfaceTexture = new SurfaceTexture();
++            mSurfaceTexture.macapkSetLayerOwner(this);
+             mSurface = new Surface(mSurfaceTexture);
+             // AOSP registers TextureView's own frame listener at texture
+             // creation (mUpdateListener); a producer frame then invalidates.
+@@ -225,6 +226,7 @@ public class TextureView extends View {
+ 
+     public void setSurfaceTexture(SurfaceTexture surfaceTexture) {
+         mSurfaceTexture = surfaceTexture;
++        if (surfaceTexture != null) surfaceTexture.macapkSetLayerOwner(this);
+         mSurface = (surfaceTexture != null) ? new Surface(surfaceTexture) : null;
+         if (surfaceTexture != null) {
+             // The adopted texture becomes this view's stream; its frames must
+@@ -330,8 +332,93 @@ public class TextureView extends View {
+         invalidate();
+     }
+ 
++    // ---- decoded video on a native layer (MACAPK_TEXTUREVIEW_LAYER) ----------
++    // AOSP composites a TextureView's buffer in the render thread; ours used to
++    // copy every decoded frame into a Bitmap and repaint the whole window in
++    // Java2D (26-41% of a core with a Reel playing, ADR 0016). With the gate on,
++    // the frame goes to a CALayer of its own at this view's visible rect, BELOW
++    // the view tree (cocoa_bridge.mm, the per-surface layers SurfaceView uses),
++    // and draw() only punches the hole -- once. Siblings drawn over the video
++    // (the Reels buttons, captions) stay in the tree, above it. A frame no
++    // longer invalidates anything; onSurfaceTextureUpdated is still sent, once
++    // per frame, on the main thread.
++    static final boolean sNativeLayer =
++        !"0".equals(System.getenv("MACAPK_TEXTUREVIEW_LAYER"));
++    private volatile int mLayerKey;
++    private volatile boolean mLayerLive;
++    private final java.util.concurrent.atomic.AtomicBoolean mUpdatePosted =
++        new java.util.concurrent.atomic.AtomicBoolean();
++    private final Runnable mPostedUpdate = () -> {
++        mUpdatePosted.set(false);
++        applyUpdate();
++    };
++    private static final android.graphics.Matrix sIdentity = new android.graphics.Matrix();
++
++    /** @hide Decode thread, per frame (SurfaceTexture.macapkNativeVideoKey). */
++    public int macapkNativeVideoFrame(SurfaceTexture st) {
++        if (!sNativeLayer || st != mSurfaceTexture || !isAttachedToWindow()) return 0;
++        int key = mLayerKey;
++        if (key == 0) {
++            key = SurfaceView.macapkRegisterLayerView(this);
++            mLayerKey = key;
++        }
++        if (!mLayerLive) {
++            mLayerLive = true;
++            postInvalidate();   // the one repaint that punches the hole
++        }
++        if (mUpdatePosted.compareAndSet(false, true)) post(mPostedUpdate);
++        return key;
++    }
++
++    /** @hide The visible part of the video in display-surface pixels, packed as
++     *  SurfaceView.macapkSurfaceRectPacked packs, and in out[0..3] the part of
++     *  the buffer it shows (fractions x0, y0, x1, y1 from the top-left). -1 =
++     *  hidden, 0 = gone. Main thread (the compositor's pull). */
++    public long macapkLayerRect(float[] crop) {
++        if (!mLayerLive || mSurfaceTexture == null || mSurfaceTexture.isReleased()) {
++            mLayerLive = false;
++            mLayerKey = 0;   // the compositor drops the layer; a new stream re-registers
++            return 0L;
++        }
++        if (!isAttachedToWindow() || !isShown() || getAlpha() <= 0f) return -1L;
++        int w = getWidth(), h = getHeight();
++        if (w <= 0 || h <= 0) return -1L;
++        // Where the buffer lands in view coordinates: the view's bounds through
++        // the content transform (setTransform), as AOSP's TextureView applies it.
++        android.graphics.RectF dst = new android.graphics.RectF(0, 0, w, h);
++        if (!mMatrix.equals(sIdentity)) {
++            if (!mMatrix.rectStaysRect()) return -1L;
++            mMatrix.mapRect(dst);
++        }
++        int[] loc = new int[2];
++        getLocationInWindow(loc);
++        View root = getRootView();
++        int ox = loc[0] - (root != null ? root.getLeft() : 0);
++        int oy = loc[1] - (root != null ? root.getTop() : 0)
++                + com.macapk.loader.StatusBarDriver.heightPx(root);
++        android.graphics.Rect vis = new android.graphics.Rect();
++        if (!getGlobalVisibleRect(vis)) return -1L;
++        vis.offset(ox - loc[0], oy - loc[1]);   // window -> display-surface pixels
++        float l = Math.max(vis.left, ox + dst.left), t = Math.max(vis.top, oy + dst.top);
++        float r = Math.min(vis.right, ox + dst.right), b = Math.min(vis.bottom, oy + dst.bottom);
++        if (r - l < 1f || b - t < 1f) return -1L;
++        float dw = dst.width(), dh = dst.height();
++        crop[0] = (l - ox - dst.left) / dw;
++        crop[1] = (t - oy - dst.top) / dh;
++        crop[2] = (r - ox - dst.left) / dw;
++        crop[3] = (b - oy - dst.top) / dh;
++        int x = Math.round(l), y = Math.round(t), pw = Math.round(r - l), ph = Math.round(b - t);
++        return ((x & 0xffffL) << 48) | ((y & 0xffffL) << 32) | ((pw & 0xffffL) << 16) | (ph & 0xffffL);
++    }
++
+     @Override
+     public void draw(android.graphics.Canvas canvas) {
++        if (mLayerLive && mSurfaceTexture != null && !mSurfaceTexture.isReleased()) {
++            // The video is on its own layer below the tree: show it through.
++            if (canvas != null) canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, 1f);
++            mMatrixChanged = false;
++            return;
++        }
+         // TextureView in AOSP does not draw via the app's Canvas machinery --
+         // the render thread composites the SurfaceTexture's latest image. Our
+         // render thread IS the Canvas pipeline, so this draw performs the
+diff --git a/runtime/java/android/graphics/SurfaceTexture.java b/runtime/java/android/graphics/SurfaceTexture.java
+--- a/runtime/java/android/graphics/SurfaceTexture.java
++++ b/runtime/java/android/graphics/SurfaceTexture.java
+@@ -909,6 +909,30 @@ public class SurfaceTexture {
+      *  BEFORE paying for a pixel copy: is there a live registered target at
+      *  all? Abandoned counts as "no" even if still referenced, matching
+      *  every other producer entry point's checkNotAbandoned-shaped gate. */
++    // ---- decoded video on a native layer (MACAPK_TEXTUREVIEW_LAYER) ----------
++    // The TextureView that consumes this stream, if any. When the decoded video
++    // frame's target is a TextureView, CocoaPresentVideoFrame hands the
++    // CVPixelBuffer to a CALayer at that view's rect (zero copy) instead of
++    // copying it into an int[] and repainting the whole view tree in Java2D for
++    // every frame -- the cost that dominated CPU with a Reel playing.
++    private volatile java.lang.ref.WeakReference<android.view.TextureView> mLayerOwner;
++
++    /** @hide TextureView, when it adopts or creates this stream. */
++    public void macapkSetLayerOwner(android.view.TextureView owner) {
++        mLayerOwner = owner != null ? new java.lang.ref.WeakReference<>(owner) : null;
++    }
++
++    /** @hide JNI, from the decode thread for every frame: the native layer key
++     *  the frame goes to, or 0 to keep the int[] path (no target, not a
++     *  TextureView, gate off, view not attached). */
++    public static int macapkNativeVideoKey() {
++        SurfaceTexture t = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
++        if (t == null || t.mAbandoned || t.mCamSession != 0 || t.mProducer != null) return 0;
++        java.lang.ref.WeakReference<android.view.TextureView> ref = t.mLayerOwner;
++        android.view.TextureView owner = ref != null ? ref.get() : null;
++        return owner != null ? owner.macapkNativeVideoFrame(t) : 0;
++    }
++
+     public static boolean macapkHasActiveVideoTarget() {
+         SurfaceTexture t = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
+         return t != null && !t.mAbandoned;
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -1611,7 +1611,47 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+      *  the layer); -1 = not visible right now (hide it). A display-sized or
+      *  fixed-size buffer keeps the legacy whole-window placement, which is
+      *  where its pixels have always been shown. */
++    // ---- TextureViews on the same per-surface layers --------------------------
++    // TextureView.macapkNativeVideoFrame puts decoded video on a per-surface
++    // layer too; it takes a key from this key space so the compositor's pulls
++    // (rect, crop, z) answer for both kinds of view.
++    private static final java.util.concurrent.ConcurrentHashMap<Integer,
++            java.lang.ref.WeakReference<TextureView>> sTextureByKey =
++        new java.util.concurrent.ConcurrentHashMap<>();
++    private static final float[] sCrop = new float[4];   // main thread only (the pulls)
++
++    static int macapkRegisterLayerView(TextureView v) {
++        int k = sSurfaceKeySeq.incrementAndGet();
++        sTextureByKey.put(k, new java.lang.ref.WeakReference<>(v));
++        return k;
++    }
++
++    /** JNI, main thread, after macapkSurfaceRectPacked for the same key: the part
++     *  of the buffer the layer shows, as four 16-bit fractions (x0, y0, x1, y1
++     *  of 65535, top-left origin); 0 = all of it. */
++    public static long macapkSurfaceCropPacked(int key) {
++        if (!sTextureByKey.containsKey(key)) return 0L;
++        long out = 0;
++        for (int i = 0; i < 4; i++) {
++            long q = Math.round(Math.max(0f, Math.min(1f, sCrop[i])) * 65535f);
++            out = (out << 16) | q;
++        }
++        return out;
++    }
++
+     public static long macapkSurfaceRectPacked(int key) {
++        java.lang.ref.WeakReference<TextureView> tref = sTextureByKey.get(key);
++        if (tref != null) {
++            TextureView tv = tref.get();
++            if (tv == null) { sTextureByKey.remove(key); return 0L; }
++            try {
++                long r = tv.macapkLayerRect(sCrop);
++                if (r == 0L) sTextureByKey.remove(key);
++                return r;
++            } catch (Throwable t) {
++                return -1L;
++            }
++        }
+         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+         SurfaceView v = ref != null ? ref.get() : null;
+         if (v == null) {
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -6828,6 +6975,46 @@ static bool MacapkOverlayImplicitFade() {
+ // reinterpreted as native-endian int32 on this little-endian arm64 host ARE
+ // Android's ARGB_8888 int value (0xAARRGGBB) with zero conversion -- the
+ // same identity MacApkDecodeImageBytes documents earlier in this file.
++static bool MacapkPresentSurfacePixbuf(int key, void* pixbuf);   // with the surface layers, below
++
++/** SurfaceTexture.macapkNativeVideoKey() from the decode thread: the per-surface
++ *  layer this frame goes to, or 0. One static call per frame. */
++static int MacapkNativeVideoLayerKey() {
++    JavaVM* vm = g_touch_vm;
++    if (!vm) return 0;
++    JNIEnv* env = nullptr;
++    bool attached = false;
++    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
++    if (r == JNI_EDETACHED) {
++        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return 0;
++        attached = true;
++    } else if (r != JNI_OK) {
++        return 0;
++    }
++    static jclass    s_cls = nullptr;
++    static jmethodID s_mid = nullptr;
++    static bool      s_tried = false;
++    if (!s_tried) {
++        s_tried = true;
++        jclass c = env->FindClass("android/graphics/SurfaceTexture");
++        if (!c) {
++            env->ExceptionClear();
++        } else {
++            s_mid = env->GetStaticMethodID(c, "macapkNativeVideoKey", "()I");
++            if (!s_mid) env->ExceptionClear();
++            else s_cls = (jclass) env->NewGlobalRef(c);
++            env->DeleteLocalRef(c);
++        }
++    }
++    int key = 0;
++    if (s_cls && s_mid) {
++        key = env->CallStaticIntMethod(s_cls, s_mid);
++        if (env->ExceptionCheck()) { env->ExceptionClear(); key = 0; }
++    }
++    if (attached) vm->DetachCurrentThread();
++    return key;
++}
++
+ static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf) {
+     // Unqualified: this function sits inside `namespace macapk` (opened
+     // line 58, closed line 3299), same span as keybind_set_active's
+@@ -7033,6 +7220,10 @@ static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view) {
+ 
+ extern "C" void CocoaPresentVideoFrame(void* pixbuf, int /*width*/, int /*height*/) {
+     if (!pixbuf) return;
++    // A TextureView's video on its own layer, zero copy (TextureView.java,
++    // "decoded video on a native layer"); else the int[] route below.
++    const int layer_key = MacapkNativeVideoLayerKey();
++    if (layer_key > 0 && MacapkPresentSurfacePixbuf(layer_key, pixbuf)) return;
+     // Route to a registered TextureView target FIRST, synchronously, on the
+     // caller's own thread -- before the CFRetain/dispatch_async hop below,
+     // and using the ORIGINAL pixbuf directly. This is safe because control
+@@ -8156,6 +8347,7 @@ void CocoaPresentBitmapFrom(int width, int height, MacapkPixelsAcquireFn acquire
+ // (hidden). MRC: g_surface_layers retains its layers.
+ // Bisect: MACAPK_SV_SURFACE_LAYER=0 on the Java side never reaches this.
+ static NSMutableDictionary* g_surface_layers = nil;   // NSNumber(key) -> CALayer; main thread only
++static NSMutableDictionary* g_surface_pixbufs = nil;  // NSNumber(key) -> CVPixelBuffer on screen (TextureView video)
+ 
+ // SurfaceView's two pull methods, resolved once (the class is on the
+ // runtime's own classpath, as for MacapkQueryVideoSinkRectPacked).
+@@ -8163,6 +8355,7 @@ void CocoaPresentBitmapFrom(int width, int height, MacapkPixelsAcquireFn acquire
+     jclass    cls  = nullptr;
+     jmethodID rect = nullptr;
+     jmethodID top  = nullptr;
++    jmethodID crop = nullptr;   // optional: TextureView layers show part of their buffer
+ };
+ static const MacapkSurfacePulls& MacapkSurfacePullMethods(JNIEnv* env) {
+     static MacapkSurfacePulls s;
+@@ -8177,6 +8370,8 @@ void CocoaPresentBitmapFrom(int width, int height, MacapkPixelsAcquireFn acquire
+             if (!s.rect) env->ExceptionClear();
+             s.top = env->GetStaticMethodID(c, "macapkSurfaceZOrderOnTop", "(I)Z");
+             if (!s.top) env->ExceptionClear();
++            s.crop = env->GetStaticMethodID(c, "macapkSurfaceCropPacked", "(I)J");
++            if (!s.crop) env->ExceptionClear();
+             if (s.rect) s.cls = (jclass) env->NewGlobalRef(c);
+             env->DeleteLocalRef(c);
+         }
+@@ -8218,6 +8413,7 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer*
+     if (packed == 0) {
+         [layer removeFromSuperlayer];
+         [g_surface_layers removeObjectForKey:nk];
++        if (g_surface_pixbufs) [g_surface_pixbufs removeObjectForKey:nk];
+         return false;
+     }
+     int16_t xs  = (int16_t) ((packed >> 48) & 0xffff);
+@@ -8239,6 +8435,25 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer*
+     want.size.width  = wpx / scale;
+     want.size.height = hpx / scale;
+     if (!CGRectEqualToRect(layer.frame, want)) layer.frame = want;
++    // The part of the buffer this rect shows (a TextureView scrolled half out of
++    // its list, or scaled by setTransform). Fractions from the top-left; the
++    // layer's unit space starts at the bottom unless the host is flipped.
++    CGRect cr = CGRectMake(0, 0, 1, 1);
++    const MacapkSurfacePulls& pulls = MacapkSurfacePullMethods(env);
++    if (pulls.cls && pulls.crop) {
++        jlong c = env->CallStaticLongMethod(pulls.cls, pulls.crop, static_cast<jint>(key));
++        if (env->ExceptionCheck()) { env->ExceptionClear(); c = 0; }
++        if (c != 0) {
++            const double x0 = ((c >> 48) & 0xffff) / 65535.0, y0 = ((c >> 32) & 0xffff) / 65535.0;
++            const double x1 = ((c >> 16) & 0xffff) / 65535.0, y1 = (c & 0xffff) / 65535.0;
++            if (x1 > x0 && y1 > y0) {
++                cr = host.layer.geometryFlipped
++                    ? CGRectMake(x0, y0, x1 - x0, y1 - y0)
++                    : CGRectMake(x0, 1.0 - y1, x1 - x0, y1 - y0);
++            }
++        }
++    }
++    if (!CGRectEqualToRect(layer.contentsRect, cr)) layer.contentsRect = cr;
+     const CGFloat z = overlay.zPosition + (MacapkQuerySurfaceOnTop(env, key) ? 0.1 : -0.25);
+     if (layer.zPosition != z) layer.zPosition = z;
+     if (layer.contentsScale != host.layer.contentsScale)
+@@ -8302,6 +8517,60 @@ static void MacapkApplySurfaceLayersGeometry(JNIEnv* env) {
+     }
+ }
+ 
++/** The layer for `key`, created on first use. Main thread only. */
++static CALayer* MacapkSurfaceLayerFor(int key, int width, int height) {
++    if (!g_surface_layers) g_surface_layers = [[NSMutableDictionary alloc] init];
++    NSNumber* nk = [NSNumber numberWithInt:key];
++    CALayer* layer = g_surface_layers[nk];
++    if (!layer) {
++        layer = [CALayer layer];
++        layer.contentsGravity = kCAGravityResize;   // AOSP scales the buffer to the rect
++        layer.opaque = NO;
++        layer.masksToBounds = YES;
++        if (!MacapkOverlayImplicitFade())
++            layer.actions = @{ @"contents":     [NSNull null],
++                               @"contentsRect": [NSNull null],
++                               @"bounds":       [NSNull null],
++                               @"position":     [NSNull null],
++                               @"hidden":       [NSNull null],
++                               @"zPosition":    [NSNull null] };
++        g_surface_layers[nk] = layer;
++        std::fprintf(stderr, "[I] cocoa_v2: surface layer %d created (%dx%d)\n", key, width, height);
++    }
++    return layer;
++}
++
++// Decoded video for a TextureView (TextureView.macapkNativeVideoFrame): the
++// CVPixelBuffer's IOSurface becomes the layer's contents as it is -- no copy, no
++// conversion, no Java. The buffer stays retained while it is on screen
++// (g_surface_pixbufs) so the decoder's pool cannot refill it under the
++// compositor; the previous one is released when the next frame replaces it.
++
++static bool MacapkPresentSurfacePixbuf(int key, void* pixbuf) {
++    CVPixelBufferRef pb = (CVPixelBufferRef) pixbuf;
++    if (!CVPixelBufferGetIOSurface(pb)) return false;   // not displayable as is
++    CFRetain(pb);
++    void (^mainBlock)(void) = ^{
++        @autoreleasepool {
++            if (!MacapkCanvasOverlayForPresent()) { CFRelease(pb); return; }
++            CALayer* layer = MacapkSurfaceLayerFor(key, (int) CVPixelBufferGetWidth(pb),
++                                                   (int) CVPixelBufferGetHeight(pb));
++            NSNumber* nk = [NSNumber numberWithInt:key];
++            if (!MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), nk, layer)) {
++                CFRelease(pb);
++                return;
++            }
++            layer.contents = (__bridge id) CVPixelBufferGetIOSurface(pb);
++            if (!g_surface_pixbufs) g_surface_pixbufs = [[NSMutableDictionary alloc] init];
++            g_surface_pixbufs[nk] = (__bridge id) pb;   // replaces (and releases) the previous
++            CFRelease(pb);
++        }
++    };
++    if ([NSThread isMainThread]) mainBlock();
++    else dispatch_async(dispatch_get_main_queue(), mainBlock);
++    return true;
++}
++
+ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
+                                    MacapkPixelsAcquireFn acquire,
+                                    MacapkPixelsReleaseFn release, void* ctx) {
+@@ -8340,24 +8609,8 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
+             // its sibling, so the overlay must exist even before the view tree
+             // presented anything (it is transparent until then).
+             if (!MacapkCanvasOverlayForPresent()) return;
+-            if (!g_surface_layers) g_surface_layers = [[NSMutableDictionary alloc] init];
+             NSNumber* nk = [NSNumber numberWithInt:key];
+-            CALayer* layer = g_surface_layers[nk];
+-            if (!layer) {
+-                layer = [CALayer layer];
+-                layer.contentsGravity = kCAGravityResize;   // AOSP scales the buffer to the rect
+-                layer.opaque = NO;
+-                layer.masksToBounds = YES;
+-                if (!MacapkOverlayImplicitFade())
+-                    layer.actions = @{ @"contents":  [NSNull null],
+-                                       @"bounds":    [NSNull null],
+-                                       @"position":  [NSNull null],
+-                                       @"hidden":    [NSNull null],
+-                                       @"zPosition": [NSNull null] };
+-                g_surface_layers[nk] = layer;
+-                std::fprintf(stderr, "[I] cocoa_v2: surface layer %d created (%dx%d)\n",
+-                             key, width, height);
+-            }
++            CALayer* layer = MacapkSurfaceLayerFor(key, width, height);
+             if (!MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), nk, layer)) return;
+             layer.contents = imageObj;
+         };

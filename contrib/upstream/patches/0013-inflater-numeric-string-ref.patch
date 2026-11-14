@@ -1,0 +1,36 @@
+inflater: resolve a numeric string reference in android:text / android:hint
+
+LayoutInflater.resolveString handled `@string/name` and `@android:string/name`
+and returned anything else verbatim. A layout whose string entry carries no
+name reaches it as `@0x7f1379b6`, and that literal became the text: the search
+field of Instagram's share sheet showed "@0x7f1379b6" as its hint. Resolve it
+through the context's Resources (the app's subclass when it serves its own
+strings), the rule TypedArray.getString already applies, and never show the
+literal. After: the hint reads "Pesquisar".
+
+diff --git a/runtime/java/android/view/LayoutInflater.java b/runtime/java/android/view/LayoutInflater.java
+--- a/runtime/java/android/view/LayoutInflater.java
++++ b/runtime/java/android/view/LayoutInflater.java
+@@ -5790,6 +5790,22 @@
+ 
+     private String resolveString(String s) {
+         if (s == null || s.isEmpty()) return s;
++        // A numeric reference (`@0x7f1379b6`, how a packed layout names a
++        // string whose entry carries no name) is a reference all the same:
++        // resolve it through the context's Resources -- the APP's subclass
++        // when it serves its own strings -- and never show the literal. This
++        // is the same rule TypedArray.getString applies.
++        if (s.length() > 3 && s.charAt(0) == '@' && s.charAt(1) == '0'
++                && (s.charAt(2) == 'x' || s.charAt(2) == 'X')) {
++            try {
++                int id = (int) Long.parseLong(s.substring(3), 16);
++                if (id != 0 && context != null && context.getResources() != null) {
++                    CharSequence resolved = context.getResources().getText(id);
++                    if (resolved != null) return resolved.toString();
++                }
++            } catch (Throwable ignored) {}
++            return null;
++        }
+         if (s.startsWith("@string/")) {
+             try {
+                 int id = parseResourceId(s);

@@ -1,0 +1,345 @@
+diff --git a/src/dex/MethodSplitter.java b/src/dex/MethodSplitter.java
+index c35799c..5354b27 100644
+--- a/src/dex/MethodSplitter.java
++++ b/src/dex/MethodSplitter.java
+@@ -160,6 +160,18 @@ final class MethodSplitter {
+ 
+     private static final boolean DEBUG = System.getenv("DEX2JVM_SPLIT_DEBUG") != null;
+ 
++    /** intEnv for a constant declared before intEnv itself is in scope. */
++    private static int intEnvAtLeast(String name, int dflt) {
++        String v = System.getenv(name);
++        if (v == null || v.isEmpty()) return dflt;
++        try {
++            int n = Integer.parseInt(v.trim());
++            return n > 0 ? n : dflt;
++        } catch (NumberFormatException e) {
++            return dflt;
++        }
++    }
++
+     private static int intEnv(String name) {
+         String v = System.getenv(name);
+         if (v == null || v.isEmpty()) return -1;
+@@ -443,7 +455,8 @@ final class MethodSplitter {
+             !"0".equals(System.getenv("DEX2JVM_SPLIT_CLONE_HANDLERS"));
+ 
+     /** Longest handler block, in instructions, worth copying into a part. */
+-    private static final int MAX_CLONE_INSNS = 8;
++    private static final int MAX_CLONE_INSNS = intEnvAtLeast(
++            "DEX2JVM_SPLIT_CLONE_INSNS", 8);
+ 
+     /** Set by the "no valid cut" refusal: the one refusal cloning can cure. */
+     private static final ThreadLocal<Boolean> NO_CUT = new ThreadLocal<>();
+@@ -595,6 +608,13 @@ final class MethodSplitter {
+         private final Map<Integer, int[]> cloneBlocks;
+         /** Any offset inside a cloned block -> that block's handler offset. */
+         private final Map<Integer, Integer> cloneBlockOf = new HashMap<>();
++        /** True when this plan HOISTED a whole-method monitor into the method's
++         *  ACC_SYNCHRONIZED flag instead of keeping monitor-enter/exit in the
++         *  chain (getValues). The emitter then replaces every monitor op with a
++         *  POP -- the operand push stays, so the frame is unchanged -- and the
++         *  JVM holds the lock for the whole call chain, releasing it on every
++         *  return and on exception unwinding. */
++        boolean hoistMonitor;
+ 
+         Plan(List<Part> parts) { this(parts, java.util.Collections.emptyList()); }
+ 
+@@ -650,6 +670,8 @@ final class MethodSplitter {
+             return ans;
+         }
+ 
++        boolean hoistMonitor() { return hoistMonitor; }
++
+         Part partOf(int dexOffset) { return parts.get(partIndexOf(dexOffset)); }
+ 
+         /** The entry record for a DEX offset that a portal targets, or null. */
+@@ -695,6 +717,62 @@ final class MethodSplitter {
+      *                    first argument (THE &lt;init&gt; SPILL); null for the
+      *                    static-field spill of a &lt;clinit&gt;
+      */
++    /** The hoist shape, checked before any cut is attempted: one
++     *  monitor-enter, on `this`, with the method's prologue ending right before
++     *  it (only moves/consts before), and at least one monitor-exit. Anything
++     *  else -- a nested synchronized block, a lock on a field, an exit before
++     *  the enter -- keeps the old refusal. */
++    /** Does the monitor-enter at {@code enterIdx} lock `this`? The block's lock
++     *  register is usually a move-object copy of p0 (`move-object v0, p0;
++     *  monitor-enter v0`), so follow a short chain of move-object copies back to
++     *  the receiver register. Anything else -- a loaded field, a parameter --
++     *  answers false, and the caller keeps the old refusal. */
++    private static boolean lockIsThis(List<TypeInference.Insn> norm, int enterIdx, int thisReg) {
++        int reg = (int) norm.get(enterIdx).args[0];
++        for (int hops = 0; hops < 8; hops++) {
++            if (reg == thisReg) return true;
++            int def = -1;
++            for (int i = enterIdx - 1; i >= 0; i--) {
++                TypeInference.Insn in = norm.get(i);
++                int op = in.opcode & 0xFF;
++                if (in.args == null || in.args.length < 1) continue;
++                if ((int) in.args[0] != reg) continue;
++                if (op == 0x07 || op == 0x08 || op == 0x09) {   // move-object*
++                    if (in.args.length < 2) return false;
++                    def = i;
++                    break;
++                }
++                return false;   // defined by something that is not a copy
++            }
++            if (def < 0) return false;
++            reg = (int) norm.get(def).args[1];
++        }
++        return false;
++    }
++
++    private static boolean hoistableMonitor(List<TypeInference.Insn> norm,
++                                           int mLo, int mHi, int thisReg) {
++        int enters = 0;
++        for (int i = 0; i < norm.size(); i++) {
++            int op = norm.get(i).opcode & 0xFF;
++            if (op == 0x1d) enters++;
++        }
++        if (enters != 1) return false;
++        TypeInference.Insn enter = norm.get(mLo);
++        if (enter.args == null || enter.args.length < 1) return false;
++        if (!lockIsThis(norm, mLo, thisReg)) return false;
++        // The prologue may READ (`iget-object v0, this, f` + a null check is the
++        // measured shape of getValues) but it must not CALL: with the method
++        // flag, whatever runs before the old monitor-enter now runs under the
++        // lock, and a call there could invert a lock order. Reads cannot.
++        for (int i = 0; i < mLo; i++) {
++            int op = norm.get(i).opcode & 0xFF;
++            if (op >= 0x6e && op <= 0x72) return false;   // invoke-*
++            if (op == 0x0d) return false;                 // move-exception
++        }
++        return true;
++    }
++
+     static Plan compute(List<TypeInference.Insn> norm,
+                         TypeInference.Result types,
+                         Translator.Locals locals,
+@@ -710,8 +788,10 @@ final class MethodSplitter {
+                         String methodTag,
+                         boolean spillAllowed,
+                         Set<String> takenFields,
+-                        String receiverDescriptor) {
++                        String receiverDescriptor,
++                        int hoistThisReg) {
+         NO_CUT.set(Boolean.FALSE);
++        boolean hoistMonitor = false;
+         // Etapa E1 do SwitchTableSplitter: reconhece a tabela pura e registra o
+         // plano de distribuicao do dispatcher (sem emitir nada ainda).
+         if (DEBUG) {
+@@ -720,7 +800,7 @@ final class MethodSplitter {
+         }
+         Plan p = computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
+                 totalBytes, targetBytes, allowWiden, returnDescriptor, taken, methodTag,
+-                spillAllowed, takenFields, receiverDescriptor, false);
++                spillAllowed, takenFields, receiverDescriptor, false, hoistThisReg);
+         if (p != null || !CLONE_HANDLERS || !Boolean.TRUE.equals(NO_CUT.get())) return p;
+         if (DEBUG) {
+             System.err.println("[dex-split] " + methodTag
+@@ -729,7 +809,7 @@ final class MethodSplitter {
+         NO_CUT.set(Boolean.FALSE);
+         return computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
+                 totalBytes, targetBytes, allowWiden, returnDescriptor, taken, methodTag,
+-                spillAllowed, takenFields, receiverDescriptor, true);
++                spillAllowed, takenFields, receiverDescriptor, true, hoistThisReg);
+     }
+ 
+     private static Plan computeOnce(List<TypeInference.Insn> norm,
+@@ -748,8 +828,19 @@ final class MethodSplitter {
+                         boolean spillAllowed,
+                         Set<String> takenFields,
+                         String receiverDescriptor,
+-                        boolean cloning) {
++                        boolean cloning,
++                        int hoistThisReg) {
+         CURRENT_METHOD.set(methodTag);
++        // The monitor decision must be made BEFORE the handler-clone map: a
++        // hoisted plan emits monitor ops as POPs, which is exactly what makes
++        // the synchronized block's own handler clonable.
++        int hMo = Integer.MAX_VALUE, hMi = -1;
++        for (int i = 0; i < norm.size(); i++) {
++            int op = norm.get(i).opcode & 0xFF;
++            if (op == 0x1d || op == 0x1e) { hMo = Math.min(hMo, i); hMi = Math.max(hMi, i); }
++        }
++        boolean hoistMonitor = hMi >= 0 && hoistThisReg >= 0
++            && hoistableMonitor(norm, hMo, hMi, hoistThisReg);
+         java.util.Arrays.fill(CUTFAIL, 0L);
+         // THE <init> SPILL: only together with the spill itself, so every
+         // plan this file produced before is produced unchanged.
+@@ -791,7 +882,7 @@ final class MethodSplitter {
+         // whose own block is kept whole instead.
+         Map<Integer, int[]> clones = cloning
+                 ? cloneableHandlers(norm, types, tries, off, indexOf, resolve, deferredNew,
+-                                    thisUninit)
++                                    thisUninit, hoistMonitor)
+                 : java.util.Collections.<Integer, int[]>emptyMap();
+         if (cloning && clones.isEmpty()) return refuse("no handler can be cloned");
+         List<int[]> spans = new ArrayList<>();
+@@ -867,9 +958,22 @@ final class MethodSplitter {
+                 }
+             }
+             if (mHi >= 0) {
+-                spans.add(new int[]{ mLo, mHi });
+-                if (DEBUG) System.err.println("[dex-split] monitor window [" + mLo
+-                    + "," + mHi + "] of " + n + " instructions is cut-forbidden");
++                // F1b: a method whose WHOLE body is one synchronized block can be
++                // split by hoisting the monitor onto the method's own
++                // ACC_SYNCHRONIZED flag instead of cutting inside the window.
++                // The emitter then swaps every monitor op for a POP (the operand
++                // push stays, so the frame is unchanged) and the JVM holds the
++                // lock across the whole chain -- released on every return and on
++                // exception unwinding. Proven only when the lock is `this`
++                // (the flag locks the receiver): a block on any other object
++                // stays on the forwarded-only path and is still refused.
++                if (hoistMonitor) {
++                    if (DEBUG) System.err.println("[dex-split] monitor hoisted to "
++                        + "ACC_SYNCHRONIZED (lock is this; " + n + " instructions)");
++                } else {
++                    spans.add(new int[]{ mLo, mHi });
++                    if (DEBUG) System.err.println("[dex-split] monitor window [" + mLo
++                        + "," + mHi + "] of " + n + " instructions is cut-forbidden");
+ 
+                 // One span is not sufficient on its own. Keeping the window in
+                 // ONE part stops a cut from splitting a lock from its unlock,
+@@ -889,10 +993,11 @@ final class MethodSplitter {
+                 // adds nothing -- d8 emits monitor-exit BEFORE the branch that
+                 // leaves a synchronized block -- so it is a guard against
+                 // restructured (R8-optimised) code, priced at one extra pass.
+-                for (int i = mLo; i <= mHi; i++) {
+-                    for (int s : successors(norm.get(i))) {
+-                        int si = resolve.indexAtOrAfter(s);
+-                        if (si > i) spans.add(new int[]{ i, si });
++                    for (int i = mLo; i <= mHi; i++) {
++                        for (int s : successors(norm.get(i))) {
++                            int si = resolve.indexAtOrAfter(s);
++                            if (si > i) spans.add(new int[]{ i, si });
++                        }
+                     }
+                 }
+             }
+@@ -1206,7 +1311,9 @@ final class MethodSplitter {
+             System.err.println("[dex-split] " + methodTag + ": " + clones.size()
+                 + " terminal handler(s) cloned per part: " + hexKeys(clones));
+         }
+-        return new Plan(parts, spillFields, clones);
++        Plan plan = new Plan(parts, spillFields, clones);
++        plan.hoistMonitor = hoistMonitor;
++        return plan;
+     }
+ 
+     /** Instamac: DEX2JVM_SPLIT_DUMP=&lt;substring&gt; prints try/catch geometry. */
+@@ -1340,7 +1447,8 @@ final class MethodSplitter {
+                                                          int[] off, Map<Integer, Integer> indexOf,
+                                                          Resolver resolve,
+                                                          Map<Integer, Integer> deferredNew,
+-                                                         Set<Integer> thisUninit) {
++                                                         Set<Integer> thisUninit,
++                                                         boolean hoistMonitor) {
+         Map<Integer, int[]> out = new java.util.TreeMap<>();
+         final int n = norm.size();
+         Set<Integer> handlers = new TreeSet<>();
+@@ -1393,7 +1501,7 @@ final class MethodSplitter {
+                 }
+                 if (insideDeferredNew(in.offset, deferredNew)) continue candidates;
+                 int fam = TypeInference.familyOf(in.opcode);
+-                if (!cloneSafe(fam)) continue candidates;
++                if (!cloneSafe(fam) && !(hoistMonitor && isMonitorFamily(fam))) continue candidates;
+                 block.add(in.offset);
+                 if (fam == TypeInference.F_THROW || fam == TypeInference.F_RETURN) {
+                     int[] b = new int[block.size()];
+@@ -1408,6 +1516,13 @@ final class MethodSplitter {
+ 
+     /** Families a handler copy may contain: straight-line, no allocation, no
+      *  monitor, no constructor call, nothing that needs a label of its own. */
++    /** monitor-enter/monitor-exit, the two families a HOISTED plan emits as a
++     *  POP: cloning such a handler is then a plain rethrow. */
++    private static boolean isMonitorFamily(int family) {
++        return family == TypeInference.F_MONITOR_ENTER
++            || family == TypeInference.F_MONITOR_EXIT;
++    }
++
+     private static boolean cloneSafe(int family) {
+         switch (family) {
+             case TypeInference.F_MOVE: case TypeInference.F_MOVE_WIDE:
+diff --git a/src/dex/Translator.java b/src/dex/Translator.java
+index 6c411cc..8e8850a 100644
+--- a/src/dex/Translator.java
++++ b/src/dex/Translator.java
+@@ -442,6 +442,16 @@ public final class Translator {
+     public static void emitUnsupportedBody(ClassFileWriter.MethodWriter mw,
+                                            DexMethod method, String msg) {
+         CodeWriter c = mw.newCode();
++        // A stub that throws is INVISIBLE in real use: the app catches the
++        // exception and routes it to its own error reporter, so a feature that
++        // silently does nothing leaves no trace in our log. Log.w at method
++        // entry makes a stub call say itself, with the same message the
++        // exception carries (class.method + why it could not be translated).
++        c.ldcString("macapk-stub");
++        c.ldcString(msg);
++        c.methodOp(CodeWriter.INVOKESTATIC, "android/util/Log", "w",
++                   "(Ljava/lang/String;Ljava/lang/String;)I", false);
++        c.op(CodeWriter.POP);
+         c.typeOp(CodeWriter.NEW, "java/lang/UnsupportedOperationException");
+         c.op(CodeWriter.DUP);
+         c.ldcString(msg);
+@@ -1713,8 +1723,23 @@ public final class Translator {
+          * routed to a portal by labelFor, so nothing else in the emitter needs
+          * to know a split is happening.
+          */
++        /** The register `this` lives in, or -1 for a static method. With this the
++         *  splitter can prove that a whole-method synchronized block locks the
++         *  receiver -- the only shape ACC_SYNCHRONIZED can carry -- before it
++         *  hoists the monitor. */
++        int hoistThisReg() {
++            if ((method.accessFlags() & ClassFileWriter.ACC_STATIC) != 0) return -1;
++            return code.registersSize() - code.insSize();
++        }
++
+         void runSplit(List<TypeInference.Insn> norm, List<TypeInference.TryBlock> tries) {
+             List<MethodSplitter.Part> parts = split.parts();
++            if (split.hoistMonitor()) {
++                // The monitor lives on the METHOD now; the chain must not also
++                // enter/exit it. ACC_SYNCHRONIZED releases on every return and
++                // on unwinding, which is the same guarantee the block gave.
++                mw.access |= ClassFileWriter.ACC_SYNCHRONIZED;
++            }
+             assignPartTries(tries);
+             emitPrologue();
+             TypeInference.Insn last = null;
+@@ -2126,7 +2151,8 @@ public final class Translator {
+                     off -> { Integer b = bytecodeOf.get(off); return b == null ? -1 : b; },
+                     length, targetBytes, allowWiden, method.proto().returnType(), taken,
+                     methodTag(), spillAllowed, takenFields,
+-                    ctorSpillEligible() ? "L" + ownerName + ";" : null);
++                    ctorSpillEligible() ? "L" + ownerName + ";" : null,
++                    hoistThisReg());
+         }
+ 
+         /** May this method's split parts take their values through fields?
+@@ -2423,13 +2449,19 @@ public final class Translator {
+                 }
+ 
+                 case TypeInference.F_MONITOR_ENTER:
+-                    pushUse(it, 0);
+-                    out.op(CodeWriter.MONITORENTER);
+-                    break;
+-
+                 case TypeInference.F_MONITOR_EXIT:
++                    // The operand push is part of the DEX instruction, so it
++                    // must happen either way; with the monitor HOISTED onto the
++                    // method's ACC_SYNCHRONIZED flag the op itself becomes a
++                    // POP, leaving every frame exactly as inferred and no
++                    // monitor instruction in the class file.
+                     pushUse(it, 0);
+-                    out.op(CodeWriter.MONITOREXIT);
++                    if (split != null && split.hoistMonitor()) {
++                        out.op(CodeWriter.POP);
++                    } else {
++                        out.op((insn.opcode & 0xFF) == 0x1d
++                                ? CodeWriter.MONITORENTER : CodeWriter.MONITOREXIT);
++                    }
+                     break;
+ 
+                 case TypeInference.F_CHECK_CAST:

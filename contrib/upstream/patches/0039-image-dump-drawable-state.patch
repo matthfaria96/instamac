@@ -1,0 +1,24 @@
+view dump: an ImageView drawable's bounds, alpha and visibility
+
+The dump shows an ImageView drawable's bounds, alpha, visibility and the view's
+image alpha -- why a set drawable does not paint.
+
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -4679,6 +4781,15 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             sb.append(" drawable=").append(d == null ? "null"
+                 : d.getClass().getSimpleName() + "(" + d.getIntrinsicWidth() + "x"
+                   + d.getIntrinsicHeight() + ")");
++            // Why a set drawable does not paint: empty bounds, alpha 0, hidden.
++            if (d != null) {
++                android.graphics.Rect db = d.getBounds();
++                sb.append(" db=").append(db.left).append(',').append(db.top).append(',')
++                  .append(db.right).append(',').append(db.bottom);
++                if (d.getAlpha() != 255) sb.append(" da=").append(d.getAlpha());
++                if (!d.isVisible()) sb.append(" dvis=false");
++                if (iv.getImageAlpha() != 255) sb.append(" ia=").append(iv.getImageAlpha());
++            }
+         }
+         // Background drawable (any view): a filled button whose fill is a
+         // custom Drawable (e.g. Duolingo's LipDrawable) shows here -- a null

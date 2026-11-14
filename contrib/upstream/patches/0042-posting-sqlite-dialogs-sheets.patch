@@ -1,0 +1,252 @@
+posting: raw BEGIN/COMMIT as nested transactions; dialog theme background; sheets that slide in
+
+Three runtime gaps that kept Instagram from publishing and from showing its bottom sheets:
+
+1. SQLiteStatement: AOSP SQLiteSession.executeSpecial turns a raw BEGIN / COMMIT /
+   END / ROLLBACK (not ROLLBACK TO) into the nested transaction API. Sent to
+   sqlite, a BEGIN inside SQLiteOpenHelper's onCreate transaction failed, so
+   Instagram's pending-media store never opened: a rendered post was never
+   committed and Share did nothing. Measured: posts with caption and music now
+   publish.
+2. Dialog: the window background is the dialog THEME's windowBackground (from
+   its own cascade); the AOSP default inset panel only when the theme declares
+   none. Instagram's sheets declare a transparent one; the grey 16dp panel
+   squeezed them.
+3. WindowOverlayStack: a dialog window is measured/laid out only when it asked
+   for layout or its frame changed (ViewRootImpl), and its tree observer gets
+   OnGlobalLayout after layout and OnPreDraw before draw. Re-laying it out on
+   every draw restarted a sheet's slide-in each frame; the never-dispatched
+   global layout left sheets that wait for it below the screen.
+Diagnostics: the view dump includes dialog windows; MACAPK_TRACE_ENTRY_MAX.
+
+diff --git a/runtime/java/android/database/sqlite/SQLiteStatement.java b/runtime/java/android/database/sqlite/SQLiteStatement.java
+--- a/runtime/java/android/database/sqlite/SQLiteStatement.java
++++ b/runtime/java/android/database/sqlite/SQLiteStatement.java
+@@ -56,10 +56,39 @@ public class SQLiteStatement extends SQLiteProgram {
+     // the ownership check and the step. Reads (simpleQueryFor*) are
+     // deliberately not gated; see the transactions comment block in
+     // SQLiteDatabase.
++    /** AOSP SQLiteSession.executeSpecial: a raw BEGIN / COMMIT / END / ROLLBACK
++     *  (not ROLLBACK TO) run through execSQL or a compiled statement is turned
++     *  into the NESTED transaction API -- beginTransaction /
++     *  setTransactionSuccessful+endTransaction / endTransaction -- instead of
++     *  reaching sqlite. Sent to sqlite, a BEGIN inside SQLiteOpenHelper's own
++     *  onCreate/onUpgrade transaction failed ("cannot start a transaction within
++     *  a transaction"). Measured: Instagram's pending-media store, so a rendered
++     *  post was never committed and never uploaded. True when handled. */
++    private boolean macapkExecuteSpecial() {
++        if (db == null) return false;
++        final String sql = getSql();
++        if (sql == null) return false;
++        switch (android.database.DatabaseUtils.getSqlStatementType(sql)) {
++            case android.database.DatabaseUtils.STATEMENT_BEGIN:
++                db.beginTransaction();
++                return true;
++            case android.database.DatabaseUtils.STATEMENT_COMMIT:
++                db.setTransactionSuccessful();
++                db.endTransaction();
++                return true;
++            case android.database.DatabaseUtils.STATEMENT_ABORT:
++                db.endTransaction();
++                return true;
++            default:
++                return false;
++        }
++    }
++
+     public void execute() {
+         acquireReference();
+         try {
+             if (stmt == 0) return;
++            if (macapkExecuteSpecial()) return;
+             if (db != null) {
+                 synchronized (db) {
+                     db.macapkAwaitTxConnection();
+@@ -97,6 +126,7 @@ public class SQLiteStatement extends SQLiteProgram {
+         acquireReference();
+         try {
+             if (stmt == 0 || db == null) return 0;
++            if (macapkExecuteSpecial()) return 0;
+             synchronized (db) {
+             db.macapkAwaitTxConnection();
+             stepNonQuery();
+diff --git a/runtime/java/android/app/Dialog.java b/runtime/java/android/app/Dialog.java
+--- a/runtime/java/android/app/Dialog.java
++++ b/runtime/java/android/app/Dialog.java
+@@ -908,6 +908,18 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
+          *  The polarity comes from the app's own theme cascade, so a dark-themed
+          *  app gets the dark panel without anything here knowing which app it is. */
+         private static void macapkApplyDialogBackground(android.view.View d, Context c) {
++            // AOSP: the window background IS the theme's android:windowBackground
++            // (PhoneWindow.generateLayout). The inset panel below is only the
++            // DEFAULT dialog theme's value; a dialog theme that declares its own
++            // (Instagram's bottom sheets and alerts: transparent, the sheet draws
++            // its own card) must get exactly that. Painting the default panel over
++            // it put a grey 16dp-inset box behind every sheet and squeezed the
++            // sheet into the band below the inset (account switcher unusable).
++            final Object themed = macapkThemedWindowBackground(c);
++            if (themed != NO_THEMED_BACKGROUND) {
++                d.setBackground((android.graphics.drawable.Drawable) themed);
++                return;
++            }
+             android.graphics.drawable.Drawable bg = macapkDialogBackground(c);
+             if (bg == null) return;
+             // setBackground applies the drawable's own padding as of v1.0.871 --
+@@ -923,6 +935,45 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
+             d.setBackground(bg);
+         }
+ 
++        private static final Object NO_THEMED_BACKGROUND = new Object();
++
++        /** The dialog theme's own windowBackground, from its cascade only (never
++         *  the application theme's, which is the activity's opaque fill): a
++         *  Drawable, null for "@null"/transparent, or NO_THEMED_BACKGROUND when
++         *  the dialog theme does not declare one. */
++        private static Object macapkThemedWindowBackground(Context c) {
++            try {
++                android.content.res.Resources.Theme th = c != null ? c.getTheme() : null;
++                if (th == null) return NO_THEMED_BACKGROUND;
++                String raw = th.macapkResolveAttrRawCascadeOnly("windowBackground");
++                if (raw == null || raw.isEmpty()) raw = th.macapkResolveAttrRawCascadeOnly("android:windowBackground");
++                if ("1".equals(System.getenv("MACAPK_TRACE_DIALOG_BG"))) {
++                    com.macapk.loader.NativeLog.i("Mac.apk.Dialog", "theme windowBackground = " + raw);
++                }
++                if (raw == null || raw.isEmpty() || raw.startsWith("?")) return NO_THEMED_BACKGROUND;
++                if (raw.equals("@null") || raw.endsWith("color/transparent")) return null;
++                if (raw.startsWith("#")) {
++                    final int color = android.graphics.Color.parseColor(raw);
++                    return (color >>> 24) == 0 ? null : new android.graphics.drawable.ColorDrawable(color);
++                }
++                if (raw.startsWith("@")) {
++                    String ref = raw.substring(1);
++                    boolean framework = ref.startsWith("android:");
++                    if (framework) ref = ref.substring("android:".length());
++                    final int slash = ref.indexOf('/');
++                    if (slash <= 0 || framework) return NO_THEMED_BACKGROUND;
++                    android.content.res.Resources r = c.getResources();
++                    final int id = r.getIdentifier(ref.substring(slash + 1), ref.substring(0, slash),
++                                                   c.getPackageName());
++                    if (id != 0) {
++                        android.graphics.drawable.Drawable dr = c.getDrawable(id);
++                        if (dr != null) return dr;
++                    }
++                }
++            } catch (Throwable ignored) { }
++            return NO_THEMED_BACKGROUND;
++        }
++
+         private static android.graphics.drawable.Drawable macapkDialogBackground(Context c) {
+             try {
+                 // Through the dialog's OWN Context first -- see the long note on
+diff --git a/runtime/java/com/macapk/loader/WindowOverlayStack.java b/runtime/java/com/macapk/loader/WindowOverlayStack.java
+--- a/runtime/java/com/macapk/loader/WindowOverlayStack.java
++++ b/runtime/java/com/macapk/loader/WindowOverlayStack.java
+@@ -30,6 +30,9 @@ public final class WindowOverlayStack {
+         public final View view;
+         public WindowManager.LayoutParams params;
+         public final Rect bounds = new Rect();   // last laid-out screen rect
++        /** The specs of the last measure (AOSP ViewRootImpl: a window is measured
++         *  again only when it asked for layout or its size changed). */
++        int lastWSpec = Integer.MIN_VALUE, lastHSpec = Integer.MIN_VALUE;
+         /** The Dialog that owns this decor, when one does. AOSP reaches the
+          *  Dialog through the DecorView's Window callback; we have no such
+          *  chain, so an outside tap had nothing to cancel and was simply
+@@ -626,7 +629,20 @@ public final class WindowOverlayStack {
+ 
+         int wSpec = specFor(lp.width, screenW);
+         int hSpec = specFor(lp.height, screenH);
+-        try { v.measure(wSpec, hSpec); } catch (Throwable ignored) { }
++        // AOSP's ViewRootImpl.performTraversals measures and lays out a window
++        // only when something in it asked (requestLayout) or its frame changed.
++        // This runs on EVERY draw, and View.layout() runs onLayout every time, so
++        // a container that re-anchors its children in onLayout restarted its
++        // animation each frame. Measured: Instagram's bottom sheets (account
++        // switcher, options) re-started their slide-in from below the screen on
++        // every frame and never appeared.
++        final boolean requested = v.isLayoutRequested();
++        final boolean specChanged = wSpec != layer.lastWSpec || hSpec != layer.lastHSpec;
++        if (requested || specChanged) {
++            try { v.measure(wSpec, hSpec); } catch (Throwable ignored) { }
++            layer.lastWSpec = wSpec;
++            layer.lastHSpec = hSpec;
++        }
+ 
+         int w = v.getMeasuredWidth();
+         int h = v.getMeasuredHeight();
+@@ -662,8 +678,22 @@ public final class WindowOverlayStack {
+         if (left + w > screenW) left = Math.max(0, screenW - w);
+         if (top + h > screenH) top = Math.max(0, screenH - h);
+ 
++        final boolean moved = layer.bounds.left != left || layer.bounds.top != top
++                || layer.bounds.right != left + w || layer.bounds.bottom != top + h;
+         layer.bounds.set(left, top, left + w, top + h);
+-        try { v.layout(left, top, left + w, top + h); } catch (Throwable ignored) { }
++        if (requested || specChanged || moved) {
++            try { v.layout(left, top, left + w, top + h); } catch (Throwable ignored) { }
++            // AOSP: every window's ViewRootImpl dispatches ITS tree observer's
++            // OnGlobalLayout after its layout pass (performTraversals). A dialog
++            // root has its own observer, and only the activity's was ever
++            // dispatched, so a listener inside a dialog never fired. Measured:
++            // Instagram's bottom sheets wait for it to slide in when they are not
++            // laid out yet ("Adicionar perfil" and others stayed below the screen).
++            try {
++                android.view.ViewTreeObserver vto = v.macapkPeekTreeObserver();
++                if (vto != null) vto.dispatchOnGlobalLayout();
++            } catch (Throwable t) { GfxTrace.swallow("overlay dispatchOnGlobalLayout", t); }
++        }
+     }
+ 
+     /**
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -1598,15 +1687,37 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             String de = ENV_MACAPK_DUMP_TREE_EVERY;
+             if (de != null) { long iv = Long.parseLong(de); dumpEvery = iv > 0 && (n % iv) == 0; }
+         } catch (Throwable ignored) {}
++        if (sDumpNow && ENV_MACAPK_DUMP_TREE_EVERY != null) { sDumpNow = false; dumpEvery = true; }
+         if (n == 1 || n == 60 || n == 300 || dumpEvery) {
+             try { dumpTree(rootView, 0, new StringBuilder()); }
+             catch (Throwable ignored) {}
++            // Dialogs, popups and sheets live in their own windows: dump them too,
++            // each under a WINDOW line, so a sheet stuck off-screen or at alpha 0
++            // (which the text dump skips) is visible with its translation.
++            try {
++                for (WindowOverlayStack.Layer layer : WindowOverlayStack.snapshot()) {
++                    if (layer.view == null) continue;
++                    NativeLog.i(TAG, "WINDOW " + layer.view.getClass().getName()
++                        + " bounds=" + layer.bounds.toShortString());
++                    dumpTree(layer.view, 0, new StringBuilder());
++                }
++            } catch (Throwable ignored) {}
+             // The harness text dump (uiautomator-shaped labels, absolute clipped
+             // bounds, floating windows, WebView page text) debug/drive_app.sh taps
+             // by: docs/harness-text-dump_2026-09-26.md. Returns at once unless
+             // MACAPK_DUMP_TREE_EVERY is set and MACAPK_TEXT_DUMP is not 0.
+             try { ViewTextDump.dumpToLog(rootView, statusBarH); }
+             catch (Throwable ignored) {}
++            try {
++                android.content.Context dumpCtx = rootView.getContext();
++                while (dumpCtx instanceof android.content.ContextWrapper
++                        && !(dumpCtx instanceof android.app.Activity)) {
++                    dumpCtx = ((android.content.ContextWrapper) dumpCtx).getBaseContext();
++                }
++                if (dumpCtx instanceof android.app.Activity) {
++                    FragmentLifecycle.dumpTree((android.app.Activity) dumpCtx);
++                }
++            } catch (Throwable ignored) {}
+             if ("1".equals(ENV_MACAPK_TRACE_BARRIER)) {
+                 try { dumpBarriers(rootView); } catch (Throwable ignored) {}
+             }
+@@ -1894,6 +2007,11 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+                 }
+                 try {
+                     WindowOverlayStack.measureAndLayout(layer, ow, oh);
++                    // ...and its OnPreDraw before it is drawn, as for the activity.
++                    try {
++                        android.view.ViewTreeObserver lvto = layer.view.macapkPeekTreeObserver();
++                        if (lvto != null) lvto.dispatchOnPreDraw();
++                    } catch (Throwable t) { GfxTrace.swallow("overlay dispatchOnPreDraw", t); }
+                     canvas.save();
+                     canvas.translate(0, statusBarH);
+                     // FLAG_DIM_BEHIND: darken everything already painted, before

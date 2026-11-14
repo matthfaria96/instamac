@@ -1,0 +1,220 @@
+translator: re-point the R8 constructor sites the plan missed
+
+Two kinds of `new T` + `S.<init>` (S a superclass of T) were left unverifiable.
+Harmless while HotSpot does not verify app classes, but the AOT training run is
+the one place it does, and there they were fatal (Instagram's QPLInitializer
+never finished; the app called System.exit(10)).
+
+1. InitRepointPlan: reusing R8's surviving pure forwarder on T made it the FIXED
+   caller of everything above it, so a superclass constructor that does real work
+   could not be routed around and the whole site was dropped. The reuse is now
+   tried as a whole and, when blocked, taken back: a padded forwarder is
+   synthesised on T as well (X/01aq -> 01ap.<init>()V calls this.A02()).
+2. InitRepointPlan: the linear scan pairs an allocation only with a constructor
+   BELOW it; R8 lays blocks out freely, so a flow-insensitive pass now proposes
+   (T, S) for every `new T` that can reach the receiver register and has S as a
+   proper ancestor. Over-proposing is harmless: every re-point is still decided
+   by type inference.
+3. Translator.hasHiddenRepoint: one `new Object()` in a method hid every other
+   Object.<init> from the exact pass. Each call now consumes one allocation of
+   its class; a surplus call triggers the pass.
+4. Translator: the DEX2JVM_TRACE_ENTRY prologue read each argument from the next
+   one's slot (spacedParams() lists the receiver first), so a boolean `true` went
+   out as the reference 0x1 and the trace itself threw.
+
+Measured: the AOT training run reaches the window and the feed (the cache grows
+from 199 to 325 MB) and the app opens in 6 s with it.
+
+diff --git a/runtime/java/com/macapk/dex/InitRepointPlan.java b/runtime/java/com/macapk/dex/InitRepointPlan.java
+--- a/runtime/java/com/macapk/dex/InitRepointPlan.java
++++ b/runtime/java/com/macapk/dex/InitRepointPlan.java
+@@ -229,7 +229,7 @@ final class InitRepointPlan {
+                     // on too; it must not take the whole plan down with it.
+                     continue;
+                 }
+-                scanMethod(decoded, m, code, (offset, uninitThis, allocated, ref) -> {
++                SiteVisitor propose = (offset, uninitThis, allocated, ref) -> {
+                     String start = uninitThis ? c.superclassName() : allocated;
+                     if (start == null) return;
+                     String owner = DexFile.internalName(ref.declaringClass());
+@@ -237,7 +237,9 @@ final class InitRepointPlan {
+                     candidates.computeIfAbsent(start + ' ' + owner + ' ' + desc,
+                                     k -> new Candidate(start, owner, desc))
+                               .referrers.add(c.name());
+-                });
++                };
++                scanMethod(decoded, m, code, propose);
++                scanOutOfOrderSites(decoded, m, byName, propose);
+             }
+             c.releaseMembers();
+         }
+@@ -473,21 +475,38 @@ final class InitRepointPlan {
+                     String forwardsTo = canBeNamed(existing, cur, namingClass, referrers)
+                             ? pureForwardTarget(c, desc) : null;
+                     if (forwardsTo != null) {
++                        // Reusing R8's forwarder makes it the FIXED caller of
++                        // everything above it, which can then never be padded.
++                        // So try the reuse as a whole, and when the chain above
++                        // is blocked by a constructor that does real work, take
++                        // the attempt back and route around this level too: a
++                        // padded forwarder synthesised HERE has a caller we can
++                        // re-point. Measured (Instagram 455): `new X/01aq` +
++                        // `Object.<init>()V`, where 01aq keeps a pure `()V`
++                        // forwarder but its superclass 01ap's `()V` also calls
++                        // this.A02() (R8 inlined that call at the site). The
++                        // reuse-only walk gave up, the site stayed unverifiable,
++                        // and the AOT training run -- the one place HotSpot
++                        // verifies app classes -- died in QPLInitializer.
++                        final int mark = pending.size();
++                        final String[] savedSuper = new String[mark];
++                        for (int i = 0; i < mark; i++) savedSuper[i] = pending.get(i)[2];
++                        boolean ok = true;
+                         if (!forwardsTo.equals(superName)) {
+                             // Its own super call was re-pointed by R8 too. It
+                             // still runs only forwardsTo's constructor, but only
+                             // if everything between it and forwardsTo is a
+                             // forwarder as well -- and that stretch is compiled
+                             // code, so nothing in it may be padded.
+-                            if (walk(superName, forwardsTo, desc, pending,
+-                                     depth + 1, FIXED_CALLER, referrers, cur) == null) {
+-                                return null;
+-                            }
++                            ok = walk(superName, forwardsTo, desc, pending,
++                                      depth + 1, FIXED_CALLER, referrers, cur) != null;
+                         }
+-                        namingClass = cur;
+-                        cur = forwardsTo;
+-                        child = FIXED_CALLER;
+-                        continue;
++                        if (ok && walk(forwardsTo, namedOwner, desc, pending, depth + 1,
++                                       FIXED_CALLER, referrers, cur) != null) {
++                            return callDescriptor;
++                        }
++                        while (pending.size() > mark) pending.remove(pending.size() - 1);
++                        for (int i = 0; i < mark; i++) pending.get(i)[2] = savedSuper[i];
+                     }
+                     blocked = true;
+                 } else if (declaresSynthetic(cur, desc)) {
+@@ -858,6 +877,95 @@ final class InitRepointPlan {
+         }
+     }
+ 
++    /**
++     * The sites scanMethod cannot pair because the allocation is not ABOVE its
++     * constructor call in address order. R8 lays blocks out freely, so a
++     * `new-instance` can sit after the `invoke-direct <init>` it feeds, reached
++     * by a backward goto (measured, Instagram 455:
++     * LongformDraftRepository.A02, `new X/0RBg` + `Object.<init>()V` at @1007
++     * with the allocation in a later block). The linear pass never sees the
++     * pair, the plan never authorises it, and the type-inference pass in the
++     * Translator -- which does see it -- finds no authorisation to use. The
++     * site stayed unverifiable, which only matters where HotSpot verifies app
++     * classes: the AOT training run, where it was fatal.
++     *
++     * Flow-insensitive on purpose: a register is credited with every class
++     * any `new-instance` (or a move-object chain from one) ever puts in it,
++     * and a candidate is proposed for each of those classes that has the
++     * named class as a proper ancestor -- which ART requires of the pair
++     * anyway. Over-proposing is the harmless direction (see build), and every
++     * re-point is still decided by the real type inference.
++     */
++    static void scanOutOfOrderSites(Instruction[] decoded, DexMethod method,
++                                    Map<String, DexClass> byName, SiteVisitor visitor) {
++        if (decoded.length == 0) return;
++        DexFile dex = method.declaringClass().dex();
++        Map<Integer, java.util.Set<String>> reach = new HashMap<>();
++        List<int[]> moves = new ArrayList<>();
++        boolean anyInit = false;
++        for (Instruction in : decoded) {
++            if (in.isPayload()) continue;
++            int op = in.opcode();
++            if (op == 0x22) {
++                String d = safeType(dex, in.index());
++                if (d != null) reach.computeIfAbsent(in.a(), k -> new java.util.TreeSet<>())
++                                    .add(DexFile.internalName(d));
++            } else if (op == 0x07 || op == 0x08 || op == 0x09) {
++                moves.add(new int[]{ in.a(), in.b() });
++            } else if (op == 0x70 || op == 0x76) {
++                anyInit = true;
++            }
++        }
++        if (!anyInit || reach.isEmpty()) return;
++        for (boolean changed = true; changed; ) {
++            changed = false;
++            for (int[] mv : moves) {
++                java.util.Set<String> src = reach.get(mv[1]);
++                if (src == null) continue;
++                if (reach.computeIfAbsent(mv[0], k -> new java.util.TreeSet<>()).addAll(src)) {
++                    changed = true;
++                }
++            }
++        }
++        for (Instruction in : decoded) {
++            if (in.isPayload()) continue;
++            int op = in.opcode();
++            if (op != 0x70 && op != 0x76) continue;
++            DexFile.MethodRef ref;
++            try {
++                ref = dex.methodRef(in.index());
++            } catch (RuntimeException e) {
++                continue;
++            }
++            int[] args = in.argRegisters();
++            if (ref == null || args.length == 0 || !"<init>".equals(ref.name())) continue;
++            java.util.Set<String> types = reach.get(args[0]);
++            if (types == null) continue;
++            String named = DexFile.internalName(ref.declaringClass());
++            for (String t : types) {
++                if (!t.equals(named) && isProperAncestor(named, t, byName)) {
++                    visitor.site(in.address(), false, t, ref);
++                }
++            }
++        }
++    }
++
++    /** Whether {@code ancestor} is a superclass of {@code cls}, walking the
++     *  classes of this session; a chain that leaves them (a platform class)
++     *  counts only when it ends exactly at java/lang/Object. */
++    private static boolean isProperAncestor(String ancestor, String cls,
++                                            Map<String, DexClass> byName) {
++        String cur = cls;
++        for (int guard = 0; guard < 64 && cur != null; guard++) {
++            DexClass c = byName.get(cur);
++            if (c == null) return false;
++            String sup = c.superclassName();
++            if (ancestor.equals(sup)) return true;
++            cur = sup;
++        }
++        return false;
++    }
++
+     private static String safeType(DexFile dex, int index) {
+         try {
+             return dex.typeDescriptor(index);
+diff --git a/src/dex/Translator.java b/src/dex/Translator.java
+--- a/src/dex/Translator.java
++++ b/src/dex/Translator.java
+@@ -1288,12 +1509,21 @@ public final class Translator {
+          */
+         boolean hasHiddenRepoint() {
+             if (repointPlan.isEmpty()) return false;
+-            java.util.Set<String> allocated = new HashSet<>();
++            // How many allocations of each class there are to pair calls with:
++            // each call naming X consumes one `new X`. A plain "the method
++            // allocates X somewhere" let one `new Object()` (a lock, a sentinel)
++            // hide every other java/lang/Object.<init> in the method, R8's
++            // re-pointed `new T; Object.<init>()` included. Measured (Instagram
++            // 455): LongformDraftRepository.A02, `new X/0RBg` + Object.<init>
++            // at @1007, unverifiable -- fatal in the AOT training run, the one
++            // place HotSpot verifies app classes. A surplus call costs one exact
++            // pass; a shortage (two constructors on two paths) only a wasted one.
++            Map<String, Integer> allocated = new HashMap<>();
+             for (Instruction i : decoded) {
+                 if (i.isPayload() || i.opcode() != 0x22) continue;
+                 String d;
+                 try { d = dex.typeDescriptor(i.index()); } catch (RuntimeException e) { continue; }
+-                if (d != null) allocated.add(DexFile.internalName(d));
++                if (d != null) allocated.merge(DexFile.internalName(d), 1, Integer::sum);
+             }
+             String superName = method.declaringClass().superclassName();
+             boolean ctor = method.isConstructor() && !isStatic;

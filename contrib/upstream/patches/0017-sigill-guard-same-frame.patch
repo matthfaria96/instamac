@@ -1,0 +1,53 @@
+sigill: the re-trap guard counts the same frame, not the same PC
+
+bionic_shim.cpp (macapk_sigill_handler). The handler chains a SIGILL it does
+not emulate to HotSpot, and guards against a chained handler that returns
+without advancing: three traps in a row at one PC on one thread restore SIG_DFL
+and re-raise. But HotSpot's NativeDeoptInstruction (0xd4ade001) sits at a return
+site inside the method being deoptimized, and every activation of that method
+still on the thread's stack returns through it. A recursive method therefore
+traps at one PC once per nested activation -- each serviced, each at its own SP
+-- and the third one was taken for a loop and killed the process.
+
+The guard now requires the same PC and the same SP. A handler that silently
+returns re-traps with every register unchanged, so the real loop is still caught.
+
+Measured on Instagram 455: "chain looping on same PC; restoring default and
+re-raising" with insn 0xd4ade001 killed 2 of 10 launches 7-8s after the first
+frame (while the feed and inbox rows were being inflated), and showed up at
+shutdown in 1-2 logs of every earlier 10-launch run. After: see the table in
+contrib/upstream/README.md.
+
+diff --git a/runtime/translator/src/bionic_shim.cpp b/runtime/translator/src/bionic_shim.cpp
+--- a/runtime/translator/src/bionic_shim.cpp
++++ b/runtime/translator/src/bionic_shim.cpp
+@@ -14100,13 +14187,28 @@ chain:
+         // starts at 1 on a fresh PC; >= kMaxSamePcTraps means we have
+         // already chained (kMaxSamePcTraps-1) times on this exact PC
+         // without it advancing -> treat as a silent-return loop.
++        //
++        // "The same site" is the same PC in the same FRAME (same SP). A deopt
++        // trap sits at a return site inside the method being deoptimized, and
++        // EVERY activation of that method still on this thread's stack returns
++        // through it: a recursive method traps at one PC once per nested
++        // activation, each of them serviced and each at its own SP. Counting
++        // the PC alone called the third of those a loop and killed the process
++        // (Instagram 455: "chain looping on same PC" with insn 0xd4ade001, in
++        // 2 of 10 launches 7-8s after the first frame, while the recursive
++        // layout inflation of the feed and inbox rows was running; before
++        // that, on 1-2 of every 10 shutdowns). A handler that silently returns
++        // re-traps with every register unchanged, SP included.
+         constexpr unsigned kMaxSamePcTraps = 3;
+         static thread_local uintptr_t t_ill_last_pc = 0;
++        static thread_local uintptr_t t_ill_last_sp = 0;
+         static thread_local unsigned  t_ill_same_count = 0;
+-        if (pc_log != 0 && pc_log == t_ill_last_pc) {
++        const uintptr_t sp_log = uc->uc_mcontext ? uc->uc_mcontext->__ss.__sp : 0;
++        if (pc_log != 0 && pc_log == t_ill_last_pc && sp_log == t_ill_last_sp) {
+             ++t_ill_same_count;
+         } else {
+             t_ill_last_pc = pc_log;
++            t_ill_last_sp = sp_log;
+             t_ill_same_count = 1;
+         }
+         const bool looping = (t_ill_same_count >= kMaxSamePcTraps);

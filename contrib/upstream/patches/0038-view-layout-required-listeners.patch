@@ -1,0 +1,88 @@
+View: fire layout-change listeners on LAYOUT_REQUIRED, as AOSP does
+
+AOSP View.measure() sets PFLAG_LAYOUT_REQUIRED when the view is forced to lay
+out OR its measure spec changed and is not exact / does not match the measured
+size, and layout() then runs the layout-change listeners even when the frame
+does not move. We only had the forced half, so a view re-measured by its parent
+with a different spec never fired its listeners.
+
+Measured victim: Instagram's gallery grid. It hands a cell its thumbnail only
+when the cell's parent has no layout pending, else it waits for the cell's next
+onLayoutChange -- which on a device comes from the ConstraintLayout parent
+re-measuring the cell (height UNSPECIFIED, then EXACTLY 97). The most recent
+photos stayed grey placeholders in about 3 of every 4 openings; after this, 19
+of 19 deferred thumbnails land and the grid is complete.
+
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -3514,6 +3515,10 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *      if (!li.mOnLayoutChangeListeners.contains(listener)) {
+      *          li.mOnLayoutChangeListeners.add(listener);
+      *      } */
++    /** AOSP mOldWidthMeasureSpec / mOldHeightMeasureSpec (initially MIN_VALUE)
++     *  and PFLAG_LAYOUT_REQUIRED: see measure() and layout(). */
++    private int mMacapkOldWidthSpec = Integer.MIN_VALUE, mMacapkOldHeightSpec = Integer.MIN_VALUE;
++    private boolean mMacapkLayoutRequired;
+     public void addOnLayoutChangeListener(OnLayoutChangeListener listener) {
+         if (!MACAPK_LAYOUT_CHANGE_LISTENERS) return;
+         if (mOnLayoutChangeListeners == null) {
+@@ -4934,11 +5022,15 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         //                 (ArrayList<OnLayoutChangeListener>)li.mOnLayoutChangeListeners.clone();
+         //         ...  listenersCopy.get(i).onLayoutChange(this, l, t, r, b, oldL, oldT, oldR, oldB);
+         // inside the `changed || LAYOUT_REQUIRED` block, so an unchanged view that did
+-        // not ask for layout does NOT fire (our traversal re-lays-out the tree more
+-        // often than AOSP's, and firing every pass would re-run a listener that
+-        // itself requests layout every frame). The list is null for nearly every
+-        // view, and always null under MACAPK_LAYOUT_CHANGE_LISTENERS=0.
+-        if (mOnLayoutChangeListeners != null && (changed || wasLayoutRequested)) {
++        // not ask for layout and was not re-measured with a new spec does NOT fire
++        // (our traversal re-lays-out the tree more often than AOSP's, and firing
++        // every pass would re-run a listener that itself requests layout every
++        // frame). LAYOUT_REQUIRED is mMacapkLayoutRequired, set by measure() with
++        // AOSP's rule. The list is null for nearly every view, and always null
++        // under MACAPK_LAYOUT_CHANGE_LISTENERS=0.
++        final boolean layoutRequired = mMacapkLayoutRequired;
++        mMacapkLayoutRequired = false;
++        if (mOnLayoutChangeListeners != null && (changed || wasLayoutRequested || layoutRequired)) {
+             macapkDispatchLayoutChange(l, t, r, b, oldL, oldT, oldR, oldB);
+         }
+         // v1.0.108: AOSP-correct -- layout completion clears the
+@@ -5090,6 +5182,37 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         try { resolveRtlPropertiesIfNeeded(); } catch (Throwable ignored) {}
+         int w = MeasureSpec.getSize(wSpec);
+         int h = MeasureSpec.getSize(hSpec);
++        // AOSP View.measure (android14 View.java:27393-27415) decides here whether
++        // the coming layout() must run onLayout and the layout-change listeners
++        // even when the frame does not move (PFLAG_LAYOUT_REQUIRED):
++        //     final boolean specChanged = widthMeasureSpec != mOldWidthMeasureSpec
++        //             || heightMeasureSpec != mOldHeightMeasureSpec;
++        //     final boolean isSpecExactly = <both modes EXACTLY>;
++        //     final boolean matchesSpecSize = getMeasuredWidth() == <spec width size>
++        //             && getMeasuredHeight() == <spec height size>;
++        //     final boolean needsLayout = specChanged
++        //             && (sAlwaysRemeasureExactly || !isSpecExactly || !matchesSpecSize);
++        //     if (forceLayout || needsLayout) { ... mPrivateFlags |= PFLAG_LAYOUT_REQUIRED; }
++        // We only had the forceLayout half (layoutRequested), so a view re-measured
++        // by its parent with a different spec never fired its listeners. Measured
++        // victim: Instagram's gallery grid. It hands a cell its thumbnail only when
++        // the cell's parent has no layout pending, else it waits for the cell's
++        // next onLayoutChange -- which on a device comes from the ConstraintLayout
++        // parent re-measuring the cell (height UNSPECIFIED, then EXACTLY 97). Ours
++        // passed the cell by, so the most recent photos stayed grey placeholders.
++        // (sAlwaysRemeasureExactly is targetSdk <= 23 only.)
++        {
++            final boolean specChanged = wSpec != mMacapkOldWidthSpec || hSpec != mMacapkOldHeightSpec;
++            final boolean isSpecExactly = MeasureSpec.getMode(wSpec) == MeasureSpec.EXACTLY
++                    && MeasureSpec.getMode(hSpec) == MeasureSpec.EXACTLY;
++            final boolean matchesSpecSize = (measuredWidth & MEASURED_SIZE_MASK) == w
++                    && (measuredHeight & MEASURED_SIZE_MASK) == h;
++            if (layoutRequested || (specChanged && (!isSpecExactly || !matchesSpecSize))) {
++                mMacapkLayoutRequired = true;
++            }
++        }
++        mMacapkOldWidthSpec = wSpec;
++        mMacapkOldHeightSpec = hSpec;
+         // v1.0.438: RESILIENT measure -- a child whose onMeasure throws must NOT
+         // abort the parent's whole measure pass (which leaves the ENTIRE content
+         // tree 0x0 -> totally blank). The trigger: androidx AbstractComposeView.

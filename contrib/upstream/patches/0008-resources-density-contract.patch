@@ -1,0 +1,419 @@
+resources: the density contract (value rows, raster files, colour aliases)
+
+Three gaps in how the resource layer treats density and references, all
+measured on Instagram 455 installed as base.apk + split_config.xxhdpi.apk and
+shown on a 160 dpi window.
+
+1. A density qualifier on a VALUE row is ranked, not dropped
+   (ResourceIndex, MACAPK_RES_VALUE_DENSITY, default on). AOSP never eliminates
+   a config by density. `dimen/tab_bar_height_panorama` exists only as
+   `-xxhdpi = 48dp`; the theme binds ?attr/tabBarHeight to it, so the bottom
+   tab bar was laid out 0 px tall and a window narrower than 600 dp had no
+   navigation at all.
+
+2. A raster resource is scaled from its file's bucket to the display's
+   (Resources / BitmapFactory, MACAPK_RES_BITMAP_DENSITY, default on):
+   ResourceIndex.macapkFileDensity reports the selected file row's density,
+   getDrawable decodes with inDensity/inTargetDensity, a compiled 9-patch has
+   its divs and padding scaled with AOSP's scaleNinePatchChunk rounding,
+   openRawResource(id, value) and getValue fill TypedValue.density, and
+   BitmapFactory.decodeResource takes AOSP's decodeResourceStream route. The
+   split ships 3,227 rasters (71 nine-patches), all drawn at 3x: a 92x96 dp
+   "more" button, a 72 dp Reels tab icon among 24 dp siblings. Only a file
+   whose config names a real bucket is scaled, so a run at the display's own
+   bucket is byte-identical.
+
+3. A colour alias whose target is a FILE reaches it (ResourceIndex ingest):
+   `color/igds_prism_secondary_button_background_filled` ->
+   `..._filled_dark` (res/gt.xml, a state list) missed, and the profile's
+   "Edit profile" / "Share profile" buttons painted no background.
+
+Applies to vendor/macapk at 57c9912 with `patch -p1` from vendor/macapk.
+
+diff --git a/runtime/java/android/content/res/Resources.java b/runtime/java/android/content/res/Resources.java
+index 27a8bb4..67ea219 100644
+--- a/runtime/java/android/content/res/Resources.java
++++ b/runtime/java/android/content/res/Resources.java
+@@ -233,9 +233,81 @@ public class Resources {
+     }
+     public InputStream openRawResource(int id, android.util.TypedValue value)
+         throws android.content.res.Resources.NotFoundException {
++        // AOSP fills `value` through getValue first (Resources.openRawResource
++        // -> ResourcesImpl.getValue), and BitmapFactory.decodeResource reads
++        // value.density off it to scale the decode.
++        if (value != null) {
++            int fd = macapkFileDensity(id);
++            value.density = fd >= 0 ? fd : 0;
++        }
+         return openRawResource(id);
+     }
+ 
++    /** MACAPK_RES_BITMAP_DENSITY, default ON: a raster resource is scaled from
++     *  its FILE's density bucket to the display's, as AOSP does for every
++     *  bitmap resource (ResourcesImpl.loadDrawableForCookie ->
++     *  Drawable.createFromResourceStream -> BitmapFactory.decodeResourceStream:
++     *  `opts.inDensity = value.density; opts.inTargetDensity =
++     *  res.getDisplayMetrics().densityDpi`, then the decoder resizes and
++     *  scales a 9-patch's divs and padding with it, BitmapFactory.cpp
++     *  scaleNinePatchChunk).
++     *
++     *  None of that existed here: getDrawable decoded with no density at all,
++     *  so a bitmap was laid out at its raw pixel size. That is only right when
++     *  the display's bucket is the one the file came from. MEASURED on
++     *  Instagram 455, installed with the xxhdpi config split (2,533 png + 694
++     *  webp, 71 of them 9-patches) and shown on a 160 dpi window: every raster
++     *  icon was 3x its size -- the post header's "more" glyph a 92x96 dp view
++     *  instead of 44x48, the Reels tab icon 72 dp among 24 dp siblings, the
++     *  action-bar wordmark 349 dp wide.
++     *
++     *  SCOPE, stated: only a file whose config names a real density bucket is
++     *  scaled. AOSP also treats an UNQUALIFIED file as mdpi and scales it up on
++     *  a denser display; this leaves those (and nodpi / anydpi) alone, the same
++     *  line BitmapFactory.decodeResourceStream already draws ("only carry a
++     *  real bucket density through"), so a run at the display's own bucket is
++     *  byte-identical. `=0` restores the unscaled decode everywhere. */
++    private static final boolean MACAPK_RES_BITMAP_DENSITY =
++        !"0".equals(System.getenv("MACAPK_RES_BITMAP_DENSITY"));
++    private static volatile java.lang.reflect.Method macapkFileDensityMethod;
++    private static volatile boolean macapkFileDensityUnavailable;
++
++    /** AOSP TypedValue.density for the file `id` resolves to (a bucket's dpi,
++     *  0 unqualified, 0xffff nodpi, 0xfffe anydpi), or -1 when unknown. */
++    private int macapkFileDensity(int id) {
++        if (!MACAPK_RES_BITMAP_DENSITY || macapkFileDensityUnavailable
++                || macapkResourceIndex == null) return -1;
++        try {
++            java.lang.reflect.Method m = macapkFileDensityMethod;
++            if (m == null) {
++                m = macapkResourceIndex.getClass().getMethod("macapkFileDensity", int.class);
++                macapkFileDensityMethod = m;
++            }
++            Object d = m.invoke(macapkResourceIndex, id);
++            return d instanceof Integer ? (Integer) d : -1;
++        } catch (NoSuchMethodException e) {
++            macapkFileDensityUnavailable = true;   // an index without the accessor
++            return -1;
++        } catch (Throwable t) {
++            return -1;
++        }
++    }
++
++    /** The decode options that scale `id`'s raster file to the display, or
++     *  null when no scaling applies (see MACAPK_RES_BITMAP_DENSITY's scope). */
++    private android.graphics.BitmapFactory.Options macapkDensityOptions(int id) {
++        int src = macapkFileDensity(id);
++        if (src <= 0 || src >= 0xfffe) return null;
++        android.util.DisplayMetrics dm = getDisplayMetrics();
++        int dst = dm != null ? dm.densityDpi : 0;
++        if (dst <= 0 || dst == src) return null;
++        android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
++        o.inDensity = src;
++        o.inTargetDensity = dst;
++        o.inScaled = true;
++        return o;
++    }
++
+     /** Return an XmlResourceParser positioned at the start of the XML
+      *  resource identified by `id`. AOSP signature; throws
+      *  NotFoundException if the id isn't a known XML resource.
+@@ -599,6 +671,13 @@ public class Resources {
+     public void getValue(int id, android.util.TypedValue outValue, boolean resolveRefs) {
+         if (outValue == null) return;
+         outValue.resourceId = id;
++        // AOSP reports the selected config's density with every value; a
++        // caller that decodes the file itself (decodeResourceStream) scales by
++        // it. Known for file rows only; 0 = TypedValue.DENSITY_DEFAULT.
++        {
++            int fd = macapkFileDensity(id);
++            outValue.density = fd >= 0 ? fd : 0;
++        }
+         // A <color> VALUE resource must report a COLOR_INT type. aapt2 stores
+         // `<color name="x">#ff1b1b1b</color>` in the resource table as a colour
+         // int (TYPE_INT_COLOR_ARGB8 = 0x1c), NOT as a string, and androidx's
+@@ -1373,8 +1452,23 @@ public class Resources {
+                         byte[] bytes;
+                         try { bytes = in.readAllBytes(); }
+                         finally { try { in.close(); } catch (Throwable ignored) {} }
+-                        android.graphics.Bitmap bm = android.graphics.BitmapFactory
+-                            .decodeStream(new java.io.ByteArrayInputStream(bytes));
++                        // Density contract (MACAPK_RES_BITMAP_DENSITY): decode
++                        // scaled from the file's bucket to the display's. A
++                        // SOURCE-form .9.png (guide border, no npTc chunk) is
++                        // the one exception: its border is scanned pixel by
++                        // pixel below, so it must decode unscaled.
++                        android.graphics.BitmapFactory.Options dopts = macapkDensityOptions(id);
++                        if (dopts != null && isPng && macapkPngChunk(bytes, "npTc") == null) {
++                            String srcPath = macapkResourcePath(id);
++                            if (srcPath != null && srcPath.endsWith(".9.png")) dopts = null;
++                        }
++                        final float dscale = dopts == null ? 1f
++                            : (float) dopts.inTargetDensity / (float) dopts.inDensity;
++                        android.graphics.Bitmap bm = dopts == null
++                            ? android.graphics.BitmapFactory
++                                .decodeStream(new java.io.ByteArrayInputStream(bytes))
++                            : android.graphics.BitmapFactory
++                                .decodeStream(new java.io.ByteArrayInputStream(bytes), null, dopts);
+                         if (bm != null) {
+                             // A 9-patch must become a NinePatchDrawable, not a
+                             // plain BitmapDrawable: only the former carries the
+@@ -1383,7 +1477,7 @@ public class Resources {
+                             // guide border and carries an npTc chunk instead; the
+                             // border parse remains for a source-form file.
+                             MacapkDrawableConstantState state =
+-                                isPng ? macapkNinePatchFromChunk(id, bm, bytes) : null;
++                                isPng ? macapkNinePatchFromChunk(id, bm, bytes, dscale) : null;
+                             if (state == null) state = macapkNinePatchState(id, bm);
+                             if (state == null) state = new MacapkDrawableConstantState(bm);
+                             macapkDrawableCache.put(cacheKey,
+@@ -1619,7 +1713,7 @@ public class Resources {
+      *  dropped here as macapk9Chunk documents). The decoded bitmap IS the
+      *  content (no border to crop). Null when the PNG carries no npTc. */
+     private MacapkDrawableConstantState macapkNinePatchFromChunk(
+-            int id, android.graphics.Bitmap bm, byte[] png) {
++            int id, android.graphics.Bitmap bm, byte[] png, float scale) {
+         byte[] np = macapkPngChunk(png, "npTc");
+         if (np == null || np.length < 32) return null;
+         try {
+@@ -1639,6 +1733,17 @@ public class Resources {
+             int[] yDivs = new int[ny];
+             for (int i = 0; i < nx; i++) xDivs[i] = bb.getInt(xOff + i * 4);
+             for (int i = 0; i < ny; i++) yDivs[i] = bb.getInt(yOff + i * 4);
++            // `bm` was decoded scaled by `scale` (the density contract), so
++            // the chunk -- written in the FILE's pixels -- scales with it:
++            // AOSP BitmapFactory.cpp scaleNinePatchChunk, same rounding.
++            if (scale != 1f) {
++                padLeft   = (int) (padLeft   * scale + 0.5f);
++                padTop    = (int) (padTop    * scale + 0.5f);
++                padRight  = (int) (padRight  * scale + 0.5f);
++                padBottom = (int) (padBottom * scale + 0.5f);
++                macapkScaleDivRange(xDivs, scale, bm.getWidth());
++                macapkScaleDivRange(yDivs, scale, bm.getHeight());
++            }
+             android.graphics.Rect padding =
+                 new android.graphics.Rect(padLeft, padTop, padRight, padBottom);
+             return new MacapkDrawableConstantState(bm, bm,
+@@ -1649,6 +1754,26 @@ public class Resources {
+         }
+     }
+ 
++    /** AOSP BitmapFactory.cpp scaleDivRange, verbatim: scale each div, keep
++     *  consecutive divs distinct, and slide the outer ones inward when the
++     *  collision avoidance pushed past the scaled bitmap's edge. */
++    private static void macapkScaleDivRange(int[] divs, float scale, int maxValue) {
++        final int count = divs.length;
++        if (count == 0) return;
++        for (int i = 0; i < count; i++) {
++            divs[i] = (int) (divs[i] * scale + 0.5f);
++            if (i > 0 && divs[i] == divs[i - 1]) divs[i]++;
++        }
++        if (divs[count - 1] > maxValue) {
++            int highestAvailable = maxValue;
++            for (int i = count - 1; i >= 0; i--) {
++                divs[i] = highestAvailable;
++                if (i > 0 && divs[i] <= divs[i - 1]) highestAvailable = divs[i] - 1;
++                else break;
++            }
++        }
++    }
++
+     /** The data of the first PNG chunk named `type`, or null. PNG = 8-byte
+      *  signature then chunks of {u32 length, 4-char type, data, u32 crc}. */
+     private static byte[] macapkPngChunk(byte[] png, String type) {
+diff --git a/runtime/java/android/graphics/BitmapFactory.java b/runtime/java/android/graphics/BitmapFactory.java
+index 7b35961..4fe647f 100644
+--- a/runtime/java/android/graphics/BitmapFactory.java
++++ b/runtime/java/android/graphics/BitmapFactory.java
+@@ -663,8 +663,17 @@ public class BitmapFactory {
+                 "decodeResource(0x" + Integer.toHexString(id) + ") res==NULL -> null");
+             return null;
+         }
+-        try (InputStream in = res.openRawResource(id)) {
+-            Bitmap b = decodeStream(in, null, opts);
++        // AOSP decodeResource: `is = res.openRawResource(id, value); bm =
++        // decodeResourceStream(res, value, is, null, opts)`, so the decode is
++        // scaled from the file's density bucket to the display's. The scaled
++        // route is taken only when the resource layer reports a real bucket
++        // (Resources.MACAPK_RES_BITMAP_DENSITY); otherwise this is the plain
++        // decode it always was.
++        final android.util.TypedValue value = new android.util.TypedValue();
++        try (InputStream in = res.openRawResource(id, value)) {
++            final boolean bucket = value.density > 0 && value.density < 0xfffe;
++            Bitmap b = bucket ? decodeResourceStream(res, value, in, null, opts)
++                              : decodeStream(in, null, opts);
+             if (trace) android.util.Log.i("Mac.apk.DecodeRes",
+                 "decodeResource(0x" + Integer.toHexString(id) + ") stream="
+                 + (in == null ? "NULL" : "ok") + " -> "
+@@ -701,7 +710,7 @@ public class BitmapFactory {
+             // AOSP: density==0 means DENSITY_DEFAULT, density==0xffff (DENSITY_NONE)
+             // means "no scaling". Only carry a real bucket density through.
+             if (opts.inDensity == 0 && value != null
+-                && value.density != 0 && value.density != 0xffff) {
++                && value.density != 0 && value.density < 0xfffe) {   // not nodpi / anydpi
+                 opts.inDensity = value.density;
+             }
+             if (opts.inTargetDensity == 0 && res != null
+diff --git a/runtime/java/com/macapk/loader/ResourceIndex.java b/runtime/java/com/macapk/loader/ResourceIndex.java
+index 201f47a..ab89d8c 100644
+--- a/runtime/java/com/macapk/loader/ResourceIndex.java
++++ b/runtime/java/com/macapk/loader/ResourceIndex.java
+@@ -2369,6 +2369,47 @@ public final class ResourceIndex {
+         return base + goodness;
+     }
+ 
++    /** AOSP `TypedValue.density` for the FILE `id` resolves to: the density
++     *  qualifier of the selected row's config -- a bucket's dpi, 0
++     *  (TypedValue.DENSITY_DEFAULT) for an unqualified config, 0xffff
++     *  (DENSITY_NONE) for nodpi, 0xfffe for anydpi -- or -1 when `id` is not
++     *  served from the installed table's file rows. Follows values-declared
++     *  file aliases the way pathFor does.
++     *
++     *  The resource layer needs it for the density contract AOSP applies to
++     *  every raster resource (BitmapFactory.decodeResourceStream: inDensity =
++     *  value.density, inTargetDensity = the display's). Without it a bitmap
++     *  is used at its raw pixel size, which is only right when the display
++     *  bucket equals the file's. MEASURED on Instagram 455 installed with its
++     *  xxhdpi config split on a 160 dpi window: the post "more" glyph and the
++     *  Reels tab icon (72x72 px files) laid out at 72 dp instead of 24. */
++    public int macapkFileDensity(int id) {
++        Object[] fr = null;
++        for (int hop = 0; hop < 8 && fr == null; ++hop) {
++            fr = fileRowById.get(id);
++            if (fr != null) break;
++            String[] tn = idToTypeName.get(id);
++            if (tn == null || tn[0] == null || tn[1] == null) return -1;
++            String alias = fileAliases.get(tn[0] + "/" + tn[1]);
++            if (alias == null || !alias.startsWith("@") || alias.indexOf('/') <= 0) return -1;
++            String body = alias.substring(1);
++            if (body.indexOf(':') >= 0) return -1;      // another package's file
++            Integer next = nameToId.get(body);
++            if (next == null || next == id) return -1;
++            id = next;
++        }
++        if (fr == null) return -1;
++        String cfg = (String) fr[2];
++        if (cfg != null && !cfg.isEmpty()) {
++            for (String q : cfg.split("-")) {
++                if (q.isEmpty()) continue;
++                int d = macapkDensityOf(q);
++                if (d != -1) return d;
++            }
++        }
++        return 0;
++    }
++
+     /** The density a qualifier stands for: a bucket's dpi, 0xfffe for
+      *  anydpi, 0xffff for nodpi, -1 when the qualifier is not a density. */
+     private static int macapkDensityOf(String q) {
+@@ -2659,6 +2700,11 @@ public final class ResourceIndex {
+         // values-<quals> suffix by ArscReader's contract), drop incompatible
+         // configs, apply ascending so better configs override per key.
+         final Map<String, Integer> cfgScore = new HashMap<>();
++        // VALUE rows rank a density qualifier instead of dropping it
++        // (MACAPK_RES_VALUE_DENSITY). File-backed types keep qualifierScore
++        // here: their density-qualified FILE rows are ranked separately by
++        // macapkIngestFileRows, and only their alias rows are read below.
++        final Map<String, Integer> valueCfgScore = new HashMap<>();
+         java.util.Set<String> allCfgs = new java.util.LinkedHashSet<>();
+         List<Object[]> ordered = new ArrayList<>();   // {score, -memberIndex, row}
+         long totalRows = 0;
+@@ -2666,15 +2712,26 @@ public final class ResourceIndex {
+             for (ArscReader.Row row : tables.get(mi).rows()) {
+                 ++totalRows;
+                 allCfgs.add(row.config);
+-                Integer sc = cfgScore.get(row.config);
++                final boolean rankDensity = MACAPK_RES_VALUE_DENSITY
++                    && !FILE_ALIAS_TYPES.contains(row.type);
++                final Map<String, Integer> cache = rankDensity ? valueCfgScore : cfgScore;
++                Integer sc = cache.get(row.config);
+                 if (sc == null) {
+-                    sc = qualifierScore(row.config.isEmpty() ? "" : row.config.substring(1));
+-                    cfgScore.put(row.config, sc);
++                    sc = rankDensity
++                        ? macapkFileCfgScore(row.config)
++                        : qualifierScore(row.config.isEmpty() ? "" : row.config.substring(1));
++                    cache.put(row.config, sc);
+                 }
+                 if (sc < 0) continue;
+                 ordered.add(new Object[] { sc, -mi, row });
+             }
+         }
++        // The headline below lists the selected configs: a config a value row
++        // was accepted under counts, whichever scorer accepted it.
++        for (Map.Entry<String, Integer> en : valueCfgScore.entrySet()) {
++            Integer other = cfgScore.get(en.getKey());
++            if (other == null || other < 0) cfgScore.put(en.getKey(), en.getValue());
++        }
+         // Stable: rows of one member+config keep their table order.
+         ordered.sort((a, b) -> {
+             int c = Integer.compare((Integer) a[0], (Integer) b[0]);
+@@ -2866,6 +2923,7 @@ public final class ResourceIndex {
+                             // Resources.getColor returns on a device).
+                             colorValues.put(name, row.data);
+                             colorRefs.remove(name);
++                            fileAliases.remove("color/" + name);
+                             ++n[5];
+                             return;
+                         case ArscReader.TYPE_REFERENCE:
+@@ -2880,6 +2938,27 @@ public final class ResourceIndex {
+                             // already handles it.
+                             colorRefs.put(name, value);
+                             colorValues.remove(name);
++                            // The target may be a FILE (res/color/x.xml, a
++                            // state list), not a value: `<color name="a">
++                            // @color/b</color>` where b is a selector. AOSP
++                            // resolves the reference and loads b's file
++                            // (ResourcesImpl.getValue(resolveRefs=true) ->
++                            // loadComplexColorForCookie). The file chase in
++                            // openRawByTypeName / pathForByTypeName reads
++                            // fileAliases, which only the file-backed TYPES
++                            // filled, so a colour alias never reached its
++                            // selector. MEASURED on Instagram 455:
++                            // `color/igds_prism_secondary_button_background_
++                            // filled` -> `..._filled_dark` (res/gt.xml) missed,
++                            // and the profile's "Editar perfil" / "Compartilhar
++                            // perfil" buttons painted no background. A target
++                            // that is a plain value still misses the chase and
++                            // falls back to colorRefs, exactly as before.
++                            if (value != null && value.startsWith("@") && value.indexOf('/') > 0) {
++                                fileAliases.put("color/" + name, value);
++                            } else {
++                                fileAliases.remove("color/" + name);
++                            }
+                             ++n[6];
+                             return;
+                         default:
+@@ -3509,6 +3588,34 @@ public final class ResourceIndex {
+     static final boolean MACAPK_RES_SIZECLASS =
+         !"0".equals(System.getenv("MACAPK_RES_SIZECLASS"));
+ 
++    /** MACAPK_RES_VALUE_DENSITY, default ON: a density qualifier on a VALUE
++     *  row (values-xxhdpi/dimens.xml and friends) is RANKED, not dropped.
++     *
++     *  AOSP never eliminates a config by density: ResTable_config::match has
++     *  no density clause, and isBetterThan only picks the closest bucket
++     *  (ResourceTypes.cpp; "density is never considered a mismatch"). So a
++     *  value that exists ONLY under a density qualifier resolves on every
++     *  device. qualifierScore returned -1 for it ("foreign density"), which
++     *  was harmless for the text path's density-free values dirs but drops
++     *  real rows from an installed apk set: a density config split carries
++     *  the values aapt2 keyed by that density.
++     *
++     *  MEASURED on Instagram 455 (base.apk + split_config.xxhdpi.apk, window
++     *  at 160 dpi): `dimen/tab_bar_height_panorama` exists only as
++     *  `-xxhdpi = 48dp`. Base.Theme.Instagram binds `?attr/tabBarHeight` to
++     *  it and the main layout sizes the bottom tab bar with that attribute,
++     *  so the bar was laid out 0 px tall: on any window narrower than 600 dp
++     *  (where the app uses the bottom bar, not the tablet rail) there was no
++     *  navigation at all. `circular_avatar_stroke_width` (2px) and
++     *  `photo_grid_spacing` (6px) are -xxhdpi-only too and read 0.
++     *
++     *  The ranking is macapkFileCfgScore's, the one file rows already use:
++     *  the other qualifiers score as before and the density adds a goodness
++     *  band below night and above version, with an unqualified row counting
++     *  as mdpi. `=0` restores the old scorer exactly. */
++    static final boolean MACAPK_RES_VALUE_DENSITY =
++        !"0".equals(System.getenv("MACAPK_RES_VALUE_DENSITY"));
++
+     /** The width of one size-class step in qualifierScore's sum. The class
+      *  sits between height and aspect in AOSP's isBetterThan order, which a
+      *  sum can only APPROXIMATE, and 1600 is the compromise between two

@@ -1,0 +1,190 @@
+MediaStore: never wait on a host folder that does not answer a listing
+
+The MediaStore sync walks the Mac folders mapped into the volume (Pictures,
+Movies). opendir() on a privacy-protected media library (~/Movies/TV, the TV
+app's) waits indefinitely, so the sync -- and every query behind it -- never
+returned: Instagram's gallery probes the provider (an is_favorite query) before
+listing, got no answer, and showed an empty gallery.
+- Known protected libraries (~/Movies/TV, ~/Music/Music, ~/Music/iTunes) are
+  skipped by path.
+- Every host folder is listed on a helper thread with a deadline
+  (MACAPK_MEDIA_LIST_TIMEOUT_MS, 1500 ms); a folder that misses it is skipped for
+  the session and logged.
+- ContentResolver logs a query with no provider and a provider's exception (once
+  per authority/type) instead of letting them vanish inside the app;
+  MACAPK_THUMB_TRACE=1 logs generated thumbnails.
+
+diff --git a/runtime/java/android/provider/MediaStoreProvider.java b/runtime/java/android/provider/MediaStoreProvider.java
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -2231,6 +2231,66 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
+         catch (Throwable t) { return false; }
+     }
+ 
++    // ---- host folders that never answer a listing --------------------------------
++    // A Mac folder can make opendir() wait indefinitely: a privacy-protected media
++    // library (~/Movies/TV, the TV app's; ~/Music/Music) waits for a consent nobody
++    // is shown, and a File Provider folder can wait for the network. One of them
++    // under the mapped Movies kept MediaStore's sync from ever returning, so every
++    // query behind it hung: Instagram's gallery probe (is_favorite) never answered
++    // and its gallery stayed empty (measured 2026-11-12: `ls ~/Movies/TV` hangs).
++    // The known libraries are skipped by path; any other folder is listed with a
++    // deadline (MACAPK_MEDIA_LIST_TIMEOUT_MS, 1500) and, if it misses it, skipped
++    // for the session (the listing thread is left to finish on its own).
++    private static final java.util.Set<String> sBlockedDirs =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
++    private static final java.util.concurrent.ExecutorService sLister =
++        java.util.concurrent.Executors.newCachedThreadPool(r -> {
++            Thread t = new Thread(r, "mediastore-list");
++            t.setDaemon(true);
++            return t;
++        });
++    private static final long LIST_TIMEOUT_MS = listTimeoutMs();
++    private static long listTimeoutMs() {
++        try {
++            String e = System.getenv("MACAPK_MEDIA_LIST_TIMEOUT_MS");
++            if (e != null) return Math.max(100L, Long.parseLong(e.trim()));
++        } catch (Throwable ignored) { }
++        return 1500L;
++    }
++    static boolean isProtectedHostLibrary(File dir) {
++        try {
++            String home = System.getProperty("user.home");
++            if (home == null) return false;
++            String p = dir.getCanonicalPath();
++            return p.equals(home + "/Movies/TV") || p.equals(home + "/Music/Music")
++                || p.equals(home + "/Music/iTunes");
++        } catch (Throwable t) {
++            return false;
++        }
++    }
++    static File[] listHostDir(File dir) {
++        final String key = dir.getAbsolutePath();
++        if (sBlockedDirs.contains(key)) return null;
++        if (isProtectedHostLibrary(dir)) {
++            if (sBlockedDirs.add(key)) {
++                com.macapk.loader.NativeLog.i(TAG, "scan: skipping " + key + " (privacy-protected media library)");
++            }
++            return null;
++        }
++        java.util.concurrent.Callable<File[]> list = dir::listFiles;
++        java.util.concurrent.Future<File[]> f = sLister.submit(list);
++        try {
++            return f.get(LIST_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
++        } catch (java.util.concurrent.TimeoutException e) {
++            sBlockedDirs.add(key);
++            com.macapk.loader.NativeLog.w(TAG, "scan: skipping " + key + " -- listing did not answer in "
++                + LIST_TIMEOUT_MS + " ms (privacy-protected or provider-backed folder)");
++            return null;
++        } catch (Exception e) {
++            return null;
++        }
++    }
++
+     /** The volume folders that are TCC-protected Mac folders when mapped. */
+     static boolean isPrivacyProtectedMapping(String volumeName) {
+         return Environment.DIRECTORY_DOCUMENTS.equals(volumeName)
+@@ -2247,7 +2307,7 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
+      *  MEDIA TYPE, never by folder). */
+     static void walkVolume(File root, List<File> out, int a) {
+         if (!hostScanEnabled()) { walk(root, root, out); return; }
+-        File[] children = root.listFiles();
++        File[] children = listHostDir(root);
+         if (children == null) return;
+         for (File f : children) {
+             String name = f.getName();
+@@ -2442,9 +2502,9 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
+     }
+ 
+     private static void walk(File dir, File root, List<File> out) {
+-        File[] children = dir.listFiles();
+-        if (children == null) return;
+         final boolean host = hostScanEnabled();
++        File[] children = host ? listHostDir(dir) : dir.listFiles();
++        if (children == null) return;
+         for (File f : children) {
+             String name = f.getName();
+             if (name.startsWith(".")) continue;
+diff --git a/runtime/java/android/content/ContentResolver.java b/runtime/java/android/content/ContentResolver.java
+--- a/runtime/java/android/content/ContentResolver.java
++++ b/runtime/java/android/content/ContentResolver.java
+@@ -191,6 +191,29 @@ public class ContentResolver {
+     // routing those first would have converted a wrong answer into an
+     // app-visible crash. Those routes landed FIRST, in the same pass; see the
+     // AUDIO SUB-TABLE VIEWS block in MediaStoreProvider.java.
++    /** A content URI no provider answers: AOSP throws or returns null by call;
++     *  either way the app sees nothing, so say which authority (once each). */
++    private static final java.util.Set<String> sNoProviderLogged =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
++    /** A provider's exception, on its way back to the app (which usually
++     *  swallows it): logged once per authority, operation and type. */
++    static void macapkProviderThrew(Uri uri, String op, Throwable e) {
++        String a = uri != null ? uri.getAuthority() : null;
++        if (sNoProviderLogged.add("threw " + op + " " + a + " " + e.getClass().getName())) {
++            StringBuilder sb = new StringBuilder("provider threw on " + uri + " (" + op + "): " + e);
++            StackTraceElement[] st = e.getStackTrace();
++            for (int i = 0; i < Math.min(8, st.length); i++) sb.append("\n    at ").append(st[i]);
++            com.macapk.loader.NativeLog.w("ContentResolver", sb.toString());
++        }
++    }
++
++    static void macapkNoProvider(Uri uri, String op) {
++        String a = uri != null ? uri.getAuthority() : null;
++        if (sNoProviderLogged.add(op + " " + a)) {
++            com.macapk.loader.NativeLog.w("ContentResolver", "no provider for " + uri + " (" + op + ")");
++        }
++    }
++
+     public final Cursor query(Uri uri, String[] projection, String selection,
+                               String[] selectionArgs, String sortOrder) {
+         ContentProvider p = providerFor(uri);
+@@ -213,9 +236,14 @@ public class ContentResolver {
+     public final Cursor query(Uri uri, String[] projection, Bundle queryArgs,
+                               CancellationSignal cancellationSignal) {
+         ContentProvider p = providerFor(uri);
+-        if (p == null) return null;
++        if (p == null) { macapkNoProvider(uri, "query(Bundle)"); return null; }
+         p.macapkEnforceRead(uri);
+-        return p.query(uri, projection, queryArgs, cancellationSignal);
++        try {
++            return p.query(uri, projection, queryArgs, cancellationSignal);
++        } catch (RuntimeException e) {
++            macapkProviderThrew(uri, "query(Bundle)", e);
++            throw e;
++        }
+     }
+     public final java.io.InputStream openInputStream(Uri uri) throws java.io.FileNotFoundException {
+         // AOSP ContentResolver.openInputStream handles the file:, android.resource:
+@@ -416,6 +444,32 @@ public class ContentResolver {
+     // "at least" promise a grid layout is relying on.
+     public android.graphics.Bitmap loadThumbnail(Uri uri, android.util.Size size,
+             CancellationSignal signal) throws java.io.IOException {
++        try {
++            final long t0 = THUMB_TRACE ? System.nanoTime() : 0L;
++            android.graphics.Bitmap b = macapkLoadThumbnail(uri, size, signal);
++            if (THUMB_TRACE && sThumbOkLog > 0) {
++                sThumbOkLog--;
++                com.macapk.loader.NativeLog.i("ContentResolver", "loadThumbnail " + uri + " " + size + " -> "
++                    + (b == null ? "null" : b.getWidth() + "x" + b.getHeight() + " " + b.getConfig()
++                       + " centro=#" + Integer.toHexString(b.getPixel(b.getWidth() / 2, b.getHeight() / 2)))
++                    + " in " + (System.nanoTime() - t0) / 1_000_000 + " ms");
++            }
++            return b;
++        } catch (java.io.IOException | RuntimeException e) {
++            if (sThumbFailLog > 0) {
++                sThumbFailLog--;
++                com.macapk.loader.NativeLog.w("ContentResolver", "loadThumbnail " + uri + " " + size + " failed: " + e);
++            }
++            throw e;
++        }
++    }
++    private static int sThumbFailLog = 8;
++    /** MACAPK_THUMB_TRACE=1: log the first 20 successful thumbnails (size, time). */
++    private static final boolean THUMB_TRACE = System.getenv("MACAPK_THUMB_TRACE") != null;
++    private static int sThumbOkLog = 20;
++
++    private android.graphics.Bitmap macapkLoadThumbnail(Uri uri, android.util.Size size,
++            CancellationSignal signal) throws java.io.IOException {
+         java.util.Objects.requireNonNull(uri, "uri");
+         java.util.Objects.requireNonNull(size, "size");
+         final int targetW = Math.max(1, size.getWidth());

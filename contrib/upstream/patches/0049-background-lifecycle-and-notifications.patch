@@ -1,0 +1,666 @@
+Window out of sight = app in the background; Android notifications in the macOS Notification Center
+
+Lifecycle: a window nobody can see (minimized, Cmd+H, fully covered, displays asleep) puts the top activity through onPause/onStop after a 1 s grace, and back through onRestart/onStart/onResume when it shows again (ActivityHost.macapkWindowVisibility, the hostCover pair). While the guest is in the background the host present idles at MACAPK_HIDDEN_DRIVE_HZ even when MACAPK_PAUSE_WHEN_HIDDEN=0. MACAPK_BACKGROUND_WHEN_HIDDEN=0 turns it off; MACAPK_BACKGROUND_ON_OCCLUSION=0 leaves covered windows out. Measured on Instagram: CPU 21% visible -> 9-14% minimized; Instagram logs "Moving to background", releases its players and recreates them on return (video and sound back).
+
+Notifications: NotificationManager.notify/cancel go to host_notifications.mm, which posts through a bundled helper app (Contents/Helpers/InstamacNotifier.app, tools/notifier in the Instamac repo) by distributed notification; a click brings the window back and fires the contentIntent. Skips ongoing, progress, group-summary and muted-channel notifications and anything while the app is in front. Dock badge = posted and not cancelled. MACAPK_NOTIFY_SELFTEST=1 posts one on going to the background; injector verbs miniaturize/deminiaturize/hide/unhide drive the window without input.
+
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -962,12 +1002,18 @@ static void macapk_kick_render_views(const char* why) {
+ // both main-thread; NSWindow notifications are inherently main-thread-only).
+ static double g_hidden_throttle_last = 0.0;
+ 
++// The guest is in onStop because its window is hidden (ActivityHost ->
++// NativeCocoa.setGuestBackgrounded). Then nothing the user could see is drawn, and
++// coming back re-installs the content (restoreTop), which repaints the window --
++// so the hidden throttle is safe even where MACAPK_PAUSE_WHEN_HIDDEN=0 (the
++// launcher's choice: a window that was merely covered came back black).
++static std::atomic<bool> g_guest_backgrounded{false};
+ static bool MacapkPauseWhenHiddenEnabled() {
+     static bool on = []{
+         const char* e = std::getenv("MACAPK_PAUSE_WHEN_HIDDEN");
+         return !(e && std::strcmp(e, "0") == 0);  // default ON; "0" = escape hatch / A-B lever
+     }();
+-    return on;
++    return on || g_guest_backgrounded.load(std::memory_order_relaxed);
+ }
+ static double MacapkHiddenThrottleHz() {
+     static double hz = []{
+@@ -997,12 +1043,56 @@ static double MacapkHiddenThrottleHz() {
+ //   state... You can use this notification to increase responsiveness and
+ //   save power, by halting any expensive calculations that the user can not
+ //   see."
++// Displays asleep (NSWorkspaceScreensDidSleepNotification): nobody can see the
++// window, like a phone with its screen off.
++static bool g_screens_asleep = false;
++
++/** Window visibility -> the guest lifecycle (ActivityHost.macapkWindowVisibility):
++ *  hidden long enough = onPause/onStop, as a phone backgrounding the app; visible
++ *  again = onRestart/onStart/onResume. Posted to the Android main Looper there. */
++static void macapk_notify_window_visibility(bool visible) {
++    JavaVM* vm = nullptr;
++    jsize n_vms = 0;
++    if (JNI_GetCreatedJavaVMs(&vm, 1, &n_vms) != JNI_OK || n_vms <= 0 || !vm) return;
++    JNIEnv* env = nullptr;
++    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
++    if (r == JNI_EDETACHED)
++        vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
++    if (!env) return;
++    static jclass    s_cls = nullptr;
++    static jmethodID s_mid = nullptr;
++    if (!s_cls) {
++        jclass c = env->FindClass("com/macapk/loader/ActivityHost");
++        if (!c) { env->ExceptionClear(); return; }
++        s_mid = env->GetStaticMethodID(c, "macapkWindowVisibility", "(Z)V");
++        if (!s_mid) { env->ExceptionClear(); env->DeleteLocalRef(c); return; }
++        s_cls = (jclass) env->NewGlobalRef(c);
++        env->DeleteLocalRef(c);
++    }
++    env->CallStaticVoidMethod(s_cls, s_mid, (jboolean)(visible ? JNI_TRUE : JNI_FALSE));
++    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
++}
++
+ static void macapk_update_window_hidden_state(const char* reason) {
+     if (!g_placeholder_window) return;
+     NSWindow* w = g_placeholder_window;
+-    bool visible = w.isVisible
+-                && ((w.occlusionState & NSWindowOcclusionStateVisible) != 0);
++    const bool on_screen = w.isVisible && !NSApp.isHidden && !g_screens_asleep;
++    const bool uncovered = (w.occlusionState & NSWindowOcclusionStateVisible) != 0;
++    bool visible = on_screen && uncovered;
+     bool wasHidden = g_window_hidden.exchange(!visible);
++    // The guest lifecycle follows the same signal, except that a fully covered
++    // window can be left out (MACAPK_BACKGROUND_ON_OCCLUSION=0): then only
++    // minimizing, Cmd+H and sleeping displays send the app to the background.
++    static const bool occlusion_counts = [] {
++        const char* e = std::getenv("MACAPK_BACKGROUND_ON_OCCLUSION");
++        return !(e && std::strcmp(e, "0") == 0);
++    }();
++    static bool s_life_visible = true;
++    const bool life_visible = on_screen && (uncovered || !occlusion_counts);
++    if (life_visible != s_life_visible) {
++        s_life_visible = life_visible;
++        macapk_notify_window_visibility(life_visible);
++    }
+     if (visible && wasHidden) {
+         g_hidden_throttle_last = 0.0;   // next hidden spell starts unthrottled
+         std::fprintf(stderr,
+@@ -3772,6 +3900,14 @@ void CocoaQuitBackstopExit() {
+ //   close     -> -[NSWindow performClose:] == clicking the red button
+ //   quit      -> what the app menu's Cmd-Q item (macapkQuit:) calls
+ //   terminate -> -[NSApplication terminate:] == Dock "Quit" / a 'quit' AE
++void CocoaSetGuestBackgrounded(bool on) {
++    g_guest_backgrounded.store(on, std::memory_order_relaxed);
++    std::fprintf(stderr, "[present] guest %s -> hidden present %s\n",
++                 on ? "in the background" : "in the foreground",
++                 on ? "throttled" : "follows MACAPK_PAUSE_WHEN_HIDDEN");
++    std::fflush(stderr);
++}
++
+ void CocoaDebugQuitGesture(const char* kind) {
+     std::string k = kind ? kind : "";
+     std::fprintf(stderr, "[quit] gesture %s wall=%lld\n", k.c_str(), macapk_wall_ms());
+@@ -3788,6 +3924,15 @@ void CocoaDebugQuitGesture(const char* kind) {
+             macapk_terminate_now(0);
+         } else if (k == "terminate") {
+             [NSApp terminate:nil];
++        } else if (k == "miniaturize") {
++            [g_placeholder_window miniaturize:nil];
++        } else if (k == "deminiaturize") {
++            [g_placeholder_window deminiaturize:nil];
++        } else if (k == "hide") {
++            [NSApp hide:nil];
++        } else if (k == "unhide") {
++            // Back without activating: a harness must not steal the owner's focus.
++            [NSApp unhideWithoutActivation];
+         }
+     });
+ }
+@@ -4362,6 +4528,37 @@ bool CocoaInit() {
+                 macapk_update_window_hidden_state("deminiaturize");
+             }];
+ 
++        [[NSNotificationCenter defaultCenter]
++            addObserverForName:NSApplicationDidHideNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification* /*note*/) {
++                macapk_update_window_hidden_state("app-hide");
++            }];
++        [[NSNotificationCenter defaultCenter]
++            addObserverForName:NSApplicationDidUnhideNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification* /*note*/) {
++                macapk_update_window_hidden_state("app-unhide");
++            }];
++        [[[NSWorkspace sharedWorkspace] notificationCenter]
++            addObserverForName:NSWorkspaceScreensDidSleepNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification* /*note*/) {
++                g_screens_asleep = true;
++                macapk_update_window_hidden_state("screens-sleep");
++            }];
++        [[[NSWorkspace sharedWorkspace] notificationCenter]
++            addObserverForName:NSWorkspaceScreensDidWakeNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification* /*note*/) {
++                g_screens_asleep = false;
++                macapk_update_window_hidden_state("screens-wake");
++            }];
++
+         // Display-sleep recovery -- see macapk_kick_render_views above for the
+         // measured bug and the mechanism. NOTE the notification center: this is
+         // an NSWorkspace notification and is NOT posted to defaultCenter.
+diff --git a/runtime/src/native_methods.cpp b/runtime/src/native_methods.cpp
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -459,6 +459,27 @@ jboolean Cocoa_debugTrackpad(JNIEnv* env, jclass, jint kind, jfloatArray a_j) {
+         ? JNI_TRUE : JNI_FALSE;
+ }
+ 
++static std::string jstr(JNIEnv* env, jstring s) {
++    if (!s) return std::string();
++    const char* c = env->GetStringUTFChars(s, nullptr);
++    std::string out = c ? c : "";
++    if (c) env->ReleaseStringUTFChars(s, c);
++    return out;
++}
++
++void Cocoa_postHostNotification(JNIEnv* env, jclass, jstring key, jstring title, jstring body,
++                                jstring thread) {
++    macapk::HostNotificationPost(jstr(env, key), jstr(env, title), jstr(env, body), jstr(env, thread));
++}
++
++void Cocoa_removeHostNotification(JNIEnv* env, jclass, jstring key) {
++    macapk::HostNotificationRemove(jstr(env, key));
++}
++
++void Cocoa_setGuestBackgrounded(JNIEnv*, jclass, jboolean on) {
++    macapk::CocoaSetGuestBackgrounded(on == JNI_TRUE);
++}
++
+ void Cocoa_debugQuitGesture(JNIEnv* env, jclass, jstring kind_j) {
+     std::string kind;
+     if (kind_j) {
+@@ -855,6 +876,12 @@ const JNINativeMethod kNativeCocoaMethods[] = {
+      reinterpret_cast<void*>(Cocoa_exitProcess)},
+     {const_cast<char*>("debugTrackpad"),          const_cast<char*>("(I[F)Z"),
+      reinterpret_cast<void*>(Cocoa_debugTrackpad)},
++    {const_cast<char*>("postHostNotification"),   const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
++     reinterpret_cast<void*>(Cocoa_postHostNotification)},
++    {const_cast<char*>("removeHostNotification"), const_cast<char*>("(Ljava/lang/String;)V"),
++     reinterpret_cast<void*>(Cocoa_removeHostNotification)},
++    {const_cast<char*>("setGuestBackgrounded"),   const_cast<char*>("(Z)V"),
++     reinterpret_cast<void*>(Cocoa_setGuestBackgrounded)},
+     {const_cast<char*>("debugQuitGesture"),       const_cast<char*>("(Ljava/lang/String;)V"),
+      reinterpret_cast<void*>(Cocoa_debugQuitGesture)},
+     {const_cast<char*>("hostRenderTick"),         const_cast<char*>("()Z"),
+diff --git a/runtime/include/macapk/cocoa_bridge.h b/runtime/include/macapk/cocoa_bridge.h
+--- a/runtime/include/macapk/cocoa_bridge.h
++++ b/runtime/include/macapk/cocoa_bridge.h
+@@ -275,6 +275,13 @@ void CocoaExitProcess(int code, const char* relaunch_intents_file);
+ // on the window, the Cmd-Q action, or NSApplication terminate: (Dock "Quit").
+ // Used by debug/closelat.sh to measure close latency without Accessibility.
+ void CocoaDebugQuitGesture(const char* kind);
++/** The guest went to the background because the window is hidden (or came back). */
++void CocoaSetGuestBackgrounded(bool on);
++/** host_notifications.mm: one Android notification into the macOS Notification Center
++ *  (through the bundled notifier helper), and its removal. Any thread. */
++void HostNotificationPost(const std::string& key, const std::string& title,
++                          const std::string& body, const std::string& thread);
++void HostNotificationRemove(const std::string& key);
+ 
+ // One render tick of the host render thread, now: -[MTKView draw] on the
+ // window-attached view, i.e. drawInMTKView -- the work the display link does
+diff --git a/runtime/java/com/macapk/loader/ActivityHost.java b/runtime/java/com/macapk/loader/ActivityHost.java
+--- a/runtime/java/com/macapk/loader/ActivityHost.java
++++ b/runtime/java/com/macapk/loader/ActivityHost.java
+@@ -970,6 +982,79 @@ public final class ActivityHost {
+         });
+     }
+ 
++    /** MACAPK_BACKGROUND_WHEN_HIDDEN (default on): a window nobody can see
++     *  (minimized, app hidden with Cmd+H, fully covered, displays asleep) puts the
++     *  top activity through onPause/onStop, as a phone does when its app goes to
++     *  the background, and brings it back through onRestart/onStart/onResume when
++     *  the window shows again. What a phone app does in onStop is exactly what a
++     *  Mac app does when it cannot be seen: video, sound and drawing stop, and an
++     *  app that notifies only from the background (Instagram) posts its
++     *  notifications. Visible but behind another app's window = still resumed. */
++    static final boolean BACKGROUND_WHEN_HIDDEN =
++        !"0".equals(System.getenv("MACAPK_BACKGROUND_WHEN_HIDDEN"));
++    /** A hide shorter than this (a Space switch, a window dragged across another)
++     *  never reaches the app. */
++    private static final long HIDDEN_GRACE_MS = 1000L;
++    private static SpecialAccessHandler.Cover sWindowCover;
++    private static final Runnable sGoBackground = new Runnable() {
++        @Override public void run() {
++            if (sWindowCover != null || sTaskInBackground || sTerminating) return;
++            Activity top = stack.peek();
++            if (top == null || top.isFinishing()) return;
++            NativeLog.i(TAG, "window hidden -> " + top.getClass().getName() + " to the background (onPause/onStop)");
++            sWindowCover = hostCover(true);
++            sWindowCover.cover();
++            try { NativeCocoa.setGuestBackgrounded(true); } catch (Throwable ignored) {}
++            if (System.getenv("MACAPK_NOTIFY_SELFTEST") != null) notifySelfTest();
++        }
++    };
++
++    /** MACAPK_NOTIFY_SELFTEST: a real notification through the app's own
++     *  NotificationManager, whose click opens the launcher activity -- the bridge
++     *  to the Notification Center end to end, without waiting for a message. */
++    private static void notifySelfTest() {
++        try {
++            if (app == null || sLauncherIntent == null) return;
++            android.app.NotificationManager nm = (android.app.NotificationManager)
++                app.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
++            android.app.PendingIntent pi = android.app.PendingIntent.getActivity(app, 0,
++                new Intent(sLauncherIntent), android.app.PendingIntent.FLAG_IMMUTABLE);
++            android.app.Notification n = new android.app.Notification.Builder(app, "macapk_selftest")
++                .setContentTitle("Instamac")
++                .setContentText("Teste de notificação: clique para abrir")
++                .setContentIntent(pi)
++                .setAutoCancel(true)
++                .build();
++            nm.notify("macapk-selftest", 1, n);
++        } catch (Throwable t) {
++            NativeLog.w(TAG, "notify self-test: " + t);
++        }
++    }
++
++    /** Native window-visibility observer (AppKit thread). */
++    public static void macapkWindowVisibility(final boolean visible) {
++        if (!BACKGROUND_WHEN_HIDDEN) return;
++        ownerHandler().post(new Runnable() {
++            @Override public void run() {
++                ownerHandler().removeCallbacks(sGoBackground);
++                if (!visible) {
++                    ownerHandler().postDelayed(sGoBackground, HIDDEN_GRACE_MS);
++                } else if (sWindowCover != null) {
++                    NativeLog.i(TAG, "window visible -> back to the foreground (onRestart/onStart/onResume)");
++                    SpecialAccessHandler.Cover c = sWindowCover;
++                    sWindowCover = null;
++                    try { NativeCocoa.setGuestBackgrounded(false); } catch (Throwable ignored) {}
++                    c.uncover();
++                }
++            }
++        });
++    }
++
++    /** True while the window is hidden and the app was sent to the background. */
++    public static boolean macapkInBackground() {
++        return sWindowCover != null || sTaskInBackground;
++    }
++
+     /** Called by the native unhide observer (AppKit thread) when the app is
+      *  brought back. A no-op unless WE sent the task to the back. */
+     public static void macapkTaskToFront() {
+diff --git a/runtime/java/com/macapk/loader/NativeCocoa.java b/runtime/java/com/macapk/loader/NativeCocoa.java
+--- a/runtime/java/com/macapk/loader/NativeCocoa.java
++++ b/runtime/java/com/macapk/loader/NativeCocoa.java
+@@ -226,6 +226,16 @@ public final class NativeCocoa {
+      *  (performClose:), Cmd-Q, or NSApplication terminate: (the Dock's "Quit").
+      *  debug/closelat.sh measures close latency through it. */
+     public static native void debugQuitGesture(String kind);
++    /** ActivityHost sent the app to the background for a hidden window (or brought it back):
++     *  the host present then idles at MACAPK_HIDDEN_DRIVE_HZ while hidden. */
++    public static native void setGuestBackgrounded(boolean on);
++    /** android.app.NotificationManager.notify / cancel -> the macOS Notification Center. */
++    public static native void postHostNotification(String key, String title, String body, String thread);
++    public static native void removeHostNotification(String key);
++    /** host_notifications.mm (AppKit main thread): the user clicked notification `key`. */
++    public static void macapkOnHostNotificationClicked(String key) {
++        android.app.NotificationManager.macapkOnHostNotificationClicked(key);
++    }
+ 
+     /** Run ONE render tick of the host render thread now (-[MTKView draw] ->
+      *  drawInMTKView, the same work the display link does each vsync). Used by
+diff --git a/runtime/java/com/macapk/loader/TouchDispatcher.java b/runtime/java/com/macapk/loader/TouchDispatcher.java
+--- a/runtime/java/com/macapk/loader/TouchDispatcher.java
++++ b/runtime/java/com/macapk/loader/TouchDispatcher.java
+@@ -1430,7 +1431,9 @@ public final class TouchDispatcher {
+         if (v.equals("rotate") && n >= 5) return fractionsInRange(p, 2) ? "rotate" : "reject";
+         if (v.equals("hostscroll") && n >= 5) return fractionsInRange(p, 2) ? "hostscroll" : "reject";
+         if (v.equals("hostwheel") && n >= 4) return fractionsInRange(p, 2) ? "hostwheel" : "reject";
+-        if (v.equals("close") || v.equals("quit") || v.equals("terminate")) return "quit";
++        if (v.equals("close") || v.equals("quit") || v.equals("terminate")
++                || v.equals("miniaturize") || v.equals("deminiaturize")
++                || v.equals("hide") || v.equals("unhide")) return "quit";
+         // Input-recorder events (InputRecorder; docs/input-recorder_2026-10-01.md):
+         // the host entry points themselves, replayed with the recorded arguments.
+         if (v.equals("ptr") && n >= 4) return "ptr";
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -166,6 +166,8 @@ set(MACAPK_RUNTIME_SOURCES
+     # linked, so no app pays for loading it at boot. docs/photos-library-mediastore_2026-09-29.md
+     src/photos_bridge.mm
+     src/document_picker.mm
++    src/launch_screen.mm
++    src/host_notifications.mm
+     src/gms_signin.mm
+     src/user_verification_bridge.mm
+     src/media_decode.mm
+@@ -207,6 +209,12 @@ set_source_files_properties(src/applink_window.mm PROPERTIES
+ # that outlive the JNI call (dispatch_async, then the panel's completion handler).
+ set_source_files_properties(src/document_picker.mm PROPERTIES
+     COMPILE_OPTIONS "-fobjc-arc")
++# host_notifications.mm: queued posts and observer blocks own what they capture.
++set_source_files_properties(src/host_notifications.mm PROPERTIES
++    COMPILE_OPTIONS "-fobjc-arc")
++# launch_screen.mm: the boot screen's timer and fade blocks own what they capture.
++set_source_files_properties(src/launch_screen.mm PROPERTIES
++    COMPILE_OPTIONS "-fobjc-arc")
+ set_source_files_properties(src/proxy_settings.mm
+     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+ # photos_bridge.mm: PhotoKit completion handlers capture state across threads.
+diff --git a/runtime/java/android/app/NotificationManager.java b/runtime/java/android/app/NotificationManager.java
+--- a/runtime/java/android/app/NotificationManager.java
++++ b/runtime/java/android/app/NotificationManager.java
+@@ -30,12 +30,96 @@ public class NotificationManager {
+ 
+     private final List<NotificationChannel> channels = new ArrayList<>();
+ 
+-    public void notify(int id, Notification notification) {}
+-    public void notify(String tag, int id, Notification notification) {}
+-    public void notifyAsPackage(String targetPackage, String tag, int id, Notification notification) {}
+-    public void cancel(int id) {}
+-    public void cancel(String tag, int id) {}
+-    public void cancelAll() {}
++    // ---- macOS notifications --------------------------------------------------
++    // notify() hands the notification to the Mac (NativeCocoa.postHostNotification,
++    // which posts through the Instamac notifier helper into Notification Center);
++    // a click comes back to macapkOnHostNotificationClicked and fires the
++    // contentIntent, as tapping it in an Android shade would. What a Mac shows
++    // nothing for: ongoing / foreground-service notifications, progress bars,
++    // group summaries (the members are shown), channels the app turned off, and
++    // anything without text. MACAPK_HOST_NOTIFICATIONS=0 turns the bridge off.
++    private static final boolean HOST_NOTIFICATIONS =
++        !"0".equals(System.getenv("MACAPK_HOST_NOTIFICATIONS"));
++    private static final java.util.Map<String, Notification> sPosted =
++        new java.util.concurrent.ConcurrentHashMap<>();
++
++    private static String hostKey(String tag, int id) { return (tag == null ? "" : tag) + "#" + id; }
++
++    private static String text(android.os.Bundle ex, String key) {
++        if (ex == null) return null;
++        CharSequence cs = ex.getCharSequence(key);
++        return cs == null ? null : cs.toString();
++    }
++
++    public void notify(int id, Notification notification) { notify(null, id, notification); }
++    public void notify(String tag, int id, Notification n) {
++        if (!HOST_NOTIFICATIONS || n == null) return;
++        final String key = hostKey(tag, id);
++        try {
++            final int skip = Notification.FLAG_ONGOING_EVENT | Notification.FLAG_FOREGROUND_SERVICE
++                           | Notification.FLAG_GROUP_SUMMARY;
++            android.os.Bundle ex = n.extras;
++            boolean progress = ex != null && ex.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0;
++            NotificationChannel ch = n.getChannelId() != null ? getNotificationChannel(n.getChannelId()) : null;
++            boolean muted = ch != null && ch.getImportance() == IMPORTANCE_NONE;
++            String title = text(ex, Notification.EXTRA_TITLE);
++            if (title == null) title = text(ex, "android.conversationTitle");
++            String body = text(ex, Notification.EXTRA_BIG_TEXT);
++            if (body == null) body = text(ex, Notification.EXTRA_TEXT);
++            // MessagingStyle (Direct): the newest message, "sender: text" in a group.
++            android.os.Parcelable[] msgs = ex != null ? ex.getParcelableArray(Notification.EXTRA_MESSAGES) : null;
++            if (msgs != null && msgs.length > 0 && msgs[msgs.length - 1] instanceof android.os.Bundle) {
++                android.os.Bundle m = (android.os.Bundle) msgs[msgs.length - 1];
++                String t = text(m, "text");
++                if (t != null) body = t;
++            }
++            if (body == null && n.tickerText != null) body = n.tickerText.toString();
++            com.macapk.loader.NativeLog.i("Notify", "notify " + key + " channel=" + n.getChannelId()
++                + " flags=0x" + Integer.toHexString(n.flags) + " progress=" + progress
++                + " title=" + (title != null) + " body=" + (body != null));
++            if ((n.flags & skip) != 0 || progress || muted || (title == null && body == null)) return;
++            sPosted.put(key, n);
++            com.macapk.loader.NativeCocoa.postHostNotification(key,
++                title != null ? title : "", body != null ? body : "",
++                n.getGroup() != null ? n.getGroup() : (n.getChannelId() != null ? n.getChannelId() : ""));
++        } catch (Throwable t) {
++            com.macapk.loader.NativeLog.w("Notify", "notify " + key + ": " + t);
++        }
++    }
++    public void notifyAsPackage(String targetPackage, String tag, int id, Notification notification) {
++        notify(tag, id, notification);
++    }
++    public void cancel(int id) { cancel(null, id); }
++    public void cancel(String tag, int id) {
++        final String key = hostKey(tag, id);
++        if (sPosted.remove(key) == null) return;
++        try { com.macapk.loader.NativeCocoa.removeHostNotification(key); } catch (Throwable ignored) {}
++    }
++    public void cancelAll() {
++        for (String key : new java.util.ArrayList<>(sPosted.keySet())) {
++            sPosted.remove(key);
++            try { com.macapk.loader.NativeCocoa.removeHostNotification(key); } catch (Throwable ignored) {}
++        }
++    }
++
++    /** JNI (AppKit main thread): the user clicked the notification `key` on the Mac. */
++    public static void macapkOnHostNotificationClicked(final String key) {
++        final Notification n = key != null ? sPosted.get(key) : null;
++        com.macapk.loader.NativeLog.i("Notify", "clicked " + key + (n == null ? " (unknown)" : ""));
++        if (n == null) return;
++        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
++            @Override public void run() {
++                if ((n.flags & Notification.FLAG_AUTO_CANCEL) != 0) {
++                    sPosted.remove(key);
++                    try { com.macapk.loader.NativeCocoa.removeHostNotification(key); } catch (Throwable ignored) {}
++                }
++                if (n.contentIntent != null) {
++                    try { n.contentIntent.send(); }
++                    catch (Throwable t) { com.macapk.loader.NativeLog.w("Notify", "contentIntent " + key + ": " + t); }
++                }
++            }
++        });
++    }
+ 
+     public void createNotificationChannel(NotificationChannel channel) {
+         if (channel != null) channels.add(channel);
+diff --git a/runtime/src/host_notifications.mm b/runtime/src/host_notifications.mm
+new file mode 100644
+index 0000000..de314c8
+--- /dev/null
++++ b/runtime/src/host_notifications.mm
+@@ -0,0 +1,194 @@
++// host_notifications.mm -- the app's Android notifications in the macOS Notification
++// Center, through the notifier helper bundled at Contents/Helpers/InstamacNotifier.app
++// (the runtime executable is not a registered bundle, which UNUserNotificationCenter
++// requires). Protocol: tools/notifier/main.swift. ARC.
++//
++// NotificationManager.notify -> NativeCocoa.postHostNotification -> HostNotificationPost:
++// skipped while the app is in front with its window on screen (the app shows its own
++// in-app banner then), queued until the helper says it is ready, then posted as a
++// distributed notification. A click comes back as dev.instamac.notifier.clicked: the
++// window is brought to the front and NativeCocoa.macapkOnHostNotificationClicked fires
++// the notification's contentIntent. The Dock badge counts what is posted and not yet
++// cancelled; it clears when the app comes to the front.
++#import <Cocoa/Cocoa.h>
++#include <jni.h>
++#include <cstdio>
++#include <string>
++
++#include "macapk/cocoa_bridge.h"
++
++namespace {
++NSString* const kPost = @"dev.instamac.notifier.post";
++NSString* const kRemove = @"dev.instamac.notifier.remove";
++NSString* const kReady = @"dev.instamac.notifier.ready";
++NSString* const kClicked = @"dev.instamac.notifier.clicked";
++NSString* const kHelperId = @"dev.instamac.notifier";
++
++NSMutableArray<NSDictionary*>* g_queue;
++NSMutableSet<NSString*>* g_badge_keys;
++bool g_ready = false;
++bool g_launching = false;
++
++NSURL* helper_url() {
++    // .../Instamac.app/Contents/Resources/runtime/Resources/macapk-runtime
++    NSString* p = NSBundle.mainBundle.executablePath;
++    for (int i = 0; i < 4; i++) p = p.stringByDeletingLastPathComponent;   // -> Contents
++    return [NSURL fileURLWithPath:[p stringByAppendingPathComponent:@"Helpers/InstamacNotifier.app"]];
++}
++
++void send(NSString* name, NSDictionary* info) {
++    [NSDistributedNotificationCenter.defaultCenter postNotificationName:name object:nil
++                                                               userInfo:info deliverImmediately:YES];
++}
++
++void flush() {
++    for (NSDictionary* d in g_queue) send(d[@"name"], d[@"info"]);
++    [g_queue removeAllObjects];
++}
++
++void update_badge() {
++    NSUInteger n = g_badge_keys.count;
++    NSApp.dockTile.badgeLabel = n ? [NSString stringWithFormat:@"%lu", (unsigned long)n] : nil;
++}
++
++void notify_java_clicked(NSString* key) {
++    JavaVM* vm = nullptr;
++    jsize n = 0;
++    if (JNI_GetCreatedJavaVMs(&vm, 1, &n) != JNI_OK || n <= 0 || !vm) return;
++    JNIEnv* env = nullptr;
++    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
++    if (r == JNI_EDETACHED) vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
++    if (!env) return;
++    static jclass cls = nullptr;
++    static jmethodID mid = nullptr;
++    if (!cls) {
++        jclass c = env->FindClass("com/macapk/loader/NativeCocoa");
++        if (!c) { env->ExceptionClear(); return; }
++        mid = env->GetStaticMethodID(c, "macapkOnHostNotificationClicked", "(Ljava/lang/String;)V");
++        if (!mid) { env->ExceptionClear(); env->DeleteLocalRef(c); return; }
++        cls = (jclass)env->NewGlobalRef(c);
++        env->DeleteLocalRef(c);
++    }
++    jstring k = env->NewStringUTF(key.UTF8String ?: "");
++    env->CallStaticVoidMethod(cls, mid, k);
++    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
++    env->DeleteLocalRef(k);
++}
++
++NSWindow* main_window() {
++    NSWindow* best = nil;
++    for (NSWindow* w in NSApp.windows) {
++        if (!(w.styleMask & NSWindowStyleMaskTitled)) continue;
++        if (!best || w.frame.size.width * w.frame.size.height
++                     > best.frame.size.width * best.frame.size.height) best = w;
++    }
++    return best;
++}
++
++void install_once() {
++    static bool done = false;
++    if (done) return;
++    done = true;
++    g_queue = [NSMutableArray array];
++    g_badge_keys = [NSMutableSet set];
++    NSDistributedNotificationCenter* dnc = NSDistributedNotificationCenter.defaultCenter;
++    [dnc addObserverForName:kReady object:nil queue:NSOperationQueue.mainQueue
++                 usingBlock:^(NSNotification*) {
++        g_ready = true;
++        g_launching = false;
++        flush();
++    }];
++    [dnc addObserverForName:kClicked object:nil queue:NSOperationQueue.mainQueue
++                 usingBlock:^(NSNotification* note) {
++        NSString* key = note.userInfo[@"key"];
++        std::fprintf(stderr, "[notify] clicked %s\n", key.UTF8String ?: "?");
++        [NSApp unhide:nil];
++        if (NSWindow* w = main_window()) {
++            if (w.isMiniaturized) [w deminiaturize:nil];
++            [w makeKeyAndOrderFront:nil];
++        }
++        [NSApp activateIgnoringOtherApps:YES];
++        [g_badge_keys removeObject:key ?: @""];
++        update_badge();
++        notify_java_clicked(key);
++    }];
++    [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification
++                                                    object:nil queue:NSOperationQueue.mainQueue
++                                                usingBlock:^(NSNotification*) {
++        [g_badge_keys removeAllObjects];
++        update_badge();
++    }];
++}
++
++void ensure_helper() {
++    if (g_ready) {
++        // It may have quit on its own since (a minute idle without Instamac).
++        if ([NSRunningApplication runningApplicationsWithBundleIdentifier:kHelperId].count) return;
++        g_ready = false;
++    }
++    if (g_launching) return;
++    NSURL* url = helper_url();
++    if (![NSFileManager.defaultManager fileExistsAtPath:url.path]) {
++        std::fprintf(stderr, "[notify] no helper at %s: notifications dropped\n", url.path.UTF8String);
++        [g_queue removeAllObjects];
++        return;
++    }
++    g_launching = true;
++    NSWorkspaceOpenConfiguration* cfg = [NSWorkspaceOpenConfiguration configuration];
++    cfg.activates = NO;
++    cfg.addsToRecentItems = NO;
++    [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:cfg
++                                    completionHandler:^(NSRunningApplication* app, NSError* err) {
++        if (err) std::fprintf(stderr, "[notify] helper launch failed: %s\n",
++                              err.localizedDescription.UTF8String);
++        // An instance that was already running answers no "ready": post anyway after a
++        // moment; a duplicate post of the same key replaces itself in the Center.
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{
++            if (g_launching) { g_launching = false; g_ready = true; flush(); }
++        });
++    }];
++}
++
++void enqueue(NSString* name, NSDictionary* info) {
++    [g_queue addObject:@{ @"name": name, @"info": info }];
++    if (g_ready && [NSRunningApplication runningApplicationsWithBundleIdentifier:kHelperId].count) {
++        flush();
++    } else {
++        ensure_helper();
++    }
++}
++
++NSString* ns(const std::string& s) { return [NSString stringWithUTF8String:s.c_str()] ?: @""; }
++}  // namespace
++
++namespace macapk {
++
++void HostNotificationPost(const std::string& key, const std::string& title,
++                          const std::string& body, const std::string& thread) {
++    NSString* k = ns(key); NSString* t = ns(title); NSString* b = ns(body); NSString* th = ns(thread);
++    dispatch_async(dispatch_get_main_queue(), ^{
++        install_once();
++        NSWindow* w = main_window();
++        const bool in_front = NSApp.isActive && w && w.isVisible && !w.isMiniaturized
++            && (w.occlusionState & NSWindowOcclusionStateVisible);
++        std::fprintf(stderr, "[notify] post %s%s\n", k.UTF8String, in_front ? " (skipped: app in front)" : "");
++        if (in_front) return;
++        [g_badge_keys addObject:k];
++        update_badge();
++        enqueue(kPost, @{ @"key": k, @"title": t, @"body": b, @"thread": th });
++    });
++}
++
++void HostNotificationRemove(const std::string& key) {
++    NSString* k = ns(key);
++    dispatch_async(dispatch_get_main_queue(), ^{
++        install_once();
++        if (![g_badge_keys containsObject:k] && !g_ready) return;   // never posted this run
++        [g_badge_keys removeObject:k];
++        update_badge();
++        enqueue(kRemove, @{ @"key": k });
++    });
++}
++
++}  // namespace macapk

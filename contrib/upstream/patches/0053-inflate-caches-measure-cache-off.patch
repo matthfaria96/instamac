@@ -1,0 +1,949 @@
+Inflation without repeated I/O; measure cache off by default; lost in-layout requests; SurfaceView keeps frames
+
+Measured with MACAPK_LAYOUT_SAMPLER=1 (new: the draw sampler over the measure+layout pass, with app-frame, wait-site and callee reports) on Instagram's tab switches (first layouts of 100-450 ms):
+- TypedArray.getFont re-read and re-parsed the font file for every TextView with a fontFamily: 29% of those layouts. Resources caches Typefaces by font resource (and weight/italic).
+- File-backed ColorStateLists were re-read out of the APK and re-parsed for every TextView: Resources caches them by (id, theme style stack), cleared on a configuration change.
+- LayoutInflater.tryCtor looked constructors up by reflection (a thrown NoSuchMethodException per miss) on every inflated view; FrameLayout.findLpField did the same per child per layout. Both cached.
+- buildLP / merge / include log lines on every inflated element now need MACAPK_TRACE_INFLATE=1.
+After these the sampled layout time is the app's own RecyclerView/Coordinator/Compose work.
+
+MACAPK_MEASURE_CACHE (0045) is now OFF by default: with it Instagram's music sheet kept a mid-animation 6-170 px content area in 10 of 12 openings; without it 12 of 12 were right. The lost re-measure was not found. Kept: requestLayout during the layout pass is recorded and re-issued up the whole chain afterwards (AOSP requestLayoutDuringLayout), and setMinimumHeight/Width request layout (AOSP).
+
+FRAMESPEED S1: no frame is skipped for empty damage while a SurfaceView is shown (its buffer-fed layer is sized and pulled at present time). MACAPK_DAMAGE_VALIDATE also checks the skip (claims one pixel instead); the off-window skip rule was dropped after the validator caught a visible caption it skipped.
+
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1252,9 +1252,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+     // size their UI hit NoSuchMethodError (Frozen Bubble's button
+     // setup at boot is an example).
+     private int minimumWidth, minimumHeight;
+-    public void setMinimumHeight(int h) { this.minimumHeight = h; }
++    // AOSP: mMinHeight = minHeight; requestLayout(); -- with the measure cache a
++    // silent change was never measured.
++    public void setMinimumHeight(int h) { if (minimumHeight != h) { this.minimumHeight = h; requestLayout(); } }
+     public int  getMinimumHeight()      { return minimumHeight; }
+-    public void setMinimumWidth(int w)  { this.minimumWidth = w; }
++    public void setMinimumWidth(int w)  { if (minimumWidth != w) { this.minimumWidth = w; requestLayout(); } }
+     public int  getMinimumWidth()       { return minimumWidth; }
+ 
+     /** v1.0.124: AOSP `View.getSuggestedMinimumWidth/Height` -- protected
+@@ -3514,6 +3530,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+      *      if (!li.mOnLayoutChangeListeners.contains(listener)) {
+      *          li.mOnLayoutChangeListeners.add(listener);
+      *      } */
++    /** AOSP mOldWidthMeasureSpec / mOldHeightMeasureSpec (initially MIN_VALUE)
++     *  and PFLAG_LAYOUT_REQUIRED: see measure() and layout(). */
++    private int mMacapkOldWidthSpec = Integer.MIN_VALUE, mMacapkOldHeightSpec = Integer.MIN_VALUE;
++    private boolean mMacapkLayoutRequired;
++    private boolean mMacapkMeasuredOnce;
++    // OFF by default (MACAPK_MEASURE_CACHE=1 turns it on): with it, Instagram's
++    // music sheet kept a mid-animation 6-170 px content area in 10 of 12
++    // openings (always right, 12 of 12, without it). The lost re-measure was
++    // not found; correctness over the layout-pass saving.
++    static final boolean MACAPK_MEASURE_CACHE = "1".equals(System.getenv("MACAPK_MEASURE_CACHE"));
+     public void addOnLayoutChangeListener(OnLayoutChangeListener listener) {
+         if (!MACAPK_LAYOUT_CHANGE_LISTENERS) return;
+         if (mOnLayoutChangeListeners == null) {
+@@ -4934,11 +5063,15 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         //                 (ArrayList<OnLayoutChangeListener>)li.mOnLayoutChangeListeners.clone();
+         //         ...  listenersCopy.get(i).onLayoutChange(this, l, t, r, b, oldL, oldT, oldR, oldB);
+         // inside the `changed || LAYOUT_REQUIRED` block, so an unchanged view that did
+-        // not ask for layout does NOT fire (our traversal re-lays-out the tree more
+-        // often than AOSP's, and firing every pass would re-run a listener that
+-        // itself requests layout every frame). The list is null for nearly every
+-        // view, and always null under MACAPK_LAYOUT_CHANGE_LISTENERS=0.
+-        if (mOnLayoutChangeListeners != null && (changed || wasLayoutRequested)) {
++        // not ask for layout and was not re-measured with a new spec does NOT fire
++        // (our traversal re-lays-out the tree more often than AOSP's, and firing
++        // every pass would re-run a listener that itself requests layout every
++        // frame). LAYOUT_REQUIRED is mMacapkLayoutRequired, set by measure() with
++        // AOSP's rule. The list is null for nearly every view, and always null
++        // under MACAPK_LAYOUT_CHANGE_LISTENERS=0.
++        final boolean layoutRequired = mMacapkLayoutRequired;
++        mMacapkLayoutRequired = false;
++        if (mOnLayoutChangeListeners != null && (changed || wasLayoutRequested || layoutRequired)) {
+             macapkDispatchLayoutChange(l, t, r, b, oldL, oldT, oldR, oldB);
+         }
+         // v1.0.108: AOSP-correct -- layout completion clears the
+@@ -5090,6 +5223,43 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         try { resolveRtlPropertiesIfNeeded(); } catch (Throwable ignored) {}
+         int w = MeasureSpec.getSize(wSpec);
+         int h = MeasureSpec.getSize(hSpec);
++        // AOSP View.measure (android14 View.java:27393-27415) decides here whether
++        // the coming layout() must run onLayout and the layout-change listeners
++        // even when the frame does not move (PFLAG_LAYOUT_REQUIRED):
++        //     final boolean specChanged = widthMeasureSpec != mOldWidthMeasureSpec
++        //             || heightMeasureSpec != mOldHeightMeasureSpec;
++        //     final boolean isSpecExactly = <both modes EXACTLY>;
++        //     final boolean matchesSpecSize = getMeasuredWidth() == <spec width size>
++        //             && getMeasuredHeight() == <spec height size>;
++        //     final boolean needsLayout = specChanged
++        //             && (sAlwaysRemeasureExactly || !isSpecExactly || !matchesSpecSize);
++        //     if (forceLayout || needsLayout) { ... mPrivateFlags |= PFLAG_LAYOUT_REQUIRED; }
++        // We only had the forceLayout half (layoutRequested), so a view re-measured
++        // by its parent with a different spec never fired its listeners. Measured
++        // victim: Instagram's gallery grid. It hands a cell its thumbnail only when
++        // the cell's parent has no layout pending, else it waits for the cell's
++        // next onLayoutChange -- which on a device comes from the ConstraintLayout
++        // parent re-measuring the cell (height UNSPECIFIED, then EXACTLY 97). Ours
++        // passed the cell by, so the most recent photos stayed grey placeholders.
++        // (sAlwaysRemeasureExactly is targetSdk <= 23 only.)
++        final boolean needsMeasure;
++        {
++            final boolean specChanged = wSpec != mMacapkOldWidthSpec || hSpec != mMacapkOldHeightSpec;
++            final boolean isSpecExactly = MeasureSpec.getMode(wSpec) == MeasureSpec.EXACTLY
++                    && MeasureSpec.getMode(hSpec) == MeasureSpec.EXACTLY;
++            final boolean matchesSpecSize = (measuredWidth & MEASURED_SIZE_MASK) == w
++                    && (measuredHeight & MEASURED_SIZE_MASK) == h;
++            needsMeasure = layoutRequested || (specChanged && (!isSpecExactly || !matchesSpecSize));
++            if (needsMeasure) mMacapkLayoutRequired = true;
++        }
++        mMacapkOldWidthSpec = wSpec;
++        mMacapkOldHeightSpec = hSpec;
++        // MACAPK_MEASURE_CACHE: AOSP measure() runs onMeasure only under that same
++        // condition (forceLayout || needsLayout) and otherwise keeps the last
++        // measurement. Ours measured every view on every layout pass; in
++        // Instagram's creation flow that was most of each frame (layout 4-6 ms
++        // avg, p90 14-19 ms, against 2-3 ms of drawing).
++        if (MACAPK_MEASURE_CACHE && !needsMeasure && mMacapkMeasuredOnce) return;
+         // v1.0.438: RESILIENT measure -- a child whose onMeasure throws must NOT
+         // abort the parent's whole measure pass (which leaves the ENTIRE content
+         // tree 0x0 -> totally blank). The trigger: androidx AbstractComposeView.
+@@ -5278,6 +5454,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+             com.macapk.loader.ComposeViewFallback.sAcvReqLayout.incrementAndGet(); } catch (Throwable ignored) {}
+         macapkTraceOffset("requestLayout", 0);
+         layoutRequested = true;
++        if (ViewRootImpl.sInLayoutPass && android.os.Looper.getMainLooper().isCurrentThread())
++            ViewRootImpl.noteRequestDuringLayout(this);
+         ViewParent p = parent;
+         if (p instanceof View vp && !vp.layoutRequested) vp.requestLayout();
+         // Tier 3 M6: ask ViewRootImpl for a traversal (measure->layout->draw) on
+@@ -5301,10 +5479,146 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+     public void forceLayout() {
+         layoutRequested = true;
+     }
++    /** After a lost in-layout request: flag every ancestor and ask for a pass. */
++    void macapkForceLayoutUpTheChain() {
++        layoutRequested = true;
++        ViewParent p = parent;
++        while (p instanceof View vp) { vp.layoutRequested = true; p = vp.parent; }
++        if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.scheduleLayout();
++    }
+     // Tier 3 M6: invalidate() schedules a draw traversal on the next frame
+     // (AOSP View.invalidate -> ViewRootImpl.invalidate -> scheduleTraversals).
+     // Gated: flag-off stays a no-op (the driver redraws every frame anyway).
+-    public void invalidate()     { macapkTraceComposeInsert("invalidate"); try { if (com.macapk.loader.ComposeViewFallback.SHEET_PROBE_ON && com.macapk.loader.ComposeViewFallback.macapkIsComposeHost(this)) com.macapk.loader.ComposeViewFallback.sAcvInval.incrementAndGet(); } catch (Throwable ignored) {} if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.schedule(); macapkInvalidateParent(); }
++    /** MACAPK_TRACE_INVAL=1 (diagnostic, default off): every 5s, which views
++     *  were invalidated how often and how big they are -- what a damage-clipped
++     *  frame would have to redraw. */
++    private static final boolean MACAPK_TRACE_INVAL = "1".equals(System.getenv("MACAPK_TRACE_INVAL"));
++    private static final java.util.concurrent.ConcurrentHashMap<String, int[]> sInvalCounts =
++        new java.util.concurrent.ConcurrentHashMap<>();
++    private static volatile boolean sInvalDumper;
++    private void macapkCountInvalidate() {
++        final String key = getClass().getSimpleName() + " " + getWidth() + "x" + getHeight();
++        sInvalCounts.computeIfAbsent(key, k -> new int[1])[0]++;
++        if (sInvalDumper) return;
++        synchronized (sInvalCounts) { if (sInvalDumper) return; sInvalDumper = true; }
++        final Thread t = new Thread(() -> {
++            while (true) {
++                try { Thread.sleep(5000); } catch (InterruptedException e) { return; }
++                final java.util.List<java.util.Map.Entry<String, int[]>> top = new java.util.ArrayList<>(sInvalCounts.entrySet());
++                sInvalCounts.clear();
++                top.sort((a, b) -> b.getValue()[0] - a.getValue()[0]);
++                final StringBuilder sb = new StringBuilder("invalidate/5s:");
++                for (int i = 0; i < top.size() && i < 8; i++)
++                    sb.append("  ").append(top.get(i).getValue()[0]).append("x ").append(top.get(i).getKey());
++                com.macapk.loader.NativeLog.i("Mac.apk.View", sb.toString());
++            }
++        }, "macapk-inval-trace");
++        t.setDaemon(true);
++        t.start();
++    }
++    public void invalidate()     { if (MACAPK_TRACE_INVAL) macapkCountInvalidate(); macapkTraceComposeInsert("invalidate"); try { if (com.macapk.loader.ComposeViewFallback.SHEET_PROBE_ON && com.macapk.loader.ComposeViewFallback.macapkIsComposeHost(this)) com.macapk.loader.ComposeViewFallback.sAcvInval.incrementAndGet(); } catch (Throwable ignored) {}
++        if (ViewRootImpl.DAMAGE_S1) macapkNoteDamage();
++        ViewRootImpl.enterViewDamage();
++        try {
++            if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.schedule();
++            macapkInvalidateParent();
++        } finally {
++            ViewRootImpl.exitViewDamage();
++        }
++    }
++
++    // ---- FRAMESPEED S1 (see ViewRootImpl.DAMAGE_S1) -----------------------------
++    // Where this view was last drawn on the frame canvas, in frame pixels: its
++    // bounds at the canvas's integer translation, grown by a margin for
++    // antialiasing and the elevation shadow, and -- for a ViewGroup -- unioned
++    // with its children's footprints (clipChildren=false, overhang). With the
++    // geometry it had then (left/top + translation), so an invalidate after a
++    // move can add the NEW position too.
++    private boolean mDmgValid;
++    private int mDmgL, mDmgT, mDmgR, mDmgB, mDmgGeoX, mDmgGeoY;
++    private static final int[] sDmgBox = new int[4];     // main thread (draw)
++    private float mDmgSX = 1f, mDmgSY = 1f;
++    private boolean mDmgScaled;
++    private static final java.util.Set<String> sDmgRecordFailClasses = new java.util.HashSet<>();
++    private static final android.graphics.Rect sDmgVisible = new android.graphics.Rect();
++
++    /** Top of View.draw: record the footprint (frame canvas only). */
++    /** Package-private: TextureView.draw replaces View.draw and records too. */
++    void macapkDamageRecord(android.graphics.Canvas canvas) {
++        if (!ViewRootImpl.DAMAGE_S1 || canvas != ViewRootImpl.sFrameCanvas) return;
++        if (!canvas.macapkDeviceBox(right - left, bottom - top, sDmgBox)) {
++            mDmgValid = false;
++            if (ViewRootImpl.DAMAGE_TRACE && sDmgRecordFailClasses.add(getClass().getName()))
++                com.macapk.loader.NativeLog.i("Mac.apk.Damage", "record failed on " + getClass().getName()
++                    + " ctm=" + canvas.getMatrix() + " transY=" + transY + " parent=" + (parent == null ? null : parent.getClass().getName()));
++            return;
++        }
++        final int m = 2 + (int) Math.ceil(3f * Math.max(0f, getZ()));
++        mDmgL = sDmgBox[0] - m;
++        mDmgT = sDmgBox[1] - m;
++        mDmgR = sDmgBox[2] + m;
++        mDmgB = sDmgBox[3] + m;
++        mDmgSX = scaleX; mDmgSY = scaleY;
++        // The box is wider/narrower than the view only under a scale somewhere.
++        mDmgScaled = (sDmgBox[2] - sDmgBox[0]) != (right - left) || (sDmgBox[3] - sDmgBox[1]) != (bottom - top);
++        mDmgGeoX = Math.round(left + transX);
++        mDmgGeoY = Math.round(top + transY);
++        mDmgValid = true;
++    }
++
++    /** End of View.draw: a group's footprint covers what its children drew. */
++    private void macapkDamageUnionChildren(android.graphics.Canvas canvas) {
++        if (!ViewRootImpl.DAMAGE_S1 || !mDmgValid || canvas != ViewRootImpl.sFrameCanvas) return;
++        if (!(this instanceof ViewGroup)) return;
++        final ViewGroup g = (ViewGroup) this;
++        for (int i = 0, n = g.getChildCount(); i < n; i++) {
++            final View c = g.getChildAt(i);
++            if (c == null || !c.mDmgValid) continue;
++            if (c.mDmgL < mDmgL) mDmgL = c.mDmgL;
++            if (c.mDmgT < mDmgT) mDmgT = c.mDmgT;
++            if (c.mDmgR > mDmgR) mDmgR = c.mDmgR;
++            if (c.mDmgB > mDmgB) mDmgB = c.mDmgB;
++        }
++    }
++
++    /** Nothing of this view reaches the screen: zero scale or zero alpha here or
++     *  on an ancestor (a collapsed like-heart overlay keeps invalidating). */
++    private boolean macapkDrawsNothing() {
++        View v = this;
++        while (v != null) {
++            if (v.alpha <= 0f || v.scaleX == 0f || v.scaleY == 0f) return true;
++            v = v.parent instanceof View ? (View) v.parent : null;
++        }
++        return false;
++    }
++
++    /** invalidate(): repaint the old footprint and, moved by this view's own
++     *  geometry change since it was drawn, the new one. Unknown = full frame. */
++    void macapkNoteDamage() {
++        if (!mDmgValid && macapkDrawsNothing()) return;   // scale 0 / alpha 0: nothing to repaint
++        if (!mDmgValid) {
++            // Never drawn on the frame canvas. Not shown = nothing on screen changes
++            // (AOSP's skipInvalidate); shown = we cannot say where: everything.
++            // (Off-window was tried as "nothing visible" via getGlobalVisibleRect;
++            // the validator caught a visible caption it skipped. Not shown is the
++            // only safe test.)
++            if (macapkAttached && isShown())
++                ViewRootImpl.macapkDamageFull(ViewRootImpl.DAMAGE_TRACE ? "never drawn " + getClass().getName() : "never drawn");
++            return;
++        }
++        if (scaleX != mDmgSX || scaleY != mDmgSY || rotation != 0f || rotationX != 0f || rotationY != 0f) {
++            ViewRootImpl.macapkDamageFull(ViewRootImpl.DAMAGE_TRACE ? "transform " + getClass().getName() : "transform");
++            return;
++        }
++        ViewRootImpl.macapkDamageRect(mDmgL, mDmgT, mDmgR, mDmgB, this);
++        final int dx = Math.round(left + transX) - mDmgGeoX;
++        final int dy = Math.round(top + transY) - mDmgGeoY;
++        if (dx != 0 || dy != 0) {
++            // Under a scale a local move is not the same move in pixels.
++            if (mDmgScaled) { ViewRootImpl.macapkDamageFull("moved under scale"); return; }
++            ViewRootImpl.macapkDamageRect(mDmgL + dx, mDmgT + dy, mDmgR + dx, mDmgB + dy, this);
++        }
++    }
+     /** MACAPK_INVALIDATE_PARENT (default ON, =0 the old schedule-only invalidate):
+      *  AOSP View.invalidateInternal (android14 View.java:20733-20780) reports the
+      *  damage to the parent, `p.invalidateChild(this, damage)`, whose
+diff --git a/runtime/java/android/view/ViewRootImpl.java b/runtime/java/android/view/ViewRootImpl.java
+--- a/runtime/java/android/view/ViewRootImpl.java
++++ b/runtime/java/android/view/ViewRootImpl.java
+@@ -87,7 +87,117 @@ public final class ViewRootImpl {
+     public boolean consumeLayoutRequested() { return mLayoutRequested.getAndSet(false); }
+ 
+     /** Convenience for the single-window case: schedule a DRAW (invalidate). */
+-    public static void schedule() { if (INVAL_CENSUS) census(); getInstance().scheduleTraversal(); }
++    public static void schedule() {
++        if (INVAL_CENSUS) census("draw ");
++        // FRAMESPEED S1: a redraw that does not come from a View with a known
++        // footprint (View.invalidate / invalidateDrawable) repaints everything.
++        if (DAMAGE_S1 && !inViewDamage()) macapkDamageFull(DAMAGE_TRACE ? "schedule " + scheduleCaller() : "schedule");
++        getInstance().scheduleTraversal();
++    }
++
++    // ---- requestLayout during layout (AOSP ViewRootImpl.requestLayoutDuringLayout) --
++    // A view that asks for layout from inside the layout pass stops bubbling at
++    // the first ancestor already flagged; that ancestor clears its flag when its
++    // own layout() returns, so the request is lost and, with the measure cache,
++    // the view is never re-measured. AOSP records such requesters and, after
++    // performLayout, re-issues requestLayout on each one still asking (its
++    // ancestors are clear by then, so it reaches the root). Measured victim:
++    // Instagram's music sheet kept a 6 px content area in ~half of its openings.
++    static boolean sInLayoutPass;
++    private static final java.util.ArrayList<View> sLayoutRequesters = new java.util.ArrayList<>();
++    static void noteRequestDuringLayout(View v) {
++        if (!sLayoutRequesters.contains(v)) sLayoutRequesters.add(v);
++    }
++    /** Driver: around the measure+layout pass (main thread). */
++    public static void macapkBeginLayoutPass() { sInLayoutPass = true; }
++    public static void macapkEndLayoutPass() {
++        sInLayoutPass = false;
++        if (sLayoutRequesters.isEmpty()) return;
++        final java.util.ArrayList<View> again = new java.util.ArrayList<>(sLayoutRequesters);
++        sLayoutRequesters.clear();
++        for (View v : again) {
++            if (!v.macapkAttached || !v.isLayoutRequested()) continue;
++            v.macapkForceLayoutUpTheChain();
++        }
++    }
++
++    // ---- FRAMESPEED S1: where the next draw-only frame has to repaint ---------
++    // The driver's S2 half (ViewCanvasDriver.macapkConsumeDamage) clips a
++    // DRAW-ONLY frame to this rect, as AOSP's software path draws through
++    // lockCanvas(dirty). Each View records where it was drawn on the frame canvas
++    // (View.macapkDamageRecord) and, when invalidated, adds that footprint at its
++    // old and its new position (View.macapkNoteDamage). Anything unknown -- a
++    // view never drawn, a scale/rotation, a legacy Animation, a schedule() from
++    // anywhere else -- makes the frame FULL. MACAPK_FRAMESPEED_DAMAGE=0 = off.
++    public static final boolean DAMAGE_S1 =
++        !"0".equals(System.getenv("MACAPK_FRAMESPEED_DAMAGE"));
++    /** The canvas the driver draws the window into this frame (main thread). */
++    public static android.graphics.Canvas sFrameCanvas;
++    private static final Object sDmgLock = new Object();
++    private static int sDmgKind, sDmgL, sDmgT, sDmgR, sDmgB;
++    private static final ThreadLocal<int[]> sViewDamageDepth = ThreadLocal.withInitial(() -> new int[1]);
++    private static String scheduleCaller() {
++        StackTraceElement[] st = new Throwable().getStackTrace();
++        for (int i = 2; i < st.length; i++) {
++            String c = st[i].getClassName();
++            if (!c.equals("android.view.ViewRootImpl")) return c + "." + st[i].getMethodName();
++        }
++        return "?";
++    }
++    static boolean inViewDamage() { return sViewDamageDepth.get()[0] > 0; }
++    static void enterViewDamage() { sViewDamageDepth.get()[0]++; }
++    static void exitViewDamage() { sViewDamageDepth.get()[0]--; }
++    public static void macapkDamageFull() { macapkDamageFull("other"); }
++    /** MACAPK_TRACE_DAMAGE=1: every 5 s, why frames went FULL (reason + caller). */
++    static final boolean DAMAGE_TRACE = "1".equals(System.getenv("MACAPK_TRACE_DAMAGE"));
++    private static final java.util.HashMap<String, int[]> sFullWhy = new java.util.HashMap<>();
++    private static long sFullWhyT0;
++    public static void macapkDamageFull(String why) {
++        synchronized (sDmgLock) {
++            sDmgKind = 2;
++            if (!DAMAGE_TRACE) return;
++            sFullWhy.computeIfAbsent(why, k -> new int[1])[0]++;
++            long now = System.nanoTime();
++            if (sFullWhyT0 == 0) sFullWhyT0 = now;
++            if (now - sFullWhyT0 > 5_000_000_000L) {
++                StringBuilder sb = new StringBuilder("[damage-full] 5s:");
++                sFullWhy.entrySet().stream().sorted((a, b) -> b.getValue()[0] - a.getValue()[0]).limit(10)
++                    .forEach(e -> sb.append("\n  ").append(e.getValue()[0]).append("  ").append(e.getKey()));
++                com.macapk.loader.NativeLog.i("Mac.apk.Damage", sb.toString());
++                sFullWhy.clear(); sFullWhyT0 = now;
++            }
++        }
++    }
++    private static final StringBuilder sDmgWho = new StringBuilder();
++    private static int sDmgWhoFrames;
++    public static void macapkDamageRect(int l, int t, int r, int b) { macapkDamageRect(l, t, r, b, null); }
++    public static void macapkDamageRect(int l, int t, int r, int b, Object who) {
++        if (r <= l || b <= t) return;
++        synchronized (sDmgLock) {
++            if (DAMAGE_TRACE && who != null && sDmgWho.length() < 4000)
++                sDmgWho.append(' ').append(who.getClass().getSimpleName()).append('[')
++                       .append(l).append(',').append(t).append('-').append(r).append(',').append(b).append(']');
++            if (sDmgKind == 2) return;
++            if (sDmgKind == 0) { sDmgL = l; sDmgT = t; sDmgR = r; sDmgB = b; sDmgKind = 1; return; }
++            if (l < sDmgL) sDmgL = l;
++            if (t < sDmgT) sDmgT = t;
++            if (r > sDmgR) sDmgR = r;
++            if (b > sDmgB) sDmgB = b;
++        }
++    }
++    /** S2's pull: 0 = nothing, 1 = out4 holds the union, 2 = full. Resets. */
++    public int macapkConsumeDamage(int[] out4) {
++        synchronized (sDmgLock) {
++            int k = sDmgKind;
++            if (k == 1) { out4[0] = sDmgL; out4[1] = sDmgT; out4[2] = sDmgR; out4[3] = sDmgB; }
++            if (DAMAGE_TRACE && k == 1 && sDmgWhoFrames++ < 400)
++                com.macapk.loader.NativeLog.i("Mac.apk.Damage", "[damage-who] " + sDmgL + "," + sDmgT + "-"
++                    + sDmgR + "," + sDmgB + ":" + sDmgWho);
++            sDmgWho.setLength(0);
++            sDmgKind = 0;
++            return k;
++        }
++    }
+     // MACAPK_TRACE_INVALIDATE=1 (diagnostic): WHO keeps the window dirty. Every
+     // schedule() is attributed to its framework entry (View.invalidate,
+     // Drawable.invalidateSelf ...) and the first APP frame that called it, and every
+diff --git a/runtime/java/android/view/LayoutInflater.java b/runtime/java/android/view/LayoutInflater.java
+--- a/runtime/java/android/view/LayoutInflater.java
++++ b/runtime/java/android/view/LayoutInflater.java
+@@ -1057,8 +1057,8 @@ public class LayoutInflater {
+                     View childView = inflateElement(child, parent);
+                     if (childView != null && childView != parent
+                         && childView.getParent() == null && parent != null) {
+-                        parent.addView(childView);
+-                        NativeLog.i(TAG, "merge: addView " + childView.getClass().getSimpleName()
++                        macapkAddInflated(parent, childView);
++                        if (TRACE_INFLATE) NativeLog.i(TAG, "merge: addView " + childView.getClass().getSimpleName()
+                           + " id=0x" + Integer.toHexString(childView.getId()) + " to " + parent.getClass().getSimpleName()
+                           + "(now " + parent.getChildCount() + " children)");
+                     }
+@@ -1077,7 +1077,7 @@ public class LayoutInflater {
+             // findViewById(R.id.action_bar_activity_content) returns
+             // null → setAttachListener NPE.
+             String layoutRef = elem.getAttribute("layout");
+-            NativeLog.i(TAG, "include: layoutRef='" + layoutRef + "' parent=" + (parent == null ? "null" : parent.getClass().getSimpleName()));
++            if (TRACE_INFLATE) NativeLog.i(TAG, "include: layoutRef='" + layoutRef + "' parent=" + (parent == null ? "null" : parent.getClass().getSimpleName()));
+             if (layoutRef == null || layoutRef.isEmpty()) {
+                 // No layout attribute -- fall through to child walk
+                 // (same as merge).
+@@ -1613,11 +1613,51 @@ public class LayoutInflater {
+         return c;
+     }
+ 
++    private static final boolean GENLP_APP_FINAL =
++        !"0".equals(System.getenv("MACAPK_GENLP_APP_FINAL"));
++    private static final java.util.Map<Class<?>, Boolean> sAppOverridesGenerateLp =
++        new java.util.concurrent.ConcurrentHashMap<>();
++
++    /** AOSP rInflate ends in `viewGroup.addView(view, params)`: the params it
++     *  generated, and a view that has none of its own yet. Ours put them on the
++     *  view first (setLayoutParams in inflateElement) and called addView(view).
++     *  To a plain ViewGroup that is the same call; to a parent that re-parents
++     *  the child it is not. SlidingPaneLayout wraps its detail pane with
++     *  `new TouchBlocker(child)` -> FrameLayout.addView(child), which on a device
++     *  finds a child without params and gives it MATCH_PARENT, and here found the
++     *  pane's own (layout_width 300dp) and pinned the pane's content to 300px
++     *  inside a pane 816px wide (measured: Instagram's tablet inbox, the "Suas
++     *  mensagens" panel drawn at the pane's left edge instead of centred).
++     *  MACAPK_INFLATE_ADDVIEW_PARAMS=0 restores addView(view). */
++    private static final boolean MACAPK_INFLATE_ADDVIEW_PARAMS =
++        !"0".equals(System.getenv("MACAPK_INFLATE_ADDVIEW_PARAMS"));
++    private static void macapkAddInflated(ViewGroup parent, View child) {
++        final ViewGroup.LayoutParams lp = MACAPK_INFLATE_ADDVIEW_PARAMS ? child.getLayoutParams() : null;
++        if (lp == null) { parent.addView(child); return; }
++        child.macapkForgetLayoutParams();
++        parent.addView(child, lp);
++    }
++
++    /** True when `parent`'s generateLayoutParams(AttributeSet) is declared by a
++     *  class the APK loaded (not by this framework). */
++    private static boolean macapkAppOverridesGenerateLp(ViewGroup parent) {
++        return sAppOverridesGenerateLp.computeIfAbsent(parent.getClass(), c -> {
++            try {
++                java.lang.reflect.Method m =
++                    c.getMethod("generateLayoutParams", android.util.AttributeSet.class);
++                return m.getDeclaringClass().getClassLoader()
++                    != LayoutInflater.class.getClassLoader();
++            } catch (Throwable t) {
++                return false;
++            }
++        });
++    }
++
+     private ViewGroup.LayoutParams buildLayoutParams(ViewGroup parent, Element elem) {
+         if (parent == null) return null;
+         // Diagnostic: log the parent class + child tag so we can verify
+         // RelativeLayout children actually pick up RelativeLayout.LayoutParams.
+-        NativeLog.i(TAG, "buildLP: parent=" + parent.getClass().getSimpleName()
++        if (TRACE_INFLATE) NativeLog.i(TAG, "buildLP: parent=" + parent.getClass().getSimpleName()
+                        + " child=<" + elem.getNodeName() + ">");
+         // Pick the LayoutParams class per parent type. Order matters --
+         // more-derived first (RelativeLayout extends ViewGroup, but
+@@ -2934,18 +3000,41 @@ public class LayoutInflater {
+      *  shorter signature); any OTHER failure propagates, because a constructor
+      *  that exists and threw is a real error the caller must report rather than
+      *  silently downgrade to a shorter signature. */
++    /** MACAPK_TRACE_INFLATE=1: the per-element buildLP / merge / include lines
++     *  (hundreds per screen; written on every inflation they were measurable). */
++    static final boolean TRACE_INFLATE = "1".equals(System.getenv("MACAPK_TRACE_INFLATE"));
++
++    /** Constructor lookups per (class, signature): reflection plus a thrown
++     *  NoSuchMethodException per miss, on every inflated view, was a visible
++     *  share of a screen's first layout. NO_CTOR marks a proven miss. */
++    private static final Constructor<?> NO_CTOR;
++    static {
++        Constructor<?> nc = null;
++        try { nc = Object.class.getConstructor(); } catch (Throwable ignored) {}
++        NO_CTOR = nc;
++    }
++    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, java.util.concurrent.ConcurrentHashMap<java.util.List<Class<?>>, Constructor<?>>>
++        sCtorCache = new java.util.concurrent.ConcurrentHashMap<>();
++
+     private View tryCtor(Class<?> cls, Class<?>[] sig, Object[] args) throws Exception {
+-        Constructor<?> c;
+-        try {
+-            c = cls.getConstructor(sig);
+-        } catch (NoSuchMethodException notPublic) {
++        final java.util.concurrent.ConcurrentHashMap<java.util.List<Class<?>>, Constructor<?>> perClass =
++            sCtorCache.computeIfAbsent(cls, k -> new java.util.concurrent.ConcurrentHashMap<>());
++        final java.util.List<Class<?>> key = java.util.Arrays.asList(sig);
++        Constructor<?> c = perClass.get(key);
++        if (c == null) {
+             try {
+-                c = cls.getDeclaredConstructor(sig);
+-            } catch (NoSuchMethodException none) {
+-                return null;
++                c = cls.getConstructor(sig);
++            } catch (NoSuchMethodException notPublic) {
++                try {
++                    c = cls.getDeclaredConstructor(sig);
++                } catch (NoSuchMethodException none) {
++                    c = NO_CTOR;
++                }
+             }
++            if (c != NO_CTOR) c.setAccessible(true);
++            perClass.put(key, c);
+         }
+-        c.setAccessible(true);
++        if (c == NO_CTOR) return null;
+         return (View) c.newInstance(args);
+     }
+ 
+diff --git a/runtime/java/android/widget/FrameLayout.java b/runtime/java/android/widget/FrameLayout.java
+--- a/runtime/java/android/widget/FrameLayout.java
++++ b/runtime/java/android/widget/FrameLayout.java
+@@ -323,17 +323,32 @@ public class FrameLayout extends ViewGroup {
+      *  read `gravity` off whatever LayoutParams subclass the APK
+      *  attached -- FrameLayout.LayoutParams, CoordinatorLayout.LP,
+      *  AppBarLayout.LP, MaterialCardView's wrapper LPs, etc. */
++    /** (LP class, field name) -> Field, or NO_FIELD: this ran for every child
++     *  on every layout, walking the class chain through thrown exceptions. */
++    private static final java.lang.reflect.Field NO_FIELD;
++    static {
++        java.lang.reflect.Field nf = null;
++        try { nf = FrameLayout.class.getDeclaredField("sLpFieldCache"); } catch (Throwable ignored) {}
++        NO_FIELD = nf;
++    }
++    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, java.util.concurrent.ConcurrentHashMap<String, java.lang.reflect.Field>>
++        sLpFieldCache = new java.util.concurrent.ConcurrentHashMap<>();
+     private static java.lang.reflect.Field findLpField(Object owner, String name) {
+         if (owner == null) return null;
++        final java.util.concurrent.ConcurrentHashMap<String, java.lang.reflect.Field> perClass =
++            sLpFieldCache.computeIfAbsent(owner.getClass(), k -> new java.util.concurrent.ConcurrentHashMap<>());
++        java.lang.reflect.Field cached = perClass.get(name);
++        if (cached != null) return cached == NO_FIELD ? null : cached;
++        java.lang.reflect.Field found = null;
+         Class<?> c = owner.getClass();
+-        while (c != null) {
++        while (c != null && found == null) {
+             try {
+-                java.lang.reflect.Field f = c.getDeclaredField(name);
+-                f.setAccessible(true);
+-                return f;
++                found = c.getDeclaredField(name);
++                found.setAccessible(true);
+             } catch (NoSuchFieldException ignored) { c = c.getSuperclass(); }
+         }
+-        return null;
++        perClass.put(name, found != null ? found : NO_FIELD);
++        return found;
+     }
+ 
+     /** AOSP FrameLayout.generateDefaultLayoutParams returns
+diff --git a/runtime/java/android/content/res/Resources.java b/runtime/java/android/content/res/Resources.java
+--- a/runtime/java/android/content/res/Resources.java
++++ b/runtime/java/android/content/res/Resources.java
+@@ -5149,8 +5299,31 @@ public class Resources {
+     private final java.util.Set<Integer> macapkCslFileMiss =
+         java.util.concurrent.ConcurrentHashMap.newKeySet();
+ 
++    /** File-backed selectors, by (id, the theme's applied-style stack): AOSP
++     *  ResourcesImpl caches complex colours the same way (keyed by the theme).
++     *  Every TextView inflation re-read and re-parsed the selector XML out of the
++     *  APK -- a third of a new screen's first layout on Instagram. Cleared on a
++     *  configuration change (night mode re-resolves -night selectors). */
++    private final java.util.concurrent.ConcurrentHashMap<String, android.content.res.ColorStateList> macapkCslCache =
++        new java.util.concurrent.ConcurrentHashMap<>();
++    private static String macapkCslKey(int id, Theme theme) {
++        if (theme == null) return Integer.toHexString(id);
++        synchronized (theme.appliedStyles) {
++            return Integer.toHexString(id) + "@" + String.join("|", theme.appliedStyles);
++        }
++    }
++
+     private android.content.res.ColorStateList macapkLoadCslFile(int id, Theme theme) {
+         if (macapkCslFileMiss.contains(id)) return null;
++        final String key = macapkCslKey(id, theme);
++        android.content.res.ColorStateList cached = macapkCslCache.get(key);
++        if (cached != null) return cached;
++        android.content.res.ColorStateList loaded = macapkLoadCslFileUncached(id, theme);
++        if (loaded != null) macapkCslCache.put(key, loaded);
++        return loaded;
++    }
++
++    private android.content.res.ColorStateList macapkLoadCslFileUncached(int id, Theme theme) {
+         // fwxml: a PLATFORM colour id is a platform file, served by id out of
+         // framework-res.apk (compiled) and inflated against `theme`, as AOSP's
+         // ResourcesImpl.loadComplexColorForCookie does for any cookie
+@@ -7412,6 +7585,15 @@ public class Resources {
+         Configuration.macapkMergeFamilyGate("MACAPK_RES_CONFIG_MERGE");
+ 
+     public void updateConfiguration(Configuration config, DisplayMetrics metrics) {
++        // The display's fields are the display's (DisplayConfig.macapkReassertDisplay).
++        final boolean followed = com.macapk.loader.DisplayConfig.macapkFollowsDisplay(this.config);
++        macapkUpdateConfigurationAsGiven(config, metrics);
++        if (followed && config != null && config != this.config)
++            com.macapk.loader.DisplayConfig.macapkReassertDisplay(this.config, config);
++    }
++
++    private void macapkUpdateConfigurationAsGiven(Configuration config, DisplayMetrics metrics) {
++        macapkCslCache.clear();
+         if (MACAPK_RES_CONFIG_MERGE) {
+             macapkUpdateConfigurationMerge(config, metrics);
+             return;
+@@ -7561,7 +7743,24 @@ public class Resources {
+     /** ResourcesImpl.loadFont's extension branch. Returns null when the id is
+      *  not a resolvable font resource (the caller then raises the AOSP
+      *  NotFoundException). */
++    /** Typefaces by font resource (and weight/italic for family members): AOSP
++     *  keeps them in ResourcesImpl's typeface cache. Every TextView with a
++     *  fontFamily re-read and re-parsed the font file -- 29% of a new screen's
++     *  first layout on Instagram. Typeface is immutable; a miss is not cached. */
++    private static final java.util.concurrent.ConcurrentHashMap<Long, android.graphics.Typeface> sMacapkFontCache =
++        new java.util.concurrent.ConcurrentHashMap<>();
++
+     private android.graphics.Typeface macapkLoadFont(int id) {
++        if (id == 0) return null;
++        final Long key = (long) id;
++        android.graphics.Typeface cached = sMacapkFontCache.get(key);
++        if (cached != null) return cached;
++        android.graphics.Typeface tf = macapkLoadFontUncached(id);
++        if (tf != null) sMacapkFontCache.put(key, tf);
++        return tf;
++    }
++
++    private android.graphics.Typeface macapkLoadFontUncached(int id) {
+         if (id == 0) return null;
+         String path = macapkResourcePath(id);
+         if (path == null) return null;
+@@ -7587,6 +7786,16 @@ public class Resources {
+      *  bytes will not parse. Null only when the resource cannot be opened. */
+     private android.graphics.Typeface macapkTypefaceFromResource(
+             int rid, int weight, boolean italic) {
++        final Long key = ((long) rid << 20) | ((long) (weight & 0x7ffff) << 1) | (italic ? 1L : 0L) | (1L << 62);
++        android.graphics.Typeface cached = sMacapkFontCache.get(key);
++        if (cached != null) return cached;
++        android.graphics.Typeface tf = macapkTypefaceFromResourceUncached(rid, weight, italic);
++        if (tf != null) sMacapkFontCache.put(key, tf);
++        return tf;
++    }
++
++    private android.graphics.Typeface macapkTypefaceFromResourceUncached(
++            int rid, int weight, boolean italic) {
+         try (java.io.InputStream in = openRawResource(rid)) {
+             if (in == null) return null;
+             return android.graphics.Typeface.Builder.macapkFromStream(in)
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -488,6 +510,121 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+     // "laggy" decomposes into pump/prep/layout/draw/bar/present numbers.
+     private static final boolean PHASE_TRACE =
+             "1".equals(System.getenv("MACAPK_FRAME_PHASE_TRACE"));
++
++    /** MACAPK_DRAW_SAMPLER=1 (diagnostic): where rootView.draw spends its time,
++     *  by Java method. A daemon thread looks at the drawing thread's stack every
++     *  millisecond while a draw is in progress and counts (a) the top frame and
++     *  (b) the innermost android.graphics / android.text / android.widget /
++     *  android.view frame -- the framework call the app's draw is waiting on.
++     *  Every 10 s: one line per top-25 entry of each, then the counts reset. */
++    private static final boolean DRAW_SAMPLER = "1".equals(System.getenv("MACAPK_DRAW_SAMPLER"));
++    /** MACAPK_LAYOUT_SAMPLER=1: the same sampler over the measure+layout pass
++     *  (its report also names the innermost APP frame: where a slow first layout
++     *  of a screen goes). */
++    private static final boolean LAYOUT_SAMPLER = "1".equals(System.getenv("MACAPK_LAYOUT_SAMPLER"));
++    static final class DrawSampler {
++        private static volatile Thread drawing;
++        private static volatile boolean inDraw;
++        private static final java.util.HashMap<String, int[]> top = new java.util.HashMap<>();
++        private static final java.util.HashMap<String, int[]> fw = new java.util.HashMap<>();
++        private static final java.util.HashMap<String, int[]> app = new java.util.HashMap<>();
++        private static final java.util.HashMap<String, int[]> waits = new java.util.HashMap<>();
++        private static final java.util.HashMap<String, int[]> under = new java.util.HashMap<>();
++        private static int samples;
++        private static Thread sampler;
++
++        static void enter() {
++            drawing = Thread.currentThread();
++            inDraw = true;
++            if (sampler == null) {
++                sampler = new Thread(DrawSampler::run, "macapk-draw-sampler");
++                sampler.setDaemon(true);
++                sampler.start();
++            }
++        }
++        static void exit() { inDraw = false; }
++
++        private static void run() {
++            long nextReport = System.nanoTime() + 10_000_000_000L;
++            while (true) {
++                try { Thread.sleep(1); } catch (InterruptedException e) { return; }
++                Thread t = drawing;
++                if (inDraw && t != null) {
++                    StackTraceElement[] st = t.getStackTrace();
++                    if (inDraw && st.length > 0) {
++                        samples++;
++                        count(top, st[0].getClassName() + "." + st[0].getMethodName());
++                        // A blocked UI thread: who sleeps / parks / waits.
++                        final String m0 = st[0].getMethodName();
++                        if (m0.startsWith("sleep") || m0.startsWith("park") || m0.equals("wait0") || m0.startsWith("await")) {
++                            for (StackTraceElement e : st) {
++                                String c = e.getClassName();
++                                if (!c.startsWith("java.") && !c.startsWith("jdk.") && !c.startsWith("sun.")) {
++                                    count(waits, c + "." + e.getMethodName() + ":" + e.getLineNumber());
++                                    break;
++                                }
++                            }
++                        }
++                        for (int si = 0; si < st.length; si++) {
++                            final StackTraceElement e = st[si];
++                            String c = e.getClassName();
++                            if (c.startsWith("android.graphics.") || c.startsWith("android.text.")
++                                    || c.startsWith("android.widget.") || c.startsWith("android.view.")) {
++                                count(fw, c + "." + e.getMethodName());
++                                // What that framework method is spending it on: its
++                                // callee chain, two frames deep.
++                                if (si > 0) count(under, e.getMethodName() + " -> " + st[si - 1].getClassName()
++                                    + "." + st[si - 1].getMethodName() + ":" + st[si - 1].getLineNumber()
++                                    + (si > 1 ? " -> " + st[si - 2].getMethodName() : ""));
++                                break;
++                            }
++                        }
++                        for (StackTraceElement e : st) {
++                            String c = e.getClassName();
++                            if (!c.startsWith("android.") && !c.startsWith("java.") && !c.startsWith("javax.")
++                                    && !c.startsWith("com.macapk.") && !c.startsWith("sun.") && !c.startsWith("jdk.")) {
++                                count(app, c + "." + e.getMethodName());
++                                break;
++                            }
++                        }
++                    }
++                }
++                if (System.nanoTime() >= nextReport) {
++                    nextReport = System.nanoTime() + 10_000_000_000L;
++                    report("top", top);
++                    report("framework", fw);
++                    report("app", app);
++                    report("waits", waits);
++                    report("under", under);
++                    NativeLog.i(TAG, "[draw-sampler] draw cache hits=" + android.graphics.Canvas.sDcHits
++                        + " misses=" + android.graphics.Canvas.sDcMisses
++                        + " (new=" + android.graphics.Canvas.sDcMissNew + " gen=" + android.graphics.Canvas.sDcMissGen
++                        + " geo=" + android.graphics.Canvas.sDcMissGeo + ") kept="
++                        + (android.graphics.Canvas.macapkDrawCacheBytes() >> 10) + " KB");
++                    samples = 0;
++                    top.clear();
++                    fw.clear();
++                    app.clear();
++                    waits.clear();
++                    under.clear();
++                }
++            }
++        }
++        private static void count(java.util.HashMap<String, int[]> m, String k) {
++            m.computeIfAbsent(k, x -> new int[1])[0]++;
++        }
++        private static void report(String what, java.util.HashMap<String, int[]> m) {
++            if (samples == 0) return;
++            java.util.List<java.util.Map.Entry<String, int[]>> l = new java.util.ArrayList<>(m.entrySet());
++            l.sort((a, b) -> b.getValue()[0] - a.getValue()[0]);
++            StringBuilder sb = new StringBuilder("[draw-sampler] " + what + " samples=" + samples);
++            for (int i = 0; i < Math.min(25, l.size()); i++) {
++                sb.append("\n[draw-sampler]   ").append(l.get(i).getValue()[0] * 100 / samples)
++                  .append("% ").append(l.get(i).getKey());
++            }
++            NativeLog.i(TAG, sb.toString());
++        }
++    }
+     private long ptSumPre, ptSumPrep, ptSumLayout, ptSumDraw, ptSumBar, ptSumPresent;
+     private long ptMaxTotal; private int ptFrames, ptOver17, ptOver33, ptLayoutFrames;
+     private long ptSumCkpt;
+@@ -962,7 +1099,13 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+                 m6SkipCount = 0;
+                 m6DrawOnlyCount = 0;
+             }
+-            if (!scheduled && !heartbeat && !warmup) {
++            // FRAMESPEED settle: a full repaint a few vsyncs after the last partial
++            // frame, so a footprint S1 got wrong is on screen ~0.1 s at most
++            // (measured: 11 of 581 partial frames under-damaged on a tab switch,
++            // a shrinking element nobody invalidated) instead of until the
++            // heartbeat.
++            final boolean settle = settleAtFrame >= 0 && n >= settleAtFrame;
++            if (!scheduled && !heartbeat && !warmup && !settle) {
+                 m6SkipCount++;
+                 m6IdleStreak++;
+                 return;   // nothing changed -- skip the whole measure/layout/draw/present
+@@ -992,6 +1135,22 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             // FRAMESPEED S2: take S1's damage with the traversal flag (the rect
+             // follows the flag). Inert (DAMAGE_FULL) until S1 exists.
+             if (FRAMESPEED_DAMAGE) dmgKind = macapkConsumeDamage(dmgRect);
++            // S1 says nothing visible changed (every invalidate came from a view
++            // that draws nothing or is off the window): a draw-only frame then
++            // has nothing to paint. Layout, warm-up and heartbeat frames still run.
++            if (settle) damageForceFullNext = true;
++            // The validator checks the skip too: draw the frame, claim one pixel.
++            if (DAMAGE_VALIDATE && dmgKind == DAMAGE_NONE && !doLayout && !heartbeat && !warmup && !settle) {
++                dmgKind = DAMAGE_PARTIAL;
++                dmgRect[0] = 0; dmgRect[1] = 0; dmgRect[2] = 1; dmgRect[3] = 1;
++            }
++            if (FRAMESPEED_DAMAGE && CONSUME_DAMAGE != null && dmgKind == DAMAGE_NONE
++                    && !doLayout && !heartbeat && !warmup && !settle
++                    && !android.view.SurfaceView.macapkAnyShown()) {
++                m6SkipCount++;
++                m6IdleStreak++;
++                return;
++            }
+         }
+         // ⚠ `canvas == null` is part of the test on purpose. `bitmap` and `canvas` are allocated
+         // together and are only meaningful as a PAIR, but this guard used to test `bitmap` alone --
+@@ -1283,6 +1444,8 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+         // gates performMeasure/performLayout on mLayoutRequested. `if (doLayout)
+         // try {...}` keeps the existing try/catch as the guarded statement.
+         if (PHASE_TRACE) pt2 = System.nanoTime();   // prep = M6 gate + bitmap + clear + letterbox + attach
++        if (LAYOUT_SAMPLER && doLayout) DrawSampler.enter();
++        if (doLayout) android.view.ViewRootImpl.macapkBeginLayoutPass();
+         if (doLayout) try {
+             // v1.0.97: run an actual measure pass before layout. AOSP-shape
+             // measure-then-layout cycle is what RecyclerView (and many
+@@ -1598,15 +1761,37 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             String de = ENV_MACAPK_DUMP_TREE_EVERY;
+             if (de != null) { long iv = Long.parseLong(de); dumpEvery = iv > 0 && (n % iv) == 0; }
+         } catch (Throwable ignored) {}
++        if (sDumpNow && ENV_MACAPK_DUMP_TREE_EVERY != null) { sDumpNow = false; dumpEvery = true; }
+         if (n == 1 || n == 60 || n == 300 || dumpEvery) {
+             try { dumpTree(rootView, 0, new StringBuilder()); }
+             catch (Throwable ignored) {}
++            // Dialogs, popups and sheets live in their own windows: dump them too,
++            // each under a WINDOW line, so a sheet stuck off-screen or at alpha 0
++            // (which the text dump skips) is visible with its translation.
++            try {
++                for (WindowOverlayStack.Layer layer : WindowOverlayStack.snapshot()) {
++                    if (layer.view == null) continue;
++                    NativeLog.i(TAG, "WINDOW " + layer.view.getClass().getName()
++                        + " bounds=" + layer.bounds.toShortString());
++                    dumpTree(layer.view, 0, new StringBuilder());
++                }
++            } catch (Throwable ignored) {}
+             // The harness text dump (uiautomator-shaped labels, absolute clipped
+             // bounds, floating windows, WebView page text) debug/drive_app.sh taps
+             // by: docs/harness-text-dump_2026-09-26.md. Returns at once unless
+             // MACAPK_DUMP_TREE_EVERY is set and MACAPK_TEXT_DUMP is not 0.
+             try { ViewTextDump.dumpToLog(rootView, statusBarH); }
+             catch (Throwable ignored) {}
++            try {
++                android.content.Context dumpCtx = rootView.getContext();
++                while (dumpCtx instanceof android.content.ContextWrapper
++                        && !(dumpCtx instanceof android.app.Activity)) {
++                    dumpCtx = ((android.content.ContextWrapper) dumpCtx).getBaseContext();
++                }
++                if (dumpCtx instanceof android.app.Activity) {
++                    FragmentLifecycle.dumpTree((android.app.Activity) dumpCtx);
++                }
++            } catch (Throwable ignored) {}
+             if ("1".equals(ENV_MACAPK_TRACE_BARRIER)) {
+                 try { dumpBarriers(rootView); } catch (Throwable ignored) {}
+             }
+@@ -1702,6 +1887,8 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+                 centerNavItemContent(rootView);
+         }
+         catch (Throwable ignored) {}
++        if (LAYOUT_SAMPLER && doLayout) DrawSampler.exit();
++        if (doLayout) android.view.ViewRootImpl.macapkEndLayoutPass();
+         if (PHASE_TRACE) pt3 = System.nanoTime();   // layout = measure + layout + RV pump (0-cost on draw-only)
+         // v1.0.144: real fix lives in ComposeViewFallback.paint --
+         // the threat-banner offset was a coordinate-frame bug in the
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -2894,6 +2981,20 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+     private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Field[]>
+         sGlThreadFieldCache = new java.util.concurrent.ConcurrentHashMap<>();
+ 
++    /** FRAMESPEED S1: is any SurfaceView on screen? Its buffer-fed layer is sized
++     *  and pulled at present time, so a frame the damage rule would skip is the
++     *  frame it was waiting for (measured: the photo editor's GL preview stayed
++     *  black). The driver does not skip frames while one is shown. */
++    public static boolean macapkAnyShown() {
++        synchronized (sLiveForEgl) {
++            for (int i = sLiveForEgl.size() - 1; i >= 0; i--) {
++                SurfaceView v = sLiveForEgl.get(i).get();
++                if (v != null && v.macapkAttached && v.isShown()) return true;
++            }
++        }
++        return false;
++    }
++
+     private static void macapkRegisterLiveForEgl(SurfaceView v) {
+         synchronized (sLiveForEgl) {
+             // Prune cleared entries as we go so the list tracks live views.
+@@ -4067,10 +4173,54 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+             mSurfaceControl = new SurfaceControl.Builder()
+                     .setName("SurfaceView[" + getClass().getSimpleName() + "]")
+                     .build();
++            mSurfaceControl.macapkSetOwnerView(this);
+         }
+         return mSurfaceControl;
+     }
+ 
++    /** A child layer was parented under this view's SurfaceControl: the view
++     *  will be fed buffers (Transaction.setBuffer), not drawn by a renderer.
++     *  Its holder then answers by the Canvas rule -- the view's own size --
++     *  as it does from a first lockCanvas on (macapkHolderSurfaceSize). */
++    void macapkNoteBufferFed() {
++        if (holder.macapkLockedCanvas) return;
++        holder.macapkLockedCanvas = true;
++        NativeLog.i(TAG, "SurfaceControl child on " + getClass().getName() + "@"
++            + Integer.toHexString(System.identityHashCode(this))
++            + ": the surface is buffer-fed; it takes the view's size and place");
++    }
++
++    /** One buffer set on this view's layer, or on a child of it. */
++    void macapkPresentBuffer(int[] argb, int w, int h) {
++        holder.macapkLockedCanvas = true;
++        // A buffer the size of the DISPLAY on a smaller view: the app sized it from
++        // the first surfaceChanged, which (before the view was known to be
++        // buffer-fed) reported the display, and laid its content out for that
++        // surface. Show the part of it under the view, where a display-sized
++        // surface puts it, instead of squeezing the whole buffer into the view
++        // (Instagram's photo editor, first open: the photo squashed over the
++        // gallery around it; the second open was right).
++        int[] d = macapkNotedDisplaySize();
++        int vw = getWidth(), vh = getHeight();
++        if (d != null && w == d[0] && h == d[1] && vw > 0 && vh > 0 && (vw != w || vh != h)) {
++            int[] o = new int[2];
++            macapkWindowOrigin(o);
++            int x0 = Math.max(0, o[0]), y0 = Math.max(0, o[1]);
++            int cw = Math.min(vw, w - x0), ch = Math.min(vh, h - y0);
++            if (cw > 0 && ch > 0) {
++                int[] crop = macapkCropBuf;
++                if (crop == null || crop.length != cw * ch) crop = macapkCropBuf = new int[cw * ch];
++                for (int row = 0; row < ch; row++) {
++                    System.arraycopy(argb, (y0 + row) * w + x0, crop, row * cw, cw);
++                }
++                holder.macapkPost(crop, cw, ch);
++                return;
++            }
++        }
++        holder.macapkPost(argb, w, h);
++    }
++    private int[] macapkCropBuf;
++
+     /** AOSP SurfaceView.applyTransactionToFrame(SurfaceControl.Transaction):
+      *  apply the transaction atomically WITH the next buffer this view posts.
+      *  With no compositor to synchronise against, applying it now is the same

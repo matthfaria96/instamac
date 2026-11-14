@@ -1,0 +1,21 @@
+# build artefacts
+build/
+*.class
+*.jar
+!scripts/*.jar
+
+# payloads e binários baixados (não versionar)
+*.xapk
+*.apk
+*.apkm
+*.dmg
+*.app/
+
+# macOS
+.DS_Store
+
+# logs
+*.log
+!docs/*.log
+payload/
+runtime/

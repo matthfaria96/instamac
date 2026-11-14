@@ -1,0 +1,57 @@
+--- /tmp/cocoa_bridge.mm.orig	2026-11-11 00:10:50
++++ vendor/macapk/runtime/src/cocoa_bridge.mm	2026-11-11 00:10:50
+@@ -373,6 +373,33 @@
+ // it is safe from the JVM thread CocoaSetPhoneSizeMax runs on.
+ // Bisect gate, shared with com.macapk.loader.DisplayConfig:
+ // MACAPK_RESIZE_CONFIG=0 turns the whole v1.0.1637 display model off.
++// ---- Instamac: ONE screen for the whole launch ------------------------------
++//
++// MEASURED on a two-display Mac (2560x1440 + 1080x1920): the launch budget was
++// computed from [[NSScreen mainScreen] visibleFrame] (2560x1284pt) while the
++// window itself opened on the OTHER display (origin x = -1080, 1080x1890). The
++// app then ran with a Configuration describing one display and a surface of the
++// other -- the incoherence that feeds the libstartup/CacheKeyGenerator storm and
++// the corrupted state our supervisor has to recover from.
++//
++// [NSScreen mainScreen] is not a stable "the user's display": AppKit answers it
++// for the KEY window, so it flips as windows move. Pin it ONCE at launch -- the
++// screen under the mouse, else mainScreen, else the first -- and use that same
++// screen for the budget AND for the window frame.
++static NSScreen* g_launch_screen = nil;
++static NSScreen* macapk_launch_screen() {
++    if (g_launch_screen) return g_launch_screen;
++    @autoreleasepool {
++        NSPoint m = [NSEvent mouseLocation];
++        for (NSScreen* s in [NSScreen screens]) {
++            if (NSMouseInRect(m, [s frame], NO)) { g_launch_screen = s; break; }
++        }
++        if (!g_launch_screen) g_launch_screen = [NSScreen mainScreen];
++        if (!g_launch_screen) g_launch_screen = [[NSScreen screens] firstObject];
++    }
++    return g_launch_screen;
++}
++
+ static bool display_model_on() {
+     static const bool on = [] {
+         const char* e = std::getenv("MACAPK_RESIZE_CONFIG");
+@@ -4099,7 +4126,10 @@
+         // doesn't clip the title bar / Dock area. Visible frame
+         // excludes the menu bar / Dock so the resulting window fits
+         // entirely on-screen.
+-        NSRect screenVis = [[NSScreen mainScreen] visibleFrame];
++        NSRect screenVis = [macapk_launch_screen() visibleFrame];
++        if (screenVis.size.width < 64 || screenVis.size.height < 64) {
++            screenVis = [[NSScreen mainScreen] visibleFrame];
++        }
+         // v1.0.503: ASPECT-PRESERVING clamp (was per-dimension, which could
+         // square an over-tall request). Shrink the app's w:h to fit the visible
+         // frame, never enlarge (scale capped at 1.0). For the --orientation auto
+@@ -5008,7 +5038,7 @@
+ CocoaContentBudget CocoaQueryContentBudget() {
+     CocoaContentBudget b;
+     @autoreleasepool {
+-        NSScreen* screen = [NSScreen mainScreen];
++        NSScreen* screen = macapk_launch_screen();
+         if (!screen) return b;
+         const NSRect vis = [screen visibleFrame];
+         if (vis.size.width < 64 || vis.size.height < 64) return b;

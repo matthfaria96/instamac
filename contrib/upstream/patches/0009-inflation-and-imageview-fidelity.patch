@@ -1,0 +1,332 @@
+inflation and ImageView: honour what the app's own classes decide
+
+Four places where an AOSP guarantee an app class relies on was missing
+(measured on Instagram 455), plus two default-off diagnostics.
+
+1. TypedArray.getNonResourceString returned null for everything; AOSP returns
+   an immediate XML string. CornerPunchedImageView requires one and threw
+   "Required value was null."; LayoutInflater substituted a FrameLayout and
+   ReelAvatarWithBadgeView then died on a ClassCastException.
+
+2. TypedArray.getResourceId / getString read 0 / the literal text for the
+   numeric reference spelling `@0x7f131764` that BinaryXmlParser emits when the
+   target id has no name in the table (Instagram's strings live in its own
+   language pack). FittingTextView threw "textId has invalid value".
+
+3. LayoutInflater.buildLayoutParams walked the element's layout_* attributes
+   onto whatever parent.generateLayoutParams(attrs) returned, overwriting an
+   APP override that deliberately ignores them (MACAPK_GENLP_APP_FINAL, default
+   on). Material's TabLayout returns generateDefaultLayoutParams(); the profile
+   tab views are declared layout_width="0px" + weight, so each measured 0 px
+   wide and the grid / reels / tagged icons never drew. ViewGroup.LayoutParams
+   gains a package-private flag set by the (int, int) constructor to tell a
+   size chosen in code from one read from attributes.
+
+4. ImageView shrank the drawable's BOUNDS for a scaling scaleType; AOSP keeps
+   the native size and scales through a matrix. Applied to drawables the APK
+   defines (MACAPK_IMAGEVIEW_APP_MATRIX, default on): Instagram's vector class
+   positions its glyph by gravity inside the bounds, so a 24 dp glyph in a
+   12 dp view showed one corner.
+
+Diagnostics: MACAPK_TRACE_RRECT=1 (each distinct Canvas.drawRoundRect, for a
+view that paints its own chrome in onDraw) and MACAPK_TRACE_SETLP=<class>
+(every setLayoutParams on that view class, with the caller).
+
+Applies to vendor/macapk at 57c9912 with `patch -p1` from vendor/macapk.
+
+diff --git a/runtime/java/android/content/res/TypedArray.java b/runtime/java/android/content/res/TypedArray.java
+index 71c3255..9b26153 100644
+--- a/runtime/java/android/content/res/TypedArray.java
++++ b/runtime/java/android/content/res/TypedArray.java
+@@ -1844,6 +1844,18 @@ public class TypedArray implements AutoCloseable {
+             if ("parent".equals(v)) return 0;
+             try { return Integer.parseInt(v); } catch (NumberFormatException ignored) { return def; }
+         }
++        // `@0x7f131764`: the NUMERIC spelling BinaryXmlParser emits for a
++        // reference whose target id has no type/name in the table. On a device
++        // the slot simply holds that id (TYPE_REFERENCE data) whether or not
++        // an entry exists, and the caller decides what to do with it.
++        // MEASURED on Instagram 455: its strings live in the app's own
++        // language pack, not in resources.arsc, so `app:fittingText=
++        // "@0x7f131764"` read 0 here and FittingTextView's constructor threw
++        // "textId has invalid value".
++        {
++            int numeric = macapkNumericRef(v);
++            if (numeric != 0) return numeric;
++        }
+         // Strip leading '@' and optional '+id/' prefix; identifier of
+         // form `<type>/<name>` looks up in ResourceIndex.
+         String body = v.substring(1);
+@@ -1877,11 +1889,33 @@ public class TypedArray implements AutoCloseable {
+         return def;
+     }
+     public int getSourceResourceId(int index, int def)    { return getResourceId(index, def); }
++
++    /** The id of a numeric reference `@0x........`, else 0. */
++    private static int macapkNumericRef(String v) {
++        if (v == null || v.length() < 4 || v.charAt(0) != '@' || v.charAt(1) != '0'
++                || (v.charAt(2) != 'x' && v.charAt(2) != 'X')) return 0;
++        try { return (int) Long.parseLong(v.substring(3), 16); }
++        catch (NumberFormatException e) { return 0; }
++    }
++
+     public String getString(int index)                    {
+         String v = macapkBoundValueAt(index);
+         if (v == null) return macapkThemeString(index);
+         // A2: TYPE_NULL -> null (AOSP :268-269), not the literal "@null".
+         if (macapkNullDataOf(index, v) >= 0) return null;
++        // A numeric reference (see getResourceId) is a reference all the
++        // same: resolve it through Resources -- which is the APP's subclass
++        // when it serves its own strings -- instead of handing back the
++        // literal "@0x7f131764" as if it were the text.
++        {
++            int numeric = macapkNumericRef(v);
++            if (numeric != 0) {
++                if (resources != null) {
++                    try { return resources.getString(numeric); } catch (Throwable ignored) {}
++                }
++                return null;
++            }
++        }
+         // Resolve @string/foo references.
+         if (v.startsWith("@string/") || v.startsWith("@android:string/")) {
+             int id = getResourceId(index, 0);
+@@ -2083,7 +2117,26 @@ public class TypedArray implements AutoCloseable {
+     /** MACAPK_TYPEDARRAY_TEXTARRAY_AOSP (labelled bisect gate, default ON). */
+     private static final boolean TEXTARRAY_AOSP =
+             !"0".equals(System.getenv("MACAPK_TYPEDARRAY_TEXTARRAY_AOSP"));
+-    public String getNonResourceString(int index)         { return null; }
++    /** AOSP TypedArray.getNonResourceString (android14-release :363-377): the
++     *  string "only if that string comes from an immediate value in an XML
++     *  file" -- `type == TYPE_STRING && cookie < 0` -- and null for a
++     *  reference, a theme attribute or an unset slot. This returned null for
++     *  everything, so a view that requires a literal attribute could not be
++     *  constructed at all. MEASURED on Instagram 455: CornerPunchedImageView
++     *  reads its punch spec as `getResourceId(i, 0) != 0 ? getString(id) :
++     *  ta.getNonResourceString(i)` and throws "Required value was null." on
++     *  null; LayoutInflater substituted a FrameLayout, and
++     *  ReelAvatarWithBadgeView (the avatar-with-badge cell) then failed with
++     *  a ClassCastException on that placeholder.
++     *  The bound set is the XML attribute tier (setValueAt), which is where an
++     *  immediate value lives. */
++    public String getNonResourceString(int index) {
++        if (index < 0 || index >= attrs.length) return null;
++        String v = macapkBoundValueAt(index);
++        if (v == null || macapkNullDataOf(index, v) >= 0) return null;
++        if (!v.isEmpty() && (v.charAt(0) == '@' || v.charAt(0) == '?')) return null;
++        return v;
++    }
+     public android.graphics.drawable.Drawable getDrawable(int index) {
+         // v1.0.97: when the attribute carries a `@drawable/foo`
+         // reference, route through Resources.getDrawable so we
+diff --git a/runtime/java/android/graphics/Canvas.java b/runtime/java/android/graphics/Canvas.java
+index 8910e5a..364c886 100644
+--- a/runtime/java/android/graphics/Canvas.java
++++ b/runtime/java/android/graphics/Canvas.java
+@@ -2305,7 +2305,23 @@ public class Canvas {
+                         float startAngle, float sweepAngle, boolean useCenter, Paint p) {
+         drawArc(new RectF(left, top, right, bottom), startAngle, sweepAngle, useCenter, p);
+     }
++    /** MACAPK_TRACE_RRECT=1 (diagnostic, default off): each DISTINCT
++     *  drawRoundRect -- rect, radii and paint (colour, alpha, style, shader) --
++     *  once, 600 distinct lines max.
++     *  A custom view that paints its own chrome in onDraw (Instagram's
++     *  IgdsButton) leaves no drawable to inspect in a tree dump; this shows
++     *  whether the op arrived empty or transparent. */
++    private static final boolean TRACE_RRECT = "1".equals(System.getenv("MACAPK_TRACE_RRECT"));
++    private static final java.util.Set<String> sTraceRRectSeen =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
+     public void drawRoundRect(RectF rect, float rx, float ry, Paint p) {
++        if (TRACE_RRECT && sTraceRRectSeen.size() < 600) {
++            String line = "rect=" + rect + " r=" + rx + "," + ry
++                + (p == null ? " paint=null" : " color=0x" + Integer.toHexString(p.getColor())
++                    + " alpha=" + p.getAlpha() + " style=" + p.getStyle()
++                    + " shader=" + (p.getShader() == null ? "null" : p.getShader().getClass().getSimpleName()));
++            if (sTraceRRectSeen.add(line)) com.macapk.loader.NativeLog.i("Mac.apk.RRect", line);
++        }
+         if (!TRACE_DRAWCOST) { drawRoundRectUntraced(rect, rx, ry, p); return; }
+         final long t0 = System.nanoTime();
+         try { drawRoundRectUntraced(rect, rx, ry, p); } finally { drawCost(t0, "rrect", p); }
+diff --git a/runtime/java/android/view/LayoutInflater.java b/runtime/java/android/view/LayoutInflater.java
+index 821371e..440e739 100644
+--- a/runtime/java/android/view/LayoutInflater.java
++++ b/runtime/java/android/view/LayoutInflater.java
+@@ -1613,6 +1613,25 @@ public class LayoutInflater {
+         return c;
+     }
+ 
++    private static final boolean GENLP_APP_FINAL =
++        !"0".equals(System.getenv("MACAPK_GENLP_APP_FINAL"));
++    private static final java.util.Map<Class<?>, Boolean> sAppOverridesGenerateLp =
++        new java.util.concurrent.ConcurrentHashMap<>();
++    /** True when `parent`'s generateLayoutParams(AttributeSet) is declared by a
++     *  class the APK loaded (not by this framework). */
++    private static boolean macapkAppOverridesGenerateLp(ViewGroup parent) {
++        return sAppOverridesGenerateLp.computeIfAbsent(parent.getClass(), c -> {
++            try {
++                java.lang.reflect.Method m =
++                    c.getMethod("generateLayoutParams", android.util.AttributeSet.class);
++                return m.getDeclaringClass().getClassLoader()
++                    != LayoutInflater.class.getClassLoader();
++            } catch (Throwable t) {
++                return false;
++            }
++        });
++    }
++
+     private ViewGroup.LayoutParams buildLayoutParams(ViewGroup parent, Element elem) {
+         if (parent == null) return null;
+         // Diagnostic: log the parent class + child tag so we can verify
+@@ -1642,6 +1661,32 @@ public class LayoutInflater {
+         try {
+             ViewGroup.LayoutParams gen = parent.generateLayoutParams(
+                 new DomBackedAttributeSet(elem, macapkLpContext(parent)));
++            // MACAPK_GENLP_APP_FINAL (default ON). On a device whatever
++            // generateLayoutParams(attrs) returns IS the child's params: the
++            // inflater applies nothing afterwards (LayoutInflater.rInflate ->
++            // `params = viewGroup.generateLayoutParams(attrs); viewGroup.
++            // addView(view, params)`). This method then walks the element's
++            // layout_* attributes onto the result, which is how the framework
++            // parents here get their values -- but it also overwrites the
++            // answer of an APP class that deliberately ignores the attributes.
++            // Material's TabLayout is that case, verbatim:
++            //     // We don't care about the layout params of any views added
++            //     // to us ... We return the default layout params ...
++            //     return generateDefaultLayoutParams();
++            // MEASURED on Instagram 455: profile_icon_tab_view_layout declares
++            // layout_width="0px" + weight (written for a horizontal strip) and
++            // is inflated with the TabLayout as root. A device hands it
++            // MATCH_PARENT x MATCH_PARENT; here the walk rewrote the width to
++            // 0, so each profile tab's icon view measured 0 px wide and the
++            // grid / reels / tagged icons never drew.
++            // Final only when BOTH hold: the override is declared by a class
++            // the APK loaded, and the size was set through the (int, int)
++            // constructor rather than read from the AttributeSet (no
++            // (Context, AttributeSet) constructor here reaches that one).
++            if (GENLP_APP_FINAL && gen != null && gen.macapkSizeFromCode
++                    && macapkAppOverridesGenerateLp(parent)) {
++                return gen;
++            }
+             if (gen != null
+                 && gen.getClass() != ViewGroup.LayoutParams.class
+                 && gen.getClass() != ViewGroup.MarginLayoutParams.class) {
+diff --git a/runtime/java/android/view/View.java b/runtime/java/android/view/View.java
+index 8898f86..80ae92e 100644
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -4835,6 +4835,29 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         return lp.width + "x" + lp.height;
+     }
+     public ViewGroup.LayoutParams getLayoutParams() { return layoutParams; }
++    /** MACAPK_TRACE_SETLP=<simple class name> (diagnostic, default off): every
++     *  setLayoutParams on a view of that class -- the params' class, width,
++     *  height and weight, and who called -- 60 lines max. A view's params in a
++     *  tree dump say what they ARE; this says who made them so. */
++    private static final String MACAPK_TRACE_SETLP = System.getenv("MACAPK_TRACE_SETLP");
++    private static final java.util.concurrent.atomic.AtomicInteger sTraceSetLpN =
++        new java.util.concurrent.atomic.AtomicInteger();
++    private void macapkTraceSetLp(ViewGroup.LayoutParams lp) {
++        if (MACAPK_TRACE_SETLP == null || !MACAPK_TRACE_SETLP.equals(getClass().getSimpleName())
++                || sTraceSetLpN.incrementAndGet() > 60) return;
++        StringBuilder sb = new StringBuilder();
++        sb.append(getClass().getSimpleName()).append('@')
++          .append(Integer.toHexString(System.identityHashCode(this)))
++          .append(" lp=").append(lp.getClass().getName())
++          .append(' ').append(lp.width).append('x').append(lp.height);
++        if (lp instanceof android.widget.LinearLayout.LayoutParams)
++            sb.append(" weight=").append(((android.widget.LinearLayout.LayoutParams) lp).weight);
++        sb.append(" parent=").append(getParent() == null ? "null" : getParent().getClass().getSimpleName());
++        StackTraceElement[] st = new Throwable().getStackTrace();
++        for (int i = 2; i < st.length && i < 12; i++) sb.append("\n    at ").append(st[i]);
++        com.macapk.loader.NativeLog.i("Mac.apk.SetLp", sb.toString());
++    }
++
+     public void setLayoutParams(ViewGroup.LayoutParams lp) {
+         // AOSP :18175 opens with
+         //     if (params == null) throw new NullPointerException("Layout parameters cannot be null");
+@@ -4842,6 +4865,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
+         // instead of at the call that caused it (fwprobe VW.id.lp.null).
+         if (lp == null) throw new NullPointerException("Layout parameters cannot be null");
+         this.layoutParams = lp;
++        macapkTraceSetLp(lp);
+         // AOSP View.setLayoutParams (android13-release View.java:18972-18982) is
+         //   mLayoutParams = params; resolveLayoutParams(); ...; requestLayout();
+         // and resolveLayoutParams() (:18989) calls
+diff --git a/runtime/java/android/view/ViewGroup.java b/runtime/java/android/view/ViewGroup.java
+index 73507f4..bdd706f 100644
+--- a/runtime/java/android/view/ViewGroup.java
++++ b/runtime/java/android/view/ViewGroup.java
+@@ -96,11 +96,19 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
+          *  custom ViewGroup we can't reach into. */
+         public int macapkGravity = android.view.Gravity.NO_GRAVITY;
+ 
++        /** True when the size came from the (int, int) constructor -- chosen
++         *  in CODE -- rather than from an XML AttributeSet. None of the
++         *  (Context, AttributeSet) constructors in this framework reach the
++         *  (int, int) one, so the flag separates the two. LayoutInflater reads
++         *  it: see buildLayoutParams' MACAPK_GENLP_APP_FINAL. */
++        boolean macapkSizeFromCode;
++
+         public LayoutParams() {}
+-        public LayoutParams(int w, int h) { this.width = w; this.height = h; }
++        public LayoutParams(int w, int h) { this.width = w; this.height = h; this.macapkSizeFromCode = true; }
+         public LayoutParams(LayoutParams src) {
+             this.width = src.width; this.height = src.height;
+             this.macapkGravity = src.macapkGravity;
++            this.macapkSizeFromCode = src.macapkSizeFromCode;
+         }
+         public LayoutParams(Context c, android.util.AttributeSet attrs) {}
+     }
+diff --git a/runtime/java/android/widget/ImageView.java b/runtime/java/android/widget/ImageView.java
+index 9e3ecf9..dcfe9c1 100644
+--- a/runtime/java/android/widget/ImageView.java
++++ b/runtime/java/android/widget/ImageView.java
+@@ -29,6 +29,9 @@ public class ImageView extends View {
+     private android.graphics.Bitmap   bitmap;
+     private android.graphics.drawable.Drawable drawable;
+     private ScaleType scaleType = ScaleType.FIT_CENTER;
++    /** See the app-drawable branch in onDraw; `=0` restores the bounds path. */
++    private static final boolean MACAPK_IMAGEVIEW_APP_MATRIX =
++        !"0".equals(System.getenv("MACAPK_IMAGEVIEW_APP_MATRIX"));
+     // 2026-09-25: the v1.0.448 `macapkImageScalePct` field (fed by a
+     // LayoutInflater `case "imageScalePercent"`) was DELETED. That attribute is
+     // PRIVATE to Google Calculator's PadImageButton, and the app applies it
+@@ -745,6 +748,38 @@ public class ImageView extends View {
+                             }
+                         }
+                     }
++                    // AOSP SEMANTICS FOR A DRAWABLE THE APP DEFINES
++                    // (MACAPK_IMAGEVIEW_APP_MATRIX, default ON). configureBounds
++                    // (android-14 ImageView.java:1281-1360) never resizes the
++                    // drawable for a scaling scaleType: it sets the bounds to
++                    // the NATIVE size and puts the scale in a matrix that
++                    // onDraw concats. The lines below instead shrink the
++                    // BOUNDS, which is equivalent only for a drawable that
++                    // fills whatever bounds it is given. One that positions its
++                    // content inside the bounds by gravity is not: handed
++                    // 12x12 bounds for a 24x24 glyph it draws the glyph at
++                    // full size, centred, and the view clips it.
++                    // MEASURED on Instagram 455: the profile chips' 12dp
++                    // IgImageView holds the app's own vector class (intrinsic
++                    // 24x24, `Gravity.apply(gravity, 24, 24, getBounds(), ...)`
++                    // in its draw) and showed one corner of each glyph.
++                    // Scoped to classes the APK loaded: they were only ever
++                    // written against the device's contract. Framework
++                    // drawables keep the bounds path their implementations
++                    // here were built around.
++                    if (MACAPK_IMAGEVIEW_APP_MATRIX && !isFab && iw > 0 && ih > 0
++                            && scaleType != ScaleType.FIT_XY
++                            && (drawW != iw || drawH != ih)
++                            && drawable.getClass().getClassLoader()
++                                != ImageView.class.getClassLoader()) {
++                        drawable.setBounds(0, 0, iw, ih);
++                        int sv = canvas.save();
++                        canvas.translate(dx + dPadL, dy + dPadT);
++                        canvas.scale((float) drawW / iw, (float) drawH / ih);
++                        drawable.draw(canvas);
++                        canvas.restoreToCount(sv);
++                        return;
++                    }
+                     drawable.setBounds(0, 0, drawW, drawH);
+                     // Offset into the content box (AOSP's
+                     // `canvas.translate(mPaddingLeft, mPaddingTop)`).

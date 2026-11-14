@@ -1,0 +1,500 @@
+text: draw emoji with the host emoji face, and report their ink
+
+An emoji cluster was painted with whatever font was current. That inks only
+when the current font is a JDK logical composite. A font created from a FILE
+(the bundled Roboto, any app typeface) has no fallback behind it and painted
+its .notdef box once per codepoint. Measured on JDK 21 / macOS:
+    Roboto(file).canDisplay(U+1F600) = false -> 3 boxes, 0 coloured pixels
+In Instagram 455 (its UI face is a file font) every emoji in a bio, a caption
+or a comment was a box.
+
+1. Draw. MacApkFont.emojiImage shapes the cluster with the host face
+   ("Apple Color Emoji") and Canvas.macapkDrawStringRuns paints that instead.
+   - SHAPED (Font.layoutGlyphVector), because drawString does not ligate this
+     face: a flag, a skin-toned hand and a keycap each came out as two glyphs
+     ~2 em wide (ink 182/193/164 px at 100 px); shaped they are one glyph of
+     one em.
+   - Through an IMAGE, because a colour glyph is painted only when both the
+     colour and the composite are fully opaque: at any other alpha
+     drawGlyphVector / drawString paint nothing (0 pixels on INT_ARGB,
+     INT_ARGB_PRE and INT_RGB). A 60% secondary label or a fade would lose its
+     emoji. The image is cached per (cluster, size, device scale in eighths),
+     bounded by count and bytes, and the paint's alpha rides on the composite.
+   - Placed with NotoColorEmoji's geometry: art ~1.1 em across whose centre is
+     0.34 em above the baseline (136x128 strike at 109 ppem, bearingY 101). The
+     host face is set at 1.2x the text size and dropped until the centres
+     agree. The cell is still emojiAdvance(), so measureText is unchanged.
+
+2. Clusters. emojiClusterEnd now takes the primary font and also recognises
+   - keycaps ([#*0-9] VS16? U+20E3), which start below the old U+203C reject;
+   - a text-default base followed by a skin tone (an emoji modifier sequence);
+   - a text-default emoji with no variation selector when the emoji family is
+     the first in the chain to cover it. fonts.xml lists NotoColorEmoji after
+     NotoSansSymbols-Regular-Subsetted and before -Subsetted2, so a bare
+     U+2764 is a red heart on a device; here -Subsetted2 won and drew it black.
+     Of the 205 text-default emoji >= U+203C: Roboto 3, Subsetted 86 (stay
+     text), Subsetted2 12 and uncovered 104 (now emoji).
+   The inner loop of a text run breaks where a cluster starts
+   (emojiStartsAt), or the digit of a keycap is swallowed by the run before it.
+   Paint.macapkMeasureRuns uses the same calls, so measure and draw agree.
+
+3. Ink bounds. A colour glyph has no outline, so getVisualBounds was empty and
+   Paint.getTextBounds answered [0,0,0,0] for an emoji. Instagram sizes the
+   bitmaps of its quick-reaction emoji from getTextBounds of U+1F601 and got a
+   bitmap with no room for the glyph. Now the strike box a device reports:
+   [0, -101/109, 136/109, 27/109] em -> [0,-30,40,8] at 32 px.
+
+MACAPK_EMOJI_FACE=0 restores the old draw. MACAPK_TRACE_TEXT=1 (diagnostic,
+off by default) logs each distinct non-Latin-1 drawText with the font it
+resolved to; it is what showed the remaining boxes were a stale on-disk cache
+of the app's own emoji sprites, not a draw.
+
+Verified in the app: bio, caption, comments and the quick-reaction row show
+colour emoji; boot 5/5.
+
+diff --git a/runtime/java/android/graphics/Canvas.java b/runtime/java/android/graphics/Canvas.java
+--- a/runtime/java/android/graphics/Canvas.java
++++ b/runtime/java/android/graphics/Canvas.java
+@@ -2304,7 +2304,31 @@
+     public void drawArc(float left, float top, float right, float bottom,
+                         float startAngle, float sweepAngle, boolean useCenter, Paint p) {
+         drawArc(new RectF(left, top, right, bottom), startAngle, sweepAngle, useCenter, p);
++    }
++    /** MACAPK_TRACE_TEXT=1 (diagnostic, default off): each DISTINCT drawText
++     *  whose string leaves Latin-1 -- its codepoints, the font it resolved to,
++     *  whether it takes the run path and where an emoji cluster ends. Answers
++     *  "which font drew this box" without a debugger. */
++    private static final boolean TRACE_TEXT = "1".equals(System.getenv("MACAPK_TRACE_TEXT"));
++    private static final java.util.Set<String> sTracedText =
++        java.util.concurrent.ConcurrentHashMap.newKeySet();
++
++    private void macapkTraceText(String text, float x, float y, Font primary, Paint p) {
++        boolean wide = false;
++        for (int i = 0; i < text.length() && !wide; i++) wide = text.charAt(i) > 0xFF;
++        if (!wide || sTracedText.size() > 600) return;
++        StringBuilder cps = new StringBuilder();
++        text.codePoints().limit(10).forEach(cp -> cps.append(Integer.toHexString(cp)).append(' '));
++        String line = "cps=" + cps + "font=" + primary.getFontName() + " size=" + primary.getSize2D()
++                + " special=" + MacApkFont.firstSpecial(text, primary)
++                + " cluster=" + MacApkFont.emojiClusterEnd(text, 0, text.length(), primary)
++                + " align=" + p.getTextAlign() + " typeface=" + p.getTypeface();
++        if (sTracedText.add(line)) {
++            com.macapk.loader.NativeLog.i("MacApkText", line + " at=" + x + "," + y
++                    + " clip=" + g.getClipBounds());
++        }
+     }
++
+     /** MACAPK_TRACE_RRECT=1 (diagnostic, default off): each DISTINCT
+      *  drawRoundRect -- rect, radii and paint (colour, alpha, style, shader) --
+      *  once, 600 distinct lines max.
+@@ -2425,6 +2449,7 @@
+         applyPaint(p);
+         Font macapkPrimaryFont = deriveFont(p);
+         g.setFont(macapkPrimaryFont);
++        if (TRACE_TEXT) macapkTraceText(text, x, y, macapkPrimaryFont, p);
+         // Paint.Align and the text decorations both need the run's advance, and
+         // hwui uses ONE number for both: layout.getAdvance(). Computed only when
+         // one of them is in play, so a plain LEFT, undecorated draw (nearly
+@@ -2684,6 +2709,15 @@
+             as.addAttribute(java.awt.font.TextAttribute.FONT, base);
+             int i = 0;
+             while (i < n) {
++                // Same cell as the measured one: the host emoji face at the
++                // size where its one-em advance IS the emoji advance.
++                int ee = MacApkFont.emojiClusterEnd(text, i, n, base);
++                Font ef = (ee > i) ? MacApkFont.emojiCellFont(base.getSize2D()) : null;
++                if (ef != null) {
++                    as.addAttribute(java.awt.font.TextAttribute.FONT, ef, i, ee);
++                    i = ee;
++                    continue;
++                }
+                 int cp = text.codePointAt(i);
+                 Font fb = (cp < 0x20) ? null : MacApkFont.fallbackBaseFor(cp, base);
+                 int runStart = i;
+@@ -2756,14 +2790,13 @@
+         while (i < n) {
+             // Mirror of Paint.macapkMeasureRuns: an emoji cluster advances the
+             // pen by the measured emoji advance, so the glyphs AFTER it land
+-            // where measureText said they would. The cluster itself is still
+-            // painted by the JDK composite (we rasterize no colour font), so it
+-            // may sit narrow inside its box -- a far smaller defect than every
+-            // emoji-bearing string wrapping at the wrong point.
+-            int ee = MacApkFont.emojiClusterEnd(text, i, n);
++            // where measureText said they would. The cluster itself is shaped
++            // with the host emoji face: the current font is usually a FILE font
++            // with no fallback behind it, which painted a .notdef box here.
++            int ee = MacApkFont.emojiClusterEnd(text, i, n, primary);
+             if (ee > i) {
+                 String ec = text.substring(i, ee);
+-                g.drawString(ec, cx, y);
++                if (!macapkDrawEmoji(ec, sizePx, cx, y)) g.drawString(ec, cx, y);
+                 cx += MacApkFont.emojiAdvance(sizePx);
+                 i = ee;
+                 continue;
+@@ -2778,6 +2811,7 @@
+             while (i < n) {
+                 int cp2 = text.codePointAt(i);
+                 if (MacApkFont.isDefaultIgnorable(cp2)) break;
++                if (MacApkFont.emojiStartsAt(text, i, n, primary)) break;
+                 Font b2 = (cp2 < 0x20) ? null : MacApkFont.fallbackBaseFor(cp2, primary);
+                 if (b2 != base) break;
+                 i += Character.charCount(cp2);
+@@ -2790,7 +2824,42 @@
+             cx += rfm.stringWidth(run);
+         }
+         g.setFont(saved);
++    }
++    /** One emoji cluster with its pen at (x, y), from the cached image of it
++     *  (see MacApkFont.emojiImage for why an image). False when the host has
++     *  no emoji face, so the caller keeps its plain draw.
++     *
++     *  The paint's ALPHA rides on the composite: a colour glyph has no use for
++     *  the paint colour, but a dimmed or fading label must dim its emoji too.
++     *  Under an axis-aligned transform the image is snapped to whole device
++     *  pixels, so a fractional pen does not resample it. */
++    private boolean macapkDrawEmoji(String cluster, float sizePx, float x, float y) {
++        final java.awt.geom.AffineTransform t = g.getTransform();
++        final float scale = (float) Math.sqrt(Math.abs(t.getDeterminant()));
++        MacApkFont.EmojiImage ei = MacApkFont.emojiImage(cluster, sizePx, scale > 0f ? scale : 1f);
++        if (ei == null) return false;
++        double ox = x + ei.dx, oy = y + ei.dy;
++        if (t.getShearX() == 0.0 && t.getShearY() == 0.0 && t.getScaleX() > 0.0 && t.getScaleY() > 0.0) {
++            ox = (Math.rint(t.getScaleX() * ox + t.getTranslateX()) - t.getTranslateX()) / t.getScaleX();
++            oy = (Math.rint(t.getScaleY() * oy + t.getTranslateY()) - t.getTranslateY()) / t.getScaleY();
++        }
++        java.awt.geom.AffineTransform at = java.awt.geom.AffineTransform.getTranslateInstance(ox, oy);
++        at.scale(1.0 / ei.scale, 1.0 / ei.scale);
++        java.awt.Composite saved = null;
++        final int alpha = g.getColor().getAlpha();
++        if (alpha < 255 && g.getComposite() instanceof AlphaComposite) {
++            AlphaComposite ac = (AlphaComposite) g.getComposite();
++            saved = ac;
++            g.setComposite(ac.derive(ac.getAlpha() * alpha / 255f));
++        }
++        try {
++            g.drawImage(ei.image, at, null);
++        } finally {
++            if (saved != null) g.setComposite(saved);
++        }
++        return true;
+     }
++
+     /** Rasterize the glyphs into an offscreen ARGB image, blur its ALPHA channel,
+      *  and draw the result at the shadow offset. Blurring alpha alone is exact
+      *  here and cannot fringe: every pixel of the offscreen carries the same
+diff --git a/runtime/java/android/graphics/MacApkFont.java b/runtime/java/android/graphics/MacApkFont.java
+--- a/runtime/java/android/graphics/MacApkFont.java
++++ b/runtime/java/android/graphics/MacApkFont.java
+@@ -745,15 +745,36 @@
+      *  U+FE0F (VS16), U+20E3 (keycap), U+1F3FB..FF (skin tone), ZWJ + the emoji
+      *  it joins, and exactly ONE partner regional indicator. */
+     public static int emojiClusterEnd(String text, int i, int n) {
++        return emojiClusterEnd(text, i, n, null);
++    }
++
++    /** As above, resolved against the font the run is drawn with. A
++     *  text-default emoji codepoint with no variation selector goes to the
++     *  first family of the chain that covers it, so the answer depends on the
++     *  primary; measure and draw must both pass the same one. */
++    public static int emojiClusterEnd(String text, int i, int n, Font primary) {
+         if (text == null || i < 0 || i >= n) return -1;
+         int cp = text.codePointAt(i);
+-        // Cheap reject before any reflection: nothing below U+203C is emoji.
+-        if (cp < 0x203C) return -1;
++        // Cheap reject: nothing below U+203C is emoji on its own. The one
++        // sequence that starts down here is the keycap -- [#*0-9] VS16? U+20E3.
++        if (cp < 0x203C) {
++            if (cp == '#' || cp == '*' || (cp >= '0' && cp <= '9')) {
++                int k = i + 1;
++                if (k < n && text.charAt(k) == 0xFE0F) k++;
++                if (k < n && text.charAt(k) == 0x20E3) return k + 1;
++            }
++            return -1;
++        }
+         int j = i + Character.charCount(cp);
+         if (!isEmojiPresentation(cp)) {
+-            // Text-default (c)/(tm)/heart style: emoji ONLY with a following VS16.
++            // Text-default (c)/(tm)/heart style: emoji with a following VS16,
++            // with a skin-tone modifier (an emoji modifier sequence is emoji
++            // presented by definition), or when the emoji family is the first
++            // one in the chain that covers it.
+             if (!isEmojiCodepoint(cp)) return -1;
+-            if (j >= n || text.codePointAt(j) != 0xFE0F) return -1;
++            int next = (j < n) ? text.codePointAt(j) : -1;
++            if (next != 0xFE0F && !(next >= 0x1F3FB && next <= 0x1F3FF)
++                    && !emojiFamilyWins(cp, next, primary)) return -1;
+         }
+         boolean firstIsRI = (cp >= 0x1F1E6 && cp <= 0x1F1FF);
+         while (j < n) {
+@@ -777,8 +798,201 @@
+             break;
+         }
+         return j;
++    }
++
++    /** Does an emoji cluster start at `i`? For the inner loop of a text run,
++     *  which would otherwise swallow a cluster whose first codepoint the run's
++     *  own font covers -- the digit of a keycap, a text-default emoji sharing
++     *  a symbols face with the character before it. One compare for ordinary
++     *  text. */
++    public static boolean emojiStartsAt(String text, int i, int n, Font primary) {
++        char c = text.charAt(i);
++        if (c < 0x203C && !(c == '#' || c == '*' || (c >= '0' && c <= '9'))) return false;
++        return emojiClusterEnd(text, i, n, primary) > i;
++    }
++
++    // --- Colour emoji through the host emoji face --------------------------
++    //
++    // A cluster used to be painted with whatever font was current. That inks
++    // only when the current font is a JDK logical composite: a font created
++    // from a FILE (the bundled Roboto, any app typeface) has no fallback, so it
++    // painted its .notdef box once per codepoint. Measured on JDK 21 / macOS:
++    // Roboto(file).canDisplay(U+1F600) = false, three boxes, 0 coloured pixels.
++    //
++    // The host face has to be SHAPED (layoutGlyphVector), not handed to
++    // drawString. Unshaped, a flag, a skin-toned hand and a keycap each paint
++    // as two glyphs ~2 em wide; shaped, each is one glyph one em wide.
++    //
++    // Geometry is NotoColorEmoji's, so the ink lands where a device puts it:
++    // its strike is a 136x128 bitmap at 109 ppem hung 101 px above the
++    // baseline, i.e. art ~1.1 em across whose centre sits 0.34 em above the
++    // baseline. The host face draws art 0.92 em across centred 0.38 em above
++    // its baseline (measured), so it is set at 1.2x the text size and dropped
++    // until the two centres agree. The CELL stays emojiAdvance(): this changes
++    // what is painted inside it, not what measureText reports.
++    /** NotoColorEmoji's strike box in em, what a device reports as the ink
++     *  bounds of an emoji: 136 px wide from the pen, 101 px above the baseline
++     *  and 27 px below it, at 109 ppem. */
++    public static final float EMOJI_BOX_WIDTH_EM = 136f / 109f;
++    public static final float EMOJI_BOX_ABOVE_EM = 101f / 109f;
++    public static final float EMOJI_BOX_BELOW_EM = 27f / 109f;
++
++    private static final boolean EMOJI_FACE =
++        !"0".equals(System.getenv("MACAPK_EMOJI_FACE"));
++    private static final String EMOJI_FAMILY = "Apple Color Emoji";
++    private static final float EMOJI_FACE_EM = 1.2f;
++    private static final float EMOJI_FACE_CENTRE = 0.38f;
++    private static final float EMOJI_CENTRE_EM = 0.34f;
++
++    private static volatile Font sEmojiBase;
++    private static volatile boolean sEmojiProbed;
++
++    private static Font emojiBase() {
++        if (!sEmojiProbed) {
++            synchronized (MacApkFont.class) {
++                if (!sEmojiProbed) {
++                    Font found = null;
++                    if (EMOJI_FACE) {
++                        try {
++                            // AWT answers an unknown family with Dialog rather
++                            // than failing, so the family has to be read back.
++                            Font c = new Font(EMOJI_FAMILY, Font.PLAIN, 1);
++                            if (EMOJI_FAMILY.equalsIgnoreCase(c.getFamily(java.util.Locale.ROOT))) found = c;
++                        } catch (Throwable ignored) {}
++                    }
++                    sEmojiBase = found;
++                    sEmojiProbed = true;
++                }
++            }
++        }
++        return sEmojiBase;
++    }
++
++    /** The host emoji face sized so one glyph advances exactly one emoji cell.
++     *  For callers that lay text out themselves (the bidi TextLayout path);
++     *  null when the host has no such face. */
++    public static Font emojiCellFont(float sizePx) {
++        Font base = emojiBase();
++        return (base == null || !(sizePx > 0f)) ? null : base.deriveFont(emojiAdvance(sizePx));
++    }
++
++    /** Android's fonts.xml lists NotoColorEmoji after
++     *  NotoSansSymbols-Regular-Subsetted and before -Subsetted2, and a
++     *  codepoint with no variation selector goes to the first family that
++     *  covers it. So a text-default emoji is TEXT when the primary, Roboto or
++     *  the first symbols subset has it, and emoji otherwise -- which is what
++     *  makes a bare U+2764 a red heart on a device. -Subsetted2 (heart, sun,
++     *  snowflake, card suits...) exists for U+FE0E and must not win here. */
++    private static boolean emojiFamilyWins(int cp, int next, Font primary) {
++        if (primary == null || next == 0xFE0E || emojiBase() == null) return false;
++        if (primary.canDisplay(cp)) return false;
++        ensureBase();
++        ensureFallbacks();
++        if (sBase != null && sBase.canDisplay(cp)) return false;
++        Font symbols = sSymbolsBeforeEmoji;
++        return symbols == null || !symbols.canDisplay(cp);
+     }
+ 
++    /** One emoji cluster rasterized for a given text size and device scale.
++     *  `image` is `scale` device pixels per text unit; its top-left corner goes
++     *  at pen + (dx, dy). */
++    public static final class EmojiImage {
++        public final java.awt.image.BufferedImage image;
++        public final float dx, dy, scale;
++        EmojiImage(java.awt.image.BufferedImage image, float dx, float dy, float scale) {
++            this.image = image; this.dx = dx; this.dy = dy; this.scale = scale;
++        }
++    }
++
++    private static final int EMOJI_IMAGE_CACHE = 384;
++    private static final long EMOJI_IMAGE_BYTES = 24L << 20;
++    private static final int EMOJI_IMAGE_MAX_PIXELS = 4 << 20;
++    private static final Object EMOJI_NONE = new Object();
++    private static final ConcurrentHashMap<String, Object> sEmojiImages =
++        new ConcurrentHashMap<>();
++    private static final java.util.concurrent.atomic.AtomicLong sEmojiImageBytes =
++        new java.util.concurrent.atomic.AtomicLong();
++
++    /** The cluster drawn with the host emoji face for text of this size, or
++     *  null when there is no such face (the caller keeps its old draw).
++     *
++     *  ⚠ AN IMAGE, NOT A GLYPH VECTOR, and not for speed. Measured on JDK 21 /
++     *  macOS: drawGlyphVector and drawString paint a colour glyph ONLY when
++     *  both the colour and the composite are fully opaque -- at any other
++     *  alpha they paint nothing at all (0 pixels, every destination type). A
++     *  secondary label at 60% black, or anything mid-fade, would lose its
++     *  emoji. Rasterizing opaque into an image and compositing the image is
++     *  the one route that honours alpha.
++     *
++     *  `deviceScale` is the scale the canvas maps text units to pixels with; it
++     *  is stepped to eighths so a scale animation reuses a handful of images
++     *  instead of one per frame. */
++    public static EmojiImage emojiImage(String cluster, float sizePx, float deviceScale) {
++        Font base = emojiBase();
++        if (base == null || cluster == null || cluster.isEmpty() || !(sizePx > 0f)) return null;
++        int step = Math.round(deviceScale * 8f);
++        if (step < 1) step = 1;
++        if (step > 64) step = 64;
++        String key = cluster + '\u0000' + Float.floatToIntBits(sizePx) + ':' + step;
++        Object v = sEmojiImages.get(key);
++        if (v == null) {
++            v = rasterEmoji(base, cluster, sizePx, step / 8f);
++            long bytes = (v instanceof EmojiImage)
++                ? 4L * ((EmojiImage) v).image.getWidth() * ((EmojiImage) v).image.getHeight() : 0L;
++            // Bounded both ways: an animated text size asks for a new entry
++            // every frame, and one story-sized emoji is hundreds of kilobytes.
++            if (sEmojiImages.size() >= EMOJI_IMAGE_CACHE
++                    || sEmojiImageBytes.get() + bytes > EMOJI_IMAGE_BYTES) {
++                sEmojiImages.clear();
++                sEmojiImageBytes.set(0L);
++            }
++            if (sEmojiImages.putIfAbsent(key, v) == null) sEmojiImageBytes.addAndGet(bytes);
++        }
++        return v == EMOJI_NONE ? null : (EmojiImage) v;
++    }
++
++    private static Object rasterEmoji(Font base, String cluster, float sizePx, float scale) {
++        try {
++            final float cell = emojiAdvance(sizePx);
++            final char[] cs = cluster.toCharArray();
++            float em = EMOJI_FACE_EM * sizePx;
++            java.awt.font.GlyphVector gv = null;
++            float w = 0f;
++            // A sequence this host does not ligate comes back as several
++            // glyphs; measureText charged ONE cell for the cluster, so the
++            // pieces are shrunk to share it rather than overrun the next run.
++            for (int pass = 0; pass < 2; pass++) {
++                gv = base.deriveFont(em * scale).layoutGlyphVector(
++                        TEXT_FRC, cs, 0, cs.length, Font.LAYOUT_LEFT_TO_RIGHT);
++                w = (float) gv.getLogicalBounds().getWidth() / scale;
++                if (!(w > 0f)) return EMOJI_NONE;
++                if (w <= cell) break;
++                em *= cell / w;
++            }
++            // The face inks up to 0.88 em above and 0.12 em below its baseline
++            // and stays inside its advance (measured); the margins cover that.
++            final float padX = 0.12f * em, above = 1.02f * em, below = 0.27f * em;
++            final int iw = (int) Math.ceil((w + 2f * padX) * scale);
++            final int ih = (int) Math.ceil((above + below) * scale);
++            if (iw <= 0 || ih <= 0 || (long) iw * ih > EMOJI_IMAGE_MAX_PIXELS) return EMOJI_NONE;
++            java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
++                    iw, ih, java.awt.image.BufferedImage.TYPE_INT_ARGB_PRE);
++            java.awt.Graphics2D ig = img.createGraphics();
++            try {
++                ig.setRenderingHint(java.awt.RenderingHints.KEY_TEXT_ANTIALIASING,
++                                    java.awt.RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
++                ig.setColor(java.awt.Color.BLACK);
++                ig.drawGlyphVector(gv, padX * scale, above * scale);
++            } finally {
++                ig.dispose();
++            }
++            return new EmojiImage(img, (cell - w) * 0.5f - padX,
++                    EMOJI_FACE_CENTRE * em - EMOJI_CENTRE_EM * sizePx - above, scale);
++        } catch (Throwable t) {
++            return EMOJI_NONE;
++        }
++    }
++
+     /** Cheap pre-test so the common all-ASCII string never pays for clustering. */
+     public static boolean hasEmoji(String text) {
+         if (text == null) return false;
+@@ -1124,6 +1338,7 @@
+     }
+ 
+     private static volatile Font[] sBundledFallbacks;
++    private static volatile Font sSymbolsBeforeEmoji; // the subset fonts.xml lists ahead of the emoji family
+     private static volatile Font sLogicalFallback;   // assigned last: doubles as the built flag
+ 
+     private static void ensureFallbacks() {
+@@ -1139,6 +1354,7 @@
+                         rememberExtents(f, bytes);
+                         rememberDeclaredBold(f, res.contains("-Bold"));
+                         list.add(f);
++                        if (res == BUNDLED_FALLBACK_RESOURCES[0]) sSymbolsBeforeEmoji = f;
+                     }
+                 } catch (Throwable ignored) {}
+             }
+diff --git a/runtime/java/android/graphics/Paint.java b/runtime/java/android/graphics/Paint.java
+--- a/runtime/java/android/graphics/Paint.java
++++ b/runtime/java/android/graphics/Paint.java
+@@ -635,7 +635,7 @@
+             // The draw side steps by the SAME value (Canvas.macapkDrawStringRuns)
+             // or measure and draw disagree, which is the defect class this file
+             // has already been bitten by twice.
+-            int ee = MacApkFont.emojiClusterEnd(text, i, n);
++            int ee = MacApkFont.emojiClusterEnd(text, i, n, primary);
+             if (ee > i) {
+                 w += MacApkFont.emojiAdvance(sizePx);
+                 i = ee;
+@@ -652,6 +652,7 @@
+             while (i < n) {
+                 int cp2 = text.codePointAt(i);
+                 if (MacApkFont.isDefaultIgnorable(cp2)) break;
++                if (MacApkFont.emojiStartsAt(text, i, n, primary)) break;
+                 java.awt.Font b2 = (cp2 < 0x20) ? null : MacApkFont.fallbackBaseFor(cp2, primary);
+                 if (b2 != base) break;
+                 i += Character.charCount(cp2);
+@@ -952,6 +953,25 @@
+                 boolean any = false;
+                 int i = 0;
+                 while (i < n) {
++                    // An emoji cluster is one cell, as in macapkMeasureRuns,
++                    // and its ink is the emoji strike's box. A colour glyph has
++                    // no outline, so getVisualBounds answered EMPTY for it and
++                    // U+1F601 came back as [0,0,0,0] -- which an app
++                    // that sizes a bitmap from these bounds (Instagram's emoji
++                    // images) turns into a bitmap with no room for the emoji.
++                    int ee = MacApkFont.emojiClusterEnd(text, i, n, f);
++                    if (ee > i) {
++                        final float sz = f.getSize2D();
++                        minX = Math.min(minX, penX);
++                        maxX = Math.max(maxX, penX + MacApkFont.EMOJI_BOX_WIDTH_EM * sz);
++                        minY = Math.min(minY, -MacApkFont.EMOJI_BOX_ABOVE_EM * sz);
++                        maxY = Math.max(maxY, MacApkFont.EMOJI_BOX_BELOW_EM * sz);
++                        any = true;
++                        lastGlyphPenX = penX;
++                        penX += MacApkFont.emojiAdvance(sz);
++                        i = ee;
++                        continue;
++                    }
+                     int cp = text.codePointAt(i);
+                     if (MacApkFont.isDefaultIgnorable(cp)) { i += Character.charCount(cp); continue; }
+                     java.awt.Font base = (cp < 0x20) ? null : MacApkFont.fallbackBaseFor(cp, f);
+@@ -960,6 +980,7 @@
+                     while (i < n) {
+                         int cp2 = text.codePointAt(i);
+                         if (MacApkFont.isDefaultIgnorable(cp2)) break;
++                        if (MacApkFont.emojiStartsAt(text, i, n, f)) break;
+                         java.awt.Font b2 = (cp2 < 0x20) ? null : MacApkFont.fallbackBaseFor(cp2, f);
+                         if (b2 != base) break;
+                         i += Character.charCount(cp2);

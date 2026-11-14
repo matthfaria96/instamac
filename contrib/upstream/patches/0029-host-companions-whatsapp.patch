@@ -1,0 +1,210 @@
+host companions: com.whatsapp is performed by the Mac (wa.me links, "send text")
+
+An app that checks for WhatsApp before handing it a link falls back to the store
+when it is absent: Instagram turned a profile's WhatsApp link into
+play.google.com/d?id=com.whatsapp, which the Mac then opened. WhatsApp's links
+and its "send this text" are web addresses (wa.me), which the Mac opens in
+WhatsApp for Mac when it is installed and in WhatsApp Web otherwise.
+- HostCompanions (new): com.whatsapp is listed as installed (PackageInfo and
+  ApplicationInfo, enabled, with our own empty signature, as the host browser's
+  com.macapk.host), and its one activity resolves only for what the Mac
+  performs: VIEW of an http(s)/whatsapp: address and SEND of text.
+- ActivityHost.macapkRouteStart: a start addressed to it (component or
+  setPackage) opens on the Mac through openHostUrlGated (user-initiated only):
+  VIEW -> the address with the app's attribution parameters dropped
+  (wa.me/<number>, `text` kept); SEND -> https://wa.me/?text=<text>.
+- MACAPK_HOST_COMPANIONS=0 lists none.
+
+diff --git a/runtime/java/com/macapk/loader/HostCompanions.java b/runtime/java/com/macapk/loader/HostCompanions.java
+new file mode 100644
+--- /dev/null
++++ b/runtime/java/com/macapk/loader/HostCompanions.java
+@@ -0,0 +1,140 @@
++package com.macapk.loader;
++
++import android.content.Intent;
++import android.content.pm.ActivityInfo;
++import android.content.pm.ApplicationInfo;
++import android.content.pm.PackageInfo;
++import android.content.pm.ResolveInfo;
++import android.net.Uri;
++
++/** Android packages whose work the Mac does (MACAPK_HOST_COMPANIONS, default on).
++ *
++ *  WhatsApp's links and its "send this text" are web addresses (wa.me), and the
++ *  Mac opens one in WhatsApp for Mac when it is installed, in WhatsApp Web
++ *  otherwise. So com.whatsapp is listed as installed, and what an app hands it is
++ *  performed on the Mac, through the same user-initiated gate as any link:
++ *    VIEW of an http(s) or whatsapp: address -> that address, as it is;
++ *    SEND of text                            -> https://wa.me/?text=<the text>.
++ *  Its activity resolves for nothing else (a file, a MAIN launch), so an app asking
++ *  for more gets the "not handled" answer it already copes with.
++ *
++ *  Why: an app that checks for the package before handing it a link falls back to
++ *  the store page when it is absent -- Instagram turned a profile's WhatsApp link
++ *  into play.google.com/d?id=com.whatsapp, which the Mac then opened.
++ *
++ *  Its signature is ours and empty, like the host browser's (com.macapk.host): an
++ *  app that verifies WhatsApp's certificate sees this is not WhatsApp. */
++final class HostCompanions {
++    static final String WHATSAPP = "com.whatsapp";
++    static final String ACTIVITY = "com.whatsapp.MacHostActivity";
++    private static final boolean ON = !"0".equals(System.getenv("MACAPK_HOST_COMPANIONS"));
++    private static final String TAG = "Mac.apk.HostCompanions";
++
++    private HostCompanions() {}
++
++    static boolean isCompanion(String pkg) {
++        return ON && WHATSAPP.equals(pkg);
++    }
++
++    /** The package an intent is addressed to: its component's, else setPackage. */
++    static String addressedTo(Intent intent) {
++        if (intent == null) return null;
++        android.content.ComponentName cn = intent.getComponent();
++        return cn != null ? cn.getPackageName() : intent.getPackage();
++    }
++
++    static ApplicationInfo applicationInfo(String pkg) {
++        ApplicationInfo ai = new ApplicationInfo();
++        ai.packageName = pkg;
++        ai.enabled = true;
++        return ai;
++    }
++
++    static PackageInfo packageInfo(String pkg) {
++        PackageInfo pi = new PackageInfo();
++        pi.packageName = pkg;
++        pi.versionName = "1.0";
++        pi.versionCode = 1;
++        pi.longVersionCode = 1;
++        pi.signatures = new android.content.pm.Signature[] {
++            new android.content.pm.Signature(new byte[0])
++        };
++        pi.applicationInfo = applicationInfo(pkg);
++        return pi;
++    }
++
++    /** The Mac address for what `intent` asks of the companion, or null when the
++     *  Mac does not perform it. */
++    static String hostUrlFor(Intent intent) {
++        if (intent == null) return null;
++        final String action = intent.getAction();
++        if (Intent.ACTION_VIEW.equals(action)) {
++            final Uri d = intent.getData();
++            final String s = d != null && d.getScheme() != null
++                ? d.getScheme().toLowerCase(java.util.Locale.ROOT) : null;
++            if (!"http".equals(s) && !"https".equals(s) && !"whatsapp".equals(s)) return null;
++            return pureLink(d);
++        }
++        if (Intent.ACTION_SEND.equals(action)) {
++            final CharSequence t = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
++            return t != null && t.length() > 0 ? "https://wa.me/?text=" + Uri.encode(t.toString()) : null;
++        }
++        return null;
++    }
++
++    /** A wa.me / api.whatsapp.com address as the person wrote it: the app's
++     *  attribution parameters (Instagram adds source_surface and token, which only
++     *  the WhatsApp app reads) are dropped; `text`, the one parameter of the link
++     *  format, stays. Any other address is left as it is. */
++    static String pureLink(Uri d) {
++        final String host = d.getHost() != null ? d.getHost().toLowerCase(java.util.Locale.ROOT) : "";
++        if (!host.equals("wa.me") && !host.equals("api.whatsapp.com") || d.getQuery() == null) {
++            return d.toString();
++        }
++        final Uri.Builder b = d.buildUpon().clearQuery();
++        final String text = d.getQueryParameter("text");
++        if (text != null) b.appendQueryParameter("text", text);
++        return b.build().toString();
++    }
++
++    /** The row queryIntentActivities lists for an intent addressed to a companion
++     *  it performs; null otherwise. */
++    static ResolveInfo resolveInfo(Intent intent) {
++        if (hostUrlFor(intent) == null) return null;
++        final String pkg = addressedTo(intent);
++        android.content.IntentFilter f = new android.content.IntentFilter();
++        f.addAction(intent.getAction());
++        f.addCategory(Intent.CATEGORY_DEFAULT);
++        if (Intent.ACTION_VIEW.equals(intent.getAction())) {
++            f.addCategory(Intent.CATEGORY_BROWSABLE);
++            f.addDataScheme(intent.getData().getScheme());
++        } else {
++            try { f.addDataType("text/plain"); } catch (Throwable ignored) { }
++        }
++        ResolveInfo ri = new ResolveInfo();
++        ri.filter = f;
++        ri.match = android.content.IntentFilter.MATCH_CATEGORY_SCHEME;
++        ActivityInfo ai = new ActivityInfo();
++        ai.name = ACTIVITY;
++        ai.packageName = pkg;
++        ai.exported = true;
++        ai.enabled = true;
++        ai.applicationInfo = applicationInfo(pkg);
++        ri.activityInfo = ai;
++        return ri;
++    }
++
++    /** ActivityHost: a start addressed to a companion. True when it was the
++     *  companion's to perform (opened on the Mac, or refused by the link policy). */
++    static boolean start(Intent intent) {
++        if (!isCompanion(addressedTo(intent))) return false;
++        final String url = hostUrlFor(intent);
++        if (url == null) {
++            NativeLog.w(TAG, "start for " + addressedTo(intent) + " not performed on the Mac: action="
++                + intent.getAction() + " data=" + intent.getDataString());
++            return false;
++        }
++        ActivityHost.openHostUrlGated(url, intent.getAction() + " for " + addressedTo(intent));
++        return true;
++    }
++}
+diff --git a/runtime/java/com/macapk/loader/MacApkPackageManager.java b/runtime/java/com/macapk/loader/MacApkPackageManager.java
+--- a/runtime/java/com/macapk/loader/MacApkPackageManager.java
++++ b/runtime/java/com/macapk/loader/MacApkPackageManager.java
+@@ -210,6 +210,9 @@ public final class MacApkPackageManager extends PackageManager {
+         // NSWorkspace. It advertises no capability we cannot honour -- note
+         // resolveService stays null for CustomTabsService, which is what makes
+         // AppAuth set useCustomTab=false and fall back to plain ACTION_VIEW.
++        // A package the Mac stands in for (HostCompanions: WhatsApp's links) is
++        // the same kind of answer.
++        if (HostCompanions.isCompanion(packageName)) return HostCompanions.packageInfo(packageName);
+         if (MACAPK_HOST_PACKAGE.equals(packageName)) {
+             PackageInfo hi = new PackageInfo();
+             hi.packageName = MACAPK_HOST_PACKAGE;
+@@ -1107,6 +1110,7 @@ public final class MacApkPackageManager extends PackageManager {
+             MacApkPackageManager peer = SystemClient.pmFor(packageName);
+             if (peer != null && peer != this) return peer.getApplicationInfo(packageName, flags);
+         }
++        if (HostCompanions.isCompanion(packageName)) return HostCompanions.applicationInfo(packageName);
+         // Same AOSP contract as getPackageInfo: a non-installed (non-self) package
+         // throws NameNotFoundException. A NULL name is not our package either --
+         // it names nothing, so it cannot be installed, and AOSP throws rather
+@@ -2991,6 +2995,13 @@ public final class MacApkPackageManager extends PackageManager {
+         final boolean scope = macapkIntentPkgScope();
+         final String want = scope ? intent.getPackage() : null;
+         final Intent query = macapkResolutionIntent(intent);
++        // A package the Mac stands in for (HostCompanions): its one row for what
++        // the Mac performs, nothing for the rest.
++        if (HostCompanions.isCompanion(HostCompanions.addressedTo(intent))) {
++            ResolveInfo ri = HostCompanions.resolveInfo(intent);
++            if (ri != null) out.add(ri);
++            return out;
++        }
+         // com.google.android.gms's Google sign-in activity (GoogleSignInBroker):
+         // answered before the per-package scans because neither of them knows
+         // the GMS package. MACAPK_GMS_SIGNIN=0 -> null -> the pre-provider path.
+diff --git a/runtime/java/com/macapk/loader/ActivityHost.java b/runtime/java/com/macapk/loader/ActivityHost.java
+--- a/runtime/java/com/macapk/loader/ActivityHost.java
++++ b/runtime/java/com/macapk/loader/ActivityHost.java
+@@ -2785,6 +2802,9 @@ public final class ActivityHost {
+         }
+         final String own = app != null ? app.getPackageName() : null;
+         final ComponentName cn = intent.getComponent();
++        // A package the Mac stands in for (HostCompanions: WhatsApp's links),
++        // addressed by component or by setPackage: performed on the Mac.
++        if (HostCompanions.start(intent)) return null;
+         if (cn != null) {
+             final String pkg = cn.getPackageName();
+             // A caller may pin the exact Settings component returned by our

@@ -1,0 +1,126 @@
+Idle frames: hidden ProgressBar stops repainting; a relaunched window keeps its place; invalidate census names layout requests
+
+ProgressBar: the indeterminate tick (20 Hz) invalidated even when the bar was hidden (GONE/INVISIBLE itself or under a hidden ancestor, alpha 0, or scrolled out of the window), which repainted the whole window: measured on Instagram's profile, ~20 frames/s with nothing moving, main thread ~19%. It now invalidates only when shown with a visible rect, as AOSP animates only while visible. Profile idle: 225 -> 290 of 300 vsyncs skipped, process CPU 20% -> 13% (10% with MACAPK_FRAMESPEED_HEARTBEAT=1, 298/300 skipped).
+
+CocoaShowWindow: an activity relaunch (rotation, configuration change) re-shows the same window. A window already on screen keeps its place in the window order and takes focus only if the app is active; before, MACAPK_NO_ACTIVATE ordered it behind every window on each rotation and the normal path activated the app over whatever was in front. Injector verb `rotate` (View > Girar).
+
+MACAPK_TRACE_INVALIDATE now also counts scheduleLayout ("layout" vs "draw"), and MACAPK_TRACE_INVALIDATE_STACK=<substring of the census key> prints three full stacks of that source after 30 s.
+
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -3788,6 +3926,17 @@ void CocoaDebugQuitGesture(const char* kind) {
+             macapk_terminate_now(0);
+         } else if (k == "terminate") {
+             [NSApp terminate:nil];
++        } else if (k == "miniaturize") {
++            [g_placeholder_window miniaturize:nil];
++        } else if (k == "deminiaturize") {
++            [g_placeholder_window deminiaturize:nil];
++        } else if (k == "hide") {
++            [NSApp hide:nil];
++        } else if (k == "rotate") {
++            CocoaRotateRender();          // View > Girar / Cmd+R
++        } else if (k == "unhide") {
++            // Back without activating: a harness must not steal the owner's focus.
++            [NSApp unhideWithoutActivation];
+         }
+     });
+ }
+@@ -10539,6 +11685,14 @@ void CocoaShowWindow(void* window) {
+     NSWindow* w = (__bridge NSWindow*)window;
+     dispatch_main_async_void(^{
+         if (MacApkServiceHost()) { /* background service process: never shown */ }
++        else if (w.isVisible || w.isMiniaturized) {
++            // Already on screen (or in the Dock): an activity relaunch -- a rotation,
++            // a configuration change -- re-shows the same window. Leave its place in
++            // the window order alone and take focus only if Instamac already has it:
++            // ordering it back sent the window behind everything on every rotation
++            // (MACAPK_NO_ACTIVATE), activating stole focus from the app in front.
++            if (NSApp.isActive && !w.isMiniaturized) [w makeKeyAndOrderFront:nil];
++        }
+         else if (MacApkHarnessNoActivate()) [w orderBack:nil];
+         else {
+             [w makeKeyAndOrderFront:nil];
+diff --git a/runtime/java/android/widget/ProgressBar.java b/runtime/java/android/widget/ProgressBar.java
+--- a/runtime/java/android/widget/ProgressBar.java
++++ b/runtime/java/android/widget/ProgressBar.java
+@@ -390,6 +390,7 @@ public class ProgressBar extends View {
+      *  established pattern in this package for a continuously-animating
+      *  widget -- so an indeterminate spinner keeps turning while attached
+      *  and stops cleanly (no leaked callbacks) once detached. */
++    private final android.graphics.Rect mAnimVisible = new android.graphics.Rect();
+     private synchronized void macapkUpdateAnim() {
+         boolean want = indeterminate && isAttachedToWindow();
+         if (want == mAnimRunning) return;
+@@ -407,7 +408,15 @@ public class ProgressBar extends View {
+                         // Wikipedia screen kept this tick alive, and the queued
+                         // message pinned the whole activity.
+                         if (mAnimRunning && isAttachedToWindow()) {
+-                            invalidate();
++                            // AOSP animates an indeterminate bar only while it is
++                            // visible (onVisibilityAggregated). A hidden one -- GONE /
++                            // INVISIBLE itself or under a hidden ancestor, or scrolled
++                            // out of the window -- invalidated the whole window 20x/s:
++                            // measured, Instagram's profile repainted ~20 frames/s
++                            // with nothing on screen moving (main thread ~19%).
++                            if (isShown() && getAlpha() > 0f && getGlobalVisibleRect(mAnimVisible)) {
++                                invalidate();
++                            }
+                             mAnimHandler.postDelayed(mAnimTick, 50);
+                         } else {
+                             mAnimRunning = false;
+diff --git a/runtime/java/android/view/ViewRootImpl.java b/runtime/java/android/view/ViewRootImpl.java
+--- a/runtime/java/android/view/ViewRootImpl.java
++++ b/runtime/java/android/view/ViewRootImpl.java
+@@ -87,7 +87,7 @@ public final class ViewRootImpl {
+     public boolean consumeLayoutRequested() { return mLayoutRequested.getAndSet(false); }
+ 
+     /** Convenience for the single-window case: schedule a DRAW (invalidate). */
+-    public static void schedule() { if (INVAL_CENSUS) census(); getInstance().scheduleTraversal(); }
++    public static void schedule() { if (INVAL_CENSUS) census("draw "); getInstance().scheduleTraversal(); }
+     // MACAPK_TRACE_INVALIDATE=1 (diagnostic): WHO keeps the window dirty. Every
+     // schedule() is attributed to its framework entry (View.invalidate,
+     // Drawable.invalidateSelf ...) and the first APP frame that called it, and every
+@@ -100,7 +100,10 @@ public final class ViewRootImpl {
+     static final boolean INVAL_CENSUS = "1".equals(System.getenv("MACAPK_TRACE_INVALIDATE"));
+     private static final java.util.HashMap<String, int[]> sCensus = new java.util.HashMap<>();
+     private static long sCensusT0;
+-    private static void census() {
++    private static final String STACK_NEEDLE = System.getenv("MACAPK_TRACE_INVALIDATE_STACK");
++    private static int sStacksLeft = 3;
++    private static final long STACK_T0 = System.nanoTime();   // steady state only: 30 s in
++    private static void census(String kind) {
+         StackTraceElement[] st = new Throwable().getStackTrace();
+         String entry = "?", app = "?";
+         for (int i = 2; i < st.length; i++) {
+@@ -110,9 +113,19 @@ public final class ViewRootImpl {
+             if (!fw) { app = c + "." + st[i].getMethodName() + ":" + st[i].getLineNumber()
+                     + (i + 1 < st.length ? " <- " + st[i + 1].getClassName() + "." + st[i + 1].getMethodName() : ""); break; }
+         }
++        // MACAPK_TRACE_INVALIDATE_STACK=<substring>: the first 3 full stacks whose
++        // app frame contains it (the census says WHO, this says from WHERE).
++        if (STACK_NEEDLE != null && sStacksLeft > 0
++                && (kind + entry + " | " + app).contains(STACK_NEEDLE)
++                && System.nanoTime() - STACK_T0 > 30_000_000_000L) {
++            sStacksLeft--;
++            StringBuilder sb = new StringBuilder("[inval-stack] " + kind + entry + " | " + app);
++            for (int i = 2; i < Math.min(st.length, 40); i++) sb.append("\n    at ").append(st[i]);
++            com.macapk.loader.NativeLog.i("Mac.apk.Inval", sb.toString());
++        }
+         long now = System.nanoTime();
+         synchronized (sCensus) {
+-            sCensus.computeIfAbsent(entry + " | " + app, k -> new int[1])[0]++;
++            sCensus.computeIfAbsent(kind + entry + " | " + app, k -> new int[1])[0]++;
+             if (sCensusT0 == 0) sCensusT0 = now;
+             if (now - sCensusT0 > 5_000_000_000L) {
+                 StringBuilder sb = new StringBuilder("[inval-census] 5s:");
+@@ -124,7 +137,7 @@ public final class ViewRootImpl {
+         }
+     }
+     /** Convenience for the single-window case: schedule a measure+layout+draw. */
+-    public static void scheduleLayout() { getInstance().requestLayoutTraversal(); }
++    public static void scheduleLayout() { if (INVAL_CENSUS) census("layout "); getInstance().requestLayoutTraversal(); }
+ 
+     // ------------------------------------------------------------------
+     // TOUCH MODE (AOSP ViewRootImpl.ensureTouchMode / enterTouchMode /

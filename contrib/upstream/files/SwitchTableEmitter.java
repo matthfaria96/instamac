@@ -1,0 +1,206 @@
+// SwitchTableEmitter -- split a method whose only control flow is one giant
+// switch over self-contained cases.
+//
+// THE CASE THIS EXISTS FOR (Instagram 455, X/0000.A00, 77,269 bytes): a single
+// switch with 7,737 cases, each `const-string vX, "..."` followed by
+// `return-object vX`, and nothing else in the method. Forward-only splitting
+// cannot place a cut: the part that inherits the switch's successors gets one
+// entry stub per target (measured: 6,211 entries, 83,346 bytes, over the JVM's
+// 65,535 ceiling).
+//
+// THE TRANSFORM: partition the switch's case values into ranges. The original
+// method becomes a driver that picks a part by range; each part is a synthetic
+// static method with its own (smaller) switch and the bodies of its cases:
+//
+//   static String A00(int key) {
+//       if (key >= 0 && key <= 1999) return A00$sw0(key);
+//       ...
+//       return "<default case string>";
+//   }
+//   static String A00$sw0(int key) {
+//       switch (key) { case 0: return "s0"; ... }
+//   }
+//
+// No value crosses a part boundary, so there is no frame, no portal and no
+// parameter beyond the key. The transform refuses anything that is not this
+// exact shape: one switch, every case target a const-string + return-object of
+// the same register, every other instruction a nop, and the switch key equal to
+// the method's own parameter.
+package com.macapk.dex;
+
+import java.util.ArrayList;
+import java.util.List;
+
+final class SwitchTableEmitter {
+
+    static final int CASES_PER_PART = 2000;
+
+    /** DEX2JVM_SWITCH_TABLE=0 disables it (A/B and regression hunting). */
+    private static final boolean ENABLED =
+            !"0".equals(System.getenv("DEX2JVM_SWITCH_TABLE"));
+    private static final boolean DEBUG =
+            System.getenv("DEX2JVM_SWITCH_TABLE_DEBUG") != null;
+
+    private SwitchTableEmitter() {}
+
+    private static void note(DexMethod m, String why) {
+        System.err.println("[switch-table] refused " + m.declaringClass().name() + "."
+                + m.name() + m.proto().descriptor() + ": " + why);
+    }
+
+    /** True when the driver and every part were emitted and the method is complete. */
+    static boolean tryEmit(DexMethod method, DexCode code, ClassFileWriter.MethodWriter mw) {
+        if (!ENABLED) return false;
+
+        String desc = method.proto().descriptor();
+        if (!desc.startsWith("(I)")) return false;          // a single int key
+        String ret = desc.substring(3);
+        if (ret.length() < 2 || ret.charAt(0) != 'L') return false;
+        if (code.tries() != null && !code.tries().isEmpty()) return false;
+
+        Instruction[] all;
+        try {
+            all = InstructionDecoder.decode(code.insns());
+        } catch (RuntimeException e) {
+            return false;
+        }
+
+        List<Instruction> real = new ArrayList<>();
+        Instruction sw = null;
+        for (Instruction i : all) {
+            if (i.isPayload()) continue;
+            int op = i.opcode();
+            if (op == Opcodes.PACKED_SWITCH || op == Opcodes.SPARSE_SWITCH) {
+                if (sw != null) return false;               // exactly one dispatch
+                sw = i;
+            } else if (op != Opcodes.NOP && op != Opcodes.CONST_STRING
+                    && op != Opcodes.CONST_STRING_JUMBO && op != Opcodes.RETURN_OBJECT) {
+                return false;                               // not a pure table
+            }
+            real.add(i);
+        }
+        if (sw == null) return false;
+
+        int[] keys = sw.switchKeys();
+        int[] targets = sw.switchTargets();
+        if (keys == null || targets == null || keys.length != targets.length) return false;
+        if (keys.length < 2 * CASES_PER_PART) return false;
+
+        // The key must be the int parameter itself, or the driver cannot
+        // reconstruct it.
+        boolean isStatic = (method.accessFlags() & ClassFileWriter.ACC_STATIC) != 0;
+        int firstParam = code.registersSize() - code.insSize();
+        int keyReg = isStatic ? firstParam : firstParam + 1;
+        if (sw.a() != keyReg) {
+            note(method, "switch key is not the method parameter");
+            return false;
+        }
+
+        // Every target must be exactly `const-string vX` + `return-object vX`.
+        DexFile dex = method.declaringClass().dex();
+        java.util.Map<Integer, Instruction> at = new java.util.HashMap<>();
+        for (Instruction i : real) at.put(i.address(), i);
+        String[] strings = new String[targets.length];
+        for (int i = 0; i < targets.length; i++) {
+            Instruction c = at.get(targets[i]);
+            if (c == null || (c.opcode() != Opcodes.CONST_STRING
+                    && c.opcode() != Opcodes.CONST_STRING_JUMBO)) return false;
+            Instruction r = at.get(c.nextAddress());
+            if (r == null || r.opcode() != Opcodes.RETURN_OBJECT) return false;
+            if (r.a() != c.a()) return false;               // returns another register
+            strings[i] = dex.string(c.index());
+        }
+        // The default target must be expressible without any state as well.
+        Instruction dflt = at.get(sw.nextAddress());
+        String dfltString;
+        if (dflt != null && dflt.opcode() == Opcodes.RETURN_OBJECT) {
+            note(method, "default returns a non-constant register");
+            return false;
+        } else if (dflt != null && (dflt.opcode() == Opcodes.CONST_STRING
+                || dflt.opcode() == Opcodes.CONST_STRING_JUMBO)) {
+            Instruction r = at.get(dflt.nextAddress());
+            if (r == null || r.opcode() != Opcodes.RETURN_OBJECT || r.a() != dflt.a()) return false;
+            dfltString = dex.string(dflt.index());
+        } else {
+            return false;
+        }
+
+        String owner = method.declaringClass().name();
+        StackMapWriter.Frame partFrame = StackMapWriter.initialFrame(owner, method.name(),
+                desc, true);
+        StackMapWriter.Frame driverFrame = StackMapWriter.initialFrame(owner, method.name(),
+                desc, isStatic);
+        int keySlot = isStatic ? 0 : 1;
+
+        List<Object[]> parts = new ArrayList<>();
+        List<int[]> ranges = new ArrayList<>();
+        for (int from = 0; from < keys.length; from += CASES_PER_PART) {
+            int to = Math.min(keys.length, from + CASES_PER_PART);
+            String name = method.name() + "$sw" + ranges.size();
+            CodeWriter cw = new CodeWriter(mw.owner.pool());
+            cw.setInitialFrame(partFrame);
+            cw.setMaxLocals(1);
+            cw.setMaxStack(2);
+
+            int k = to - from;
+            int[] ks = new int[k];
+            CodeWriter.Label[] ls = new CodeWriter.Label[k];
+            CodeWriter.Label miss = cw.newLabel("sw$miss");
+            for (int i = 0; i < k; i++) {
+                ks[i] = keys[from + i];
+                ls[i] = cw.newLabel("sw$" + i);
+            }
+            cw.varOp(CodeWriter.ILOAD, 0);
+            cw.lookupSwitch(miss, ks, ls);
+            for (int i = 0; i < k; i++) {
+                cw.mark(ls[i]);
+                cw.putFrame(ls[i], partFrame);
+                cw.ldcString(strings[from + i]);
+                cw.op(CodeWriter.ARETURN);
+            }
+            // Unreachable when the driver's range check is right; null keeps the
+            // verifier's frame for `miss` identical to every case label.
+            cw.mark(miss);
+            cw.putFrame(miss, partFrame);
+            cw.op(CodeWriter.ACONST_NULL);
+            cw.op(CodeWriter.ARETURN);
+            parts.add(new Object[]{ name, "(I)" + ret, cw });
+            ranges.add(new int[]{ keys[from], keys[to - 1] });
+        }
+
+        // Driver in the original method.
+        CodeWriter drv = mw.newCode();
+        drv.setInitialFrame(driverFrame);
+        drv.setMaxLocals(isStatic ? 1 : 2);
+        drv.setMaxStack(2);
+        for (int p = 0; p < parts.size(); p++) {
+            CodeWriter.Label next = drv.newLabel("sw$next" + p);
+            drv.varOp(CodeWriter.ILOAD, keySlot);
+            drv.pushInt(ranges.get(p)[0]);
+            drv.jump(CodeWriter.IF_ICMPLT, next);
+            drv.varOp(CodeWriter.ILOAD, keySlot);
+            drv.pushInt(ranges.get(p)[1]);
+            drv.jump(CodeWriter.IF_ICMPGT, next);
+            drv.varOp(CodeWriter.ILOAD, keySlot);
+            drv.methodOp(CodeWriter.INVOKESTATIC, owner, (String) parts.get(p)[0],
+                         (String) parts.get(p)[1], false);
+            drv.op(CodeWriter.ARETURN);
+            drv.mark(next);
+            drv.putFrame(next, driverFrame);
+        }
+        drv.ldcString(dfltString);
+        drv.op(CodeWriter.ARETURN);
+
+        // Only now, with every part measured and no exception thrown, do the
+        // synthetic methods join the class.
+        for (Object[] p : parts) {
+            ((CodeWriter) p[2]).measuredLength();
+            mw.owner.addMethod(ClassFileWriter.ACC_PRIVATE | ClassFileWriter.ACC_STATIC
+                               | ClassFileWriter.ACC_SYNTHETIC,
+                               (String) p[0], (String) p[1]).setCode((CodeWriter) p[2]);
+        }
+        System.err.println("[switch-table] " + owner + "." + method.name() + desc
+                + ": " + keys.length + " cases, " + parts.size() + " parts");
+        return true;
+    }
+}

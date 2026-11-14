@@ -1,0 +1,43 @@
+bionic shim: the file-mode heal leaves read-only files alone
+
+macapk_heal_app_data_modes walks the app's data directory at every start and
+gave owner read+write back to any regular file missing either bit. A file its
+owner can read but not write is not the va_arg poison the heal exists for (0000,
+0300): it is deliberate. On API 34 dynamically loaded code must be read-only, so
+an app marks a downloaded module File.setReadOnly() and refuses it when it is
+writable again. Instagram 455 threw "Downloaded module file must be read only"
+for every downloaded module at every launch (pytorch, executorch), and its Mantle
+module download reported failure.
+
+Only a file the owner cannot read is healed now. After: 0 such errors, the
+modules stay 0444 across launches and load ("Split loaded: executorch").
+
+diff --git a/runtime/translator/src/bionic_shim.cpp b/runtime/translator/src/bionic_shim.cpp
+--- a/runtime/translator/src/bionic_shim.cpp
++++ b/runtime/translator/src/bionic_shim.cpp
+@@ -41828,8 +41930,15 @@ static bool macapk_is_proc_pid_file(const std::string& s, const char* name) {
+ // disk). Even with the open() fix, OPENING an existing mode-0000 file returns
+ // EACCES (no perms for anyone, incl. owner), so the fixed code would still
+ // inherit the poisoned tree -> the UnauthorizedAccessException storm persists.
+-// Walk the app data dir once and restore owner rwx where it is missing (files
++// Walk the app data dir once and restore owner access where it is missing (files
+ // 0644, dirs 0755); files already sane are skipped. Idempotent; runs once.
++//
++// A file the owner can READ but not write is not poison, it is deliberate: on
++// API 34 dynamically loaded code must be read-only, so an app marks a
++// downloaded module File.setReadOnly() and refuses to load it once it is
++// writable again (Instagram 455: "Downloaded module file must be read only",
++// every launch, for each of its downloaded modules). Only a file its owner
++// cannot read is healed -- the observed poison (0000, 0300) always is one.
+ static void macapk_heal_app_data_modes() {
+     const char* root = __macapk_get_android_root();
+     const char* sub  = __macapk_get_data_subdir();
+@@ -41841,7 +41950,7 @@ static void macapk_heal_app_data_modes() {
+                 if ((sb->st_mode & 0700) != 0700)
+                     chmod(fp, (sb->st_mode & ~(mode_t)0777) | 0755);
+             } else if (S_ISREG(sb->st_mode)) {
+-                if ((sb->st_mode & 0600) != 0600)
++                if ((sb->st_mode & 0400) == 0)
+                     chmod(fp, (sb->st_mode & ~(mode_t)0777) | 0644);
+             }
+             return 0;

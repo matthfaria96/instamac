@@ -1,0 +1,61 @@
+harness: `dump` inject verb draws a frame and dumps the view tree now
+
+The harness text dump runs every MACAPK_DUMP_TREE_EVERY frames, and an idle
+screen draws a frame only now and then (5 fps measured), so a dump read after a
+tap could be minutes old. The `dump` verb sets a flag the next frame consumes
+and invalidates the decor view, so that frame is drawn at once. Runs only when
+MACAPK_DUMP_TREE_EVERY is set.
+
+diff --git a/runtime/java/com/macapk/loader/TouchDispatcher.java b/runtime/java/com/macapk/loader/TouchDispatcher.java
+--- a/runtime/java/com/macapk/loader/TouchDispatcher.java
++++ b/runtime/java/com/macapk/loader/TouchDispatcher.java
+@@ -1423,6 +1423,7 @@ public final class TouchDispatcher {
+         if (v.equals("hostkeyup") && n >= 2) return "hostkeyup";
+         if (v.equals("text") && n >= 2) return "text";
+         if (v.equals("sleep") && n >= 2) return "sleep";
++        if (v.equals("dump")) return "dump";
+         // Host trackpad (cocoa_bridge.mm CocoaDebugTrackpad): the NSTouch frame /
+         // magnify body a real trackpad runs, entered below the NSEvent decode.
+         if (v.equals("trackpad") && n >= 3) return fractionsInRange(p, 2) ? "trackpad" : "reject";
+@@ -1512,6 +1513,11 @@ public final class TouchDispatcher {
+             case "sleep":
+                 Thread.sleep(Long.parseLong(p[1]));
+                 break;
++            case "dump":
++                // The harness dumps (MACAPK_DUMP_TREE_EVERY) on the next frame, which
++                // is drawn now: an idle screen draws a frame only now and then.
++                ViewCanvasDriver.macapkRequestDump();
++                break;
+             case "trackpad": {
+                 // trackpad <cursor fx> <cursor fy> [<id>:<phase>:<nx>:<ny> ...]
+                 // phase as cocoa_bridge.mm flattens NSTouchPhase (0 began, 1 moved,
+diff --git a/runtime/java/com/macapk/loader/ViewCanvasDriver.java b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -38,6 +38,18 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+     private static final String ENV_MACAPK_DUMP_CL_WIDGETS = System.getenv("MACAPK_DUMP_CL_WIDGETS");
+     private static final String ENV_MACAPK_DUMP_MOTION = System.getenv("MACAPK_DUMP_MOTION");
+     private static final String ENV_MACAPK_DUMP_TREE_EVERY = System.getenv("MACAPK_DUMP_TREE_EVERY");
++    private static volatile boolean sDumpNow;
++
++    /** @hide The injector's `dump`: the harness dump on the next frame, and that
++     *  frame drawn now (MACAPK_DUMP_TREE_EVERY runs only). */
++    static void macapkRequestDump() {
++        if (ENV_MACAPK_DUMP_TREE_EVERY == null) return;
++        sDumpNow = true;
++        try {
++            android.app.Activity a = ActivityHost.peek();
++            if (a != null && a.getWindow() != null) a.getWindow().getDecorView().postInvalidate();
++        } catch (Throwable ignored) { }
++    }
+     private static final String ENV_MACAPK_GROW_FITS_APPBAR = System.getenv("MACAPK_GROW_FITS_APPBAR");
+     private static final String ENV_MACAPK_KEEP_NAV_CENTER = System.getenv("MACAPK_KEEP_NAV_CENTER");
+     private static final String ENV_MACAPK_M6_FORCE_DRAW = System.getenv("MACAPK_M6_FORCE_DRAW");
+@@ -1598,6 +1610,7 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
+             String de = ENV_MACAPK_DUMP_TREE_EVERY;
+             if (de != null) { long iv = Long.parseLong(de); dumpEvery = iv > 0 && (n % iv) == 0; }
+         } catch (Throwable ignored) {}
++        if (sDumpNow && ENV_MACAPK_DUMP_TREE_EVERY != null) { sDumpNow = false; dumpEvery = true; }
+         if (n == 1 || n == 60 || n == 300 || dumpEvery) {
+             try { dumpTree(rootView, 0, new StringBuilder()); }
+             catch (Throwable ignored) {}

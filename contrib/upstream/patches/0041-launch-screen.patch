@@ -1,0 +1,230 @@
+launch screen: the app's icon and name instead of a black window while it boots
+
+The window opened black and stayed black for the whole boot (5-17 s for
+Instagram). It now shows the app's icon (breathing slowly), its name and a small
+native spinner on the window material (NSVisualEffectView, follows light/dark),
+and fades out at the first presented frame that is not one flat colour (an 8x8
+sample of the retained canvas/GL snapshot, polled every 150 ms on the main
+thread), or after 45 s. Kept above the render view across content-view swaps.
+MACAPK_LAUNCH_SCREEN=0 turns it off. ARC translation unit.
+
+diff --git a/runtime/src/launch_screen.mm b/runtime/src/launch_screen.mm
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/launch_screen.mm
+@@ -0,0 +1,126 @@
++// launch_screen.mm -- what the window shows while the app boots: the app's icon
++// and name on the window's own material, with a spinner, until the app draws.
++//
++// Without it the window opens black and stays black for the whole boot (5-8 s
++// for Instagram), which reads as "stuck". A native Mac app shows its own face
++// immediately; this is that face, built only from AppKit pieces so it follows
++// the system appearance (light/dark) and accessibility settings by itself.
++//
++// It lives inside the letterbox container, above the render view, and leaves
++// with a short fade at the first presented frame that is not one flat colour
++// (CocoaLatestFrameHasContent): an app's starting window is a solid fill, its
++// first real frame is not. 45 s without content also ends it, so a guest that
++// presents through a path we do not sample is never covered for long.
++// MACAPK_LAUNCH_SCREEN=0 turns it off.
++//
++// ARC translation unit (see CMakeLists.txt): the timer and animation blocks own
++// what they capture.
++#import <Cocoa/Cocoa.h>
++#import <QuartzCore/QuartzCore.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++extern "C" bool CocoaLatestFrameHasContent(void);   // cocoa_bridge.mm
++
++static NSView* g_launch = nil;
++static NSTimer* g_launch_timer = nil;
++static CFTimeInterval g_launch_t0 = 0;
++
++extern "C" bool LaunchScreenIs(NSView* v) { return v != nil && v == g_launch; }
++
++extern "C" void LaunchScreenKeepOnTop(void) {
++    if (g_launch && g_launch.superview) {
++        [g_launch.superview addSubview:g_launch positioned:NSWindowAbove relativeTo:nil];
++    }
++}
++
++static void launch_screen_hide(const char* why) {
++    if (!g_launch) return;
++    [g_launch_timer invalidate];
++    g_launch_timer = nil;
++    NSView* v = g_launch;
++    g_launch = nil;
++    std::fprintf(stderr, "[I] cocoa: launch screen off after %.1f s (%s)\n",
++                 CACurrentMediaTime() - g_launch_t0, why);
++    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
++        ctx.duration = 0.3;
++        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
++        v.animator.alphaValue = 0.0;
++    } completionHandler:^{
++        [v removeFromSuperview];
++    }];
++}
++
++static NSString* app_name(void) {
++    const char* label = std::getenv("MACAPK_APP_LABEL");
++    if (label && label[0]) return [NSString stringWithUTF8String:label];
++    NSString* n = [[NSRunningApplication currentApplication] localizedName];
++    return n.length ? n : @"";
++}
++
++extern "C" void LaunchScreenShow(NSView* container) {
++    const char* off = std::getenv("MACAPK_LAUNCH_SCREEN");
++    if (!container || g_launch || (off && std::strcmp(off, "0") == 0)) return;
++
++    NSVisualEffectView* fx = [[NSVisualEffectView alloc] initWithFrame:container.bounds];
++    fx.material = NSVisualEffectMaterialUnderWindowBackground;
++    fx.blendingMode = NSVisualEffectBlendingModeBehindWindow;
++    fx.state = NSVisualEffectStateActive;
++    fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++
++    NSImageView* icon = [NSImageView imageViewWithImage:[NSApp applicationIconImage]];
++    icon.imageScaling = NSImageScaleProportionallyUpOrDown;
++    NSShadow* shadow = [[NSShadow alloc] init];
++    shadow.shadowColor = [NSColor colorWithWhite:0 alpha:0.28];
++    shadow.shadowBlurRadius = 18;
++    shadow.shadowOffset = NSMakeSize(0, -6);
++    icon.shadow = shadow;
++    icon.wantsLayer = YES;
++
++    NSTextField* name = [NSTextField labelWithString:app_name()];
++    name.font = [NSFont systemFontOfSize:24 weight:NSFontWeightSemibold];
++    name.textColor = [NSColor labelColor];
++
++    NSProgressIndicator* spin = [[NSProgressIndicator alloc] init];
++    spin.style = NSProgressIndicatorStyleSpinning;
++    spin.controlSize = NSControlSizeSmall;
++    spin.indeterminate = YES;
++    spin.displayedWhenStopped = NO;
++    [spin startAnimation:nil];
++
++    NSStackView* stack = [NSStackView stackViewWithViews:@[ icon, name, spin ]];
++    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
++    stack.alignment = NSLayoutAttributeCenterX;
++    stack.spacing = 16;
++    [stack setCustomSpacing:30 afterView:name];
++    stack.translatesAutoresizingMaskIntoConstraints = NO;
++    [fx addSubview:stack];
++    [NSLayoutConstraint activateConstraints:@[
++        [icon.widthAnchor constraintEqualToConstant:128],
++        [icon.heightAnchor constraintEqualToConstant:128],
++        [stack.centerXAnchor constraintEqualToAnchor:fx.centerXAnchor],
++        // A touch above the middle: the optical centre of a portrait window.
++        [stack.centerYAnchor constraintEqualToAnchor:fx.centerYAnchor constant:-24],
++    ]];
++
++    [container addSubview:fx positioned:NSWindowAbove relativeTo:nil];
++    g_launch = fx;
++    g_launch_t0 = CACurrentMediaTime();
++
++    // The icon breathes, slowly, so the window is visibly alive.
++    CABasicAnimation* breathe = [CABasicAnimation animationWithKeyPath:@"opacity"];
++    breathe.fromValue = @1.0;
++    breathe.toValue = @0.78;
++    breathe.duration = 1.4;
++    breathe.autoreverses = YES;
++    breathe.repeatCount = HUGE_VALF;
++    breathe.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
++    [icon.layer addAnimation:breathe forKey:@"breathe"];
++
++    g_launch_timer = [NSTimer timerWithTimeInterval:0.15 repeats:YES block:^(NSTimer*) {
++        if (CocoaLatestFrameHasContent()) launch_screen_hide("first frame with content");
++        else if (CACurrentMediaTime() - g_launch_t0 > 45.0) launch_screen_hide("45 s without content");
++    }];
++    [[NSRunLoop mainRunLoop] addTimer:g_launch_timer forMode:NSRunLoopCommonModes];
++}
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -323,6 +324,10 @@ static bool SurfaceSizeTraceOn() {
+ // the activity DOES call setContentView later, it replaces this
+ // placeholder's content view via the same NSWindow.
+ static NSWindow* g_placeholder_window = nil;
++// launch_screen.mm: the boot screen shown over the render view until the app draws.
++extern "C" void LaunchScreenShow(NSView* container);
++extern "C" bool LaunchScreenIs(NSView* v);
++extern "C" void LaunchScreenKeepOnTop(void);
+ 
+ // Re-center the placeholder window on its screen's visible frame on the NEXT
+ // main-queue cycle. The window is aspect-ratio-locked, and AppKit shrinks an
+@@ -3167,6 +3207,29 @@ static void MacapkSnapshotDc(const uint8_t* rgba, int w, int h) {
+ // consumer (debug/rendercheck.sh, recap_*, sweep.sh) is unchanged. At worst a
+ // busy app has retained a newer frame by the time the block runs, which no
+ // consumer of the line distinguishes.
++// Whether the last presented frame (canvas or GL path) is more than one flat
++// colour, read on an 8x8 grid: an app's starting window is a solid fill, its first
++// real frame is not. The boot screen (launch_screen.mm) leaves on the first true.
++extern "C" bool CocoaLatestFrameHasContent(void) {
++    std::lock_guard<std::mutex> lk(g_snap_mu);
++    auto varied = [](const std::vector<uint8_t>& px, int w, int h) {
++        if (w <= 0 || h <= 0 || px.size() < (size_t)w * h * 4) return false;
++        const uint32_t* p = reinterpret_cast<const uint32_t*>(px.data());
++        uint32_t first = 0;
++        for (int gy = 0; gy < 8; gy++) {
++            for (int gx = 0; gx < 8; gx++) {
++                const uint32_t c = p[(size_t)((2 * gy + 1) * h / 16) * w + (2 * gx + 1) * w / 16]
++                                   & 0x00ffffffu;
++                if (gx == 0 && gy == 0) first = c;
++                else if (c != first) return true;
++            }
++        }
++        return false;
++    };
++    return varied(g_snap_canvas, g_snap_canvas_w, g_snap_canvas_h)
++        || varied(g_snap_dc, g_snap_dc_w, g_snap_dc_h);
++}
++
+ static void MacapkScoreSnapshotAsync(bool dc) {
+     static dispatch_queue_t q = dispatch_queue_create("macapk.frame-score",
+                                                       DISPATCH_QUEUE_SERIAL);
+@@ -4171,6 +4265,7 @@ bool CocoaInit() {
+         g_letterbox_container.autoresizingMask =
+             NSViewWidthSizable | NSViewHeightSizable;
+         [g_placeholder_window setContentView:g_letterbox_container];
++        LaunchScreenShow(g_letterbox_container);
+ 
+         // v1.0.503: lock the window to the app's aspect ratio so a corner-drag
+         // can only resize along w:h and never distorts the content; the
+@@ -10489,6 +11437,7 @@ void CocoaSetWindowContentView(void* window, void* content_view) {
+             // sends. No-op when nothing is down.
+             macapk_cancel_active_touch("content-view-swap");
+             for (NSView* sub in [[g_letterbox_container subviews] copy]) {
++                if (LaunchScreenIs(sub)) continue;   // stays until the app draws
+                 [sub removeFromSuperview];
+             }
+             // v1.0.503: aspect-FIT the render view into the container (was: pin
+@@ -10512,6 +11461,7 @@ void CocoaSetWindowContentView(void* window, void* content_view) {
+             [v setFrame:frame];
+             v.autoresizingMask = NSViewNotSizable;
+             [g_letterbox_container addSubview:v];
++            LaunchScreenKeepOnTop();
+             // v1.0.1649: lay it out through the container once, so the letterbox
+             // background (bars) matches a view swapped in mid-letterbox too.
+             if (g_wp.active) refit_letterbox_main();
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -166,6 +166,7 @@ set(MACAPK_RUNTIME_SOURCES
+     # linked, so no app pays for loading it at boot. docs/photos-library-mediastore_2026-09-29.md
+     src/photos_bridge.mm
+     src/document_picker.mm
++    src/launch_screen.mm
+     src/gms_signin.mm
+     src/user_verification_bridge.mm
+     src/media_decode.mm
+@@ -207,6 +208,9 @@ set_source_files_properties(src/applink_window.mm PROPERTIES
+ # that outlive the JNI call (dispatch_async, then the panel's completion handler).
+ set_source_files_properties(src/document_picker.mm PROPERTIES
+     COMPILE_OPTIONS "-fobjc-arc")
++# launch_screen.mm: the boot screen's timer and fade blocks own what they capture.
++set_source_files_properties(src/launch_screen.mm PROPERTIES
++    COMPILE_OPTIONS "-fobjc-arc")
+ set_source_files_properties(src/proxy_settings.mm
+     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+ # photos_bridge.mm: PhotoKit completion handlers capture state across threads.

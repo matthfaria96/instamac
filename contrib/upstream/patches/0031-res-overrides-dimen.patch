@@ -1,0 +1,46 @@
+MACAPK_RES_OVERRIDES: a dimen value the host product chooses over the APK's, by name
+
+"dimen/<name>=<value>;..." replaces the value a resource table row loads for
+that dimen, in every configuration, so every reader (Resources.getDimension*,
+TypedArray through a @dimen reference) sees it. Instamac uses it for
+dimen/igds_chip_radius=8dp: Instagram 455 declares 99dp (pill-shaped chips),
+while the owner's phone shows the same chips as rounded rectangles.
+
+diff --git a/runtime/java/com/macapk/loader/ResourceIndex.java b/runtime/java/com/macapk/loader/ResourceIndex.java
+--- a/runtime/java/com/macapk/loader/ResourceIndex.java
++++ b/runtime/java/com/macapk/loader/ResourceIndex.java
+@@ -2930,7 +3009,8 @@ public final class ResourceIndex {
+                     // ("@dimen/x", chased at read time), AND the float
+                     // <item type="dimen"> form the text loader missed (it
+                     // only read <dimen> tags).
+-                    dimenValues.put(name, value);
++                    String over = RES_OVERRIDES.get("dimen/" + name);
++                    dimenValues.put(name, over != null ? over : value);
+                     ++n[9];
+                 }
+                 return;
+@@ -3041,6 +3121,24 @@ public final class ResourceIndex {
+      *  solve). */
+     private final Map<String, String> dimenValues = new HashMap<>();
+     private final Map<String, String> fractionValues = new HashMap<>();
++
++    /** MACAPK_RES_OVERRIDES="dimen/<name>=<value>;...": a value the host product
++     *  chooses over the APK's, by resource name, for every configuration (the
++     *  launcher's, e.g. Instamac's chips drawn as on the owner's phone). Only
++     *  dimens today. */
++    private static final Map<String, String> RES_OVERRIDES = parseResOverrides(
++        System.getenv("MACAPK_RES_OVERRIDES"));
++    private static Map<String, String> parseResOverrides(String spec) {
++        Map<String, String> out = new HashMap<>();
++        if (spec == null) return out;
++        for (String part : spec.split(";")) {
++            int eq = part.indexOf('=');
++            if (eq <= 0 || eq == part.length() - 1) continue;
++            String key = part.substring(0, eq).trim(), val = part.substring(eq + 1).trim();
++            if (key.startsWith("dimen/") && !val.isEmpty()) out.put(key, val);
++        }
++        return out;
++    }
+     public String getDimenRaw(String name)    {
+         String v = chaseValueRef(dimenValues.get(name), new java.util.HashSet<>());
+         if (v != null) return v;

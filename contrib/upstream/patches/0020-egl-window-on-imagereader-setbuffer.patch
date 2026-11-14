@@ -1,0 +1,704 @@
+EGL window surface on an ImageReader, and Transaction.setBuffer onto a SurfaceView
+
+On API 34+ Instagram's photo editor does not draw into its SurfaceView's Surface.
+It renders with its own EGL context into an ImageReader (RGBA_8888, the size
+surfaceChanged reported) and shows each Image with
+SurfaceControl.Transaction.setBuffer(child, image.getHardwareBuffer(), fence,
+releaseCallback) on a child of SurfaceView.getSurfaceControl(). Here
+EGL14.eglCreateWindowSurface refused the reader's Surface, so the editor opened
+with the photo imported and a black preview.
+
+MacApkGlWindow takes an ImageReader as its consumer next to a SurfaceTexture: the
+same pbuffer read back at eglSwapBuffers, queued as an Image. ImageReader gains
+that producer side (a bounded queue of maxImages, acquireNextImage /
+acquireLatestImage, the AOSP "maxImages has already been acquired" exception) and
+an Image with one RGBA plane, getHardwareBuffer() carrying the pixels and
+getFence(). Bitmap.wrapHardwareBuffer copies such a buffer instead of returning
+an empty bitmap. PixelCopy.request(Surface) answers from the reader's last queued
+frame.
+
+SurfaceControl records parents (Builder.setParent, Transaction.reparent) and the
+SurfaceView a control belongs to; Transaction.setBuffer has the three AOSP
+overloads and apply() shows the buffer through the path a lockCanvas frame takes
+(SurfaceHolderImpl.macapkPost, split out of unlockCanvasAndPost), then reports
+the release from another thread, as a device does. A SurfaceView that receives a
+SurfaceControl child answers its holder by the Canvas rule from then on: the
+view's own size, shown at the view's rect.
+
+Measured on Instagram 455: the surface is re-announced at 412x412 (it was
+412x915, the window), the reader window is created at that size, the first frame
+is shown on the per-surface layer at 0,237, and the editor shows the photo. The
+1080x1080 image the app renders for upload was inspected and is correct. Still
+open: the thumbnail on the "new post" screen stays on its shimmer placeholder.
+Cost: one synchronous glReadPixels plus an ARGB conversion per swap.
+
+diff --git a/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java b/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java
+--- a/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java
++++ b/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java
+@@ -90,6 +90,9 @@ public final class MacApkGlWindow {
+     private final android.opengl.EGLDisplay mDpy;
+     private final android.opengl.EGLConfig mCfg;
+     private final SurfaceTexture mSt;
++    /** The consumer when the native window is an ImageReader's Surface (then mSt
++     *  is null): the reader has a fixed size and takes the frame as an Image. */
++    private final android.media.ImageReader mReader;
+     private volatile android.opengl.EGLSurface mPbuffer;
+     private volatile int mW, mH;
+     private volatile boolean mDestroyed;
+@@ -103,10 +106,11 @@ public final class MacApkGlWindow {
+     private final java.util.function.Consumer<int[]> mRecycler = mFree::offer;
+ 
+     private MacApkGlWindow(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
+-                           SurfaceTexture st) {
++                           SurfaceTexture st, android.media.ImageReader reader) {
+         mDpy = dpy;
+         mCfg = cfg;
+         mSt = st;
++        mReader = reader;
+     }
+ 
+     /** Result of {@link #create}: the window, or the EGL error the caller must
+@@ -120,7 +124,7 @@ public final class MacApkGlWindow {
+     /** Connect to {@code st} as its producer and allocate the pbuffer. */
+     static Created create(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
+                           SurfaceTexture st) {
+-        MacApkGlWindow w = new MacApkGlWindow(dpy, cfg, st);
++        MacApkGlWindow w = new MacApkGlWindow(dpy, cfg, st, null);
+         // AOSP: a second producer (another window surface, a camera, a decoder)
+         // makes native_window_api_connect fail and eglCreateWindowSurface
+         // return EGL_NO_SURFACE with EGL_BAD_ALLOC. An abandoned stream too.
+@@ -137,6 +141,23 @@ public final class MacApkGlWindow {
+         return new Created(w, EGL10.EGL_SUCCESS);
+     }
+ 
++    /** The same window on an ImageReader's Surface: AOSP connects EGL to the
++     *  reader's BufferQueue, whose buffers have the reader's size. */
++    static Created create(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
++                          android.media.ImageReader reader) {
++        MacApkGlWindow w = new MacApkGlWindow(dpy, cfg, null, reader);
++        if (!reader.macapkConnectGlProducer(w)) return new Created(null, EGL10.EGL_BAD_ALLOC);
++        android.opengl.EGLSurface s = newPbuffer(dpy, cfg, reader.getWidth(), reader.getHeight());
++        if (s == null) {
++            reader.macapkDisconnectGlProducer(w);
++            return new Created(null, 0);
++        }
++        w.mPbuffer = s;
++        w.mW = reader.getWidth();
++        w.mH = reader.getHeight();
++        return new Created(w, EGL10.EGL_SUCCESS);
++    }
++
+     private static int[] defaultSize(SurfaceTexture st) {
+         int w = st.macapkGetDefaultWidth(), h = st.macapkGetDefaultHeight();
+         if (w <= 0 || h <= 0) { w = 1; h = 1; }   // BufferQueueCore's default
+@@ -243,7 +264,11 @@ public final class MacApkGlWindow {
+         }
+         // premultipliedSource=true: a GL consumer (updateTexImage) must see the
+         // premultiplied bytes a device buffer holds, not our straight copy.
+-        mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
++        if (mReader != null) {
++            mReader.macapkQueueGlFrame(argb, w, h, System.nanoTime(), mRecycler);
++        } else {
++            mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
++        }
+         mFrames++;
+     }
+ 
+@@ -261,7 +286,7 @@ public final class MacApkGlWindow {
+      * (the old one stays; the next swap retries).
+      */
+     android.opengl.EGLSurface resizeIfNeeded() {
+-        if (mDestroyed) return null;
++        if (mDestroyed || mReader != null) return null;
+         int[] size = defaultSize(mSt);
+         if (size[0] == mW && size[1] == mH) return null;
+         android.opengl.EGLSurface s = newPbuffer(mDpy, mCfg, size[0], size[1]);
+@@ -280,7 +305,8 @@ public final class MacApkGlWindow {
+     boolean destroy() {
+         if (mDestroyed) return true;
+         mDestroyed = true;
+-        mSt.macapkDisconnectProducer(this);
++        if (mReader != null) mReader.macapkDisconnectGlProducer(this);
++        else mSt.macapkDisconnectProducer(this);
+         mFree.clear();
+         return EGL14.eglDestroySurface(mDpy, mPbuffer);
+     }
+@@ -365,6 +391,7 @@ public final class MacApkGlWindow {
+         }
+         final SurfaceTexture st;
+         final String kind;
++        android.media.ImageReader reader = null;
+         if (sur != null) {
+             // android_eglCreateWindowSurface: the list is optional here.
+             if (attribs != null) {
+@@ -392,16 +419,21 @@ public final class MacApkGlWindow {
+                 return EGL14_SURFACEVIEW_WINDOW;
+             }
+             if (st == null) {
+-                // An ImageReader's Surface, a plain Surface (or a SurfaceView's
+-                // under MACAPK_EGL14_SURFACEVIEW_WINDOW=0): no window we can
+-                // produce into.
++                // An ImageReader's Surface: a renderer that hands its frames on as
++                // Images (android_eglCreateWindowSurface makes no difference between
++                // this ANativeWindow and any other).
++                reader = android.media.ImageReader.macapkReaderForSurface(sur);
++            }
++            if (st == null && reader == null) {
++                // A plain Surface (or a SurfaceView's under
++                // MACAPK_EGL14_SURFACEVIEW_WINDOW=0): no window we can produce into.
+                 if (log14()) {
+                     info14("eglCreateWindowSurface(" + win.getClass().getName()
+                         + ") -> EGL_NO_SURFACE (EGL_BAD_NATIVE_WINDOW: not a SurfaceTexture stream)");
+                 }
+                 return EGL14_NOT_A_STREAM;
+             }
+-            kind = "Surface(SurfaceTexture)";
++            kind = st != null ? "Surface(SurfaceTexture)" : "Surface(ImageReader)";
+         } else if (win instanceof SurfaceTexture) {
+             // android_eglCreateWindowSurfaceTexture: the list is REQUIRED.
+             if (attribs == null) throw new IllegalArgumentException("attrib_list == null");
+@@ -418,7 +450,7 @@ public final class MacApkGlWindow {
+         }
+         // The window's own attributes (EGL_RENDER_BUFFER, EGL_GL_COLORSPACE_KHR)
+         // have no pbuffer counterpart; the stream buffer is RGBA8888 sRGB.
+-        Created made = create(dpy, cfg, st);
++        Created made = reader != null ? create(dpy, cfg, reader) : create(dpy, cfg, st);
+         if (made.window == null) {
+             if (log14()) {
+                 info14("eglCreateWindowSurface(" + kind + ") -> EGL_NO_SURFACE"
+@@ -450,7 +482,8 @@ public final class MacApkGlWindow {
+         if (w == null || w.mDestroyed) return 0;
+         w.queueFrame(clientVersion);
+         if (w.mFrames == 1 && log14()) {
+-            info14("eglSwapBuffers -> SurfaceTexture frame #1 (" + w.mW + "x" + w.mH + ")");
++            info14("eglSwapBuffers -> " + (w.mReader != null ? "ImageReader" : "SurfaceTexture")
++                + " frame #1 (" + w.mW + "x" + w.mH + ")");
+         }
+         android.opengl.EGLSurface old = w.resizeIfNeeded();
+         if (old == null) return 0;
+diff --git a/runtime/java/android/media/ImageReader.java b/runtime/java/android/media/ImageReader.java
+--- a/runtime/java/android/media/ImageReader.java
++++ b/runtime/java/android/media/ImageReader.java
+@@ -251,6 +251,8 @@ public class ImageReader implements AutoCloseable {
+      *         attached, or when an Image is still outstanding.
+      */
+     public Image acquireLatestImage() {
++        Image rendered = acquireGlImage(true);
++        if (rendered != null) return rendered;
+         long handle;
+         int negotiatedWidth;
+         int negotiatedHeight;
+@@ -326,7 +328,132 @@ public class ImageReader implements AutoCloseable {
+      * it skip, and this comment is where that behaviour is explained.
+      */
+     public Image acquireNextImage() {
+-        return acquireLatestImage();
++        Image rendered = acquireGlImage(false);
++        return rendered != null ? rendered : acquireLatestImage();
++    }
++
++    // ---- GL producer --------------------------------------------------------
++    // An EGL window surface made on this reader's Surface (MacApkGlWindow) is a
++    // pbuffer read back at each eglSwapBuffers; the frame arrives here as
++    // top-down rows of non-premultiplied ARGB. This is the BufferQueue of the
++    // pair: a swap that finds maxImages frames queued or acquired replaces the
++    // oldest queued one, where a device would block the producer in
++    // dequeueBuffer.
++
++    private static final class GlFrame {
++        final int[] argb;
++        final int width, height;
++        final long timestampNs;
++        final java.util.function.Consumer<int[]> recycler;
++        GlFrame(int[] argb, int width, int height, long timestampNs,
++                java.util.function.Consumer<int[]> recycler) {
++            this.argb = argb; this.width = width; this.height = height;
++            this.timestampNs = timestampNs; this.recycler = recycler;
++        }
++    }
++    private final java.util.ArrayDeque<GlFrame> mGlQueue = new java.util.ArrayDeque<>();
++    private Object mGlProducer;
++    private int mGlAcquired;
++    private boolean mClosed;
++    /** The last frame queued, for PixelCopy (Surface::getLastQueuedBuffer on a
++     *  device). A private copy: a queued array goes back to the producer. */
++    private int[] mGlLast;
++    private int mGlLastWidth, mGlLastHeight;
++
++    /** @hide The last frame a GL producer queued on this reader, or null. */
++    public android.graphics.Bitmap macapkLastGlFrame() {
++        synchronized (mCameraLock) {
++            if (mGlLast == null) return null;
++            return android.graphics.Bitmap.createBitmap(mGlLast, mGlLastWidth, mGlLastHeight,
++                    android.graphics.Bitmap.Config.ARGB_8888);
++        }
++    }
++
++    /** @hide One producer at a time, as native_window_api_connect allows. */
++    public boolean macapkConnectGlProducer(Object producer) {
++        synchronized (mCameraLock) {
++            if (mClosed || (mGlProducer != null && mGlProducer != producer)) return false;
++            mGlProducer = producer;
++            return true;
++        }
++    }
++
++    /** @hide */
++    public void macapkDisconnectGlProducer(Object producer) {
++        synchronized (mCameraLock) {
++            if (mGlProducer == producer) mGlProducer = null;
++        }
++    }
++
++    /** @hide One swapped frame. {@code recycler} takes the array back once
++     *  nothing can read it any more. */
++    public void macapkQueueGlFrame(int[] argb, int width, int height, long timestampNs,
++            java.util.function.Consumer<int[]> recycler) {
++        GlFrame replaced = null;
++        OnImageAvailableListener listener;
++        android.os.Handler handler;
++        synchronized (mCameraLock) {
++            if (mClosed) {
++                recycler.accept(argb);
++                return;
++            }
++            if (mGlQueue.size() + mGlAcquired >= mMaxImages) replaced = mGlQueue.pollFirst();
++            final int n = width * height;
++            if (mGlLast == null || mGlLast.length != n) mGlLast = new int[n];
++            System.arraycopy(argb, 0, mGlLast, 0, n);
++            mGlLastWidth = width;
++            mGlLastHeight = height;
++            mGlQueue.addLast(new GlFrame(argb, width, height, timestampNs, recycler));
++            listener = mListener;
++            handler = mListenerHandler;
++        }
++        if (replaced != null) replaced.recycler.accept(replaced.argb);
++        if (listener == null) return;
++        final OnImageAvailableListener l = listener;
++        Runnable deliver = () -> {
++            try {
++                l.onImageAvailable(this);
++            } catch (Throwable t) {
++                System.err.println("[imagereader] exception from OnImageAvailableListener:");
++                t.printStackTrace();
++            }
++        };
++        if (handler != null) handler.post(deliver);
++        else deliver.run();
++    }
++
++    /** The next (or newest) rendered frame, or null when no GL frame is queued. */
++    private Image acquireGlImage(boolean latest) {
++        GlFrame frame;
++        java.util.ArrayList<GlFrame> skipped = null;
++        synchronized (mCameraLock) {
++            if (mGlQueue.isEmpty()) return null;
++            if (mGlAcquired >= mMaxImages) {
++                throw new IllegalStateException("maxImages (" + mMaxImages
++                        + ") has already been acquired, call #close before acquiring more.");
++            }
++            frame = mGlQueue.pollFirst();
++            while (latest && !mGlQueue.isEmpty()) {
++                if (skipped == null) skipped = new java.util.ArrayList<>();
++                skipped.add(frame);
++                frame = mGlQueue.pollFirst();
++            }
++            mGlAcquired++;
++        }
++        if (skipped != null) {
++            for (GlFrame f : skipped) f.recycler.accept(f.argb);
++        }
++        return new GlImage(this, frame, mFormat);
++    }
++
++    /** {@code pixelsEscaped}: a HardwareBuffer was handed out, and on a device it
++     *  keeps the buffer alive past Image.close(); the array is then left to the
++     *  collector instead of going back to the producer. */
++    void macapkGlImageClosed(GlFrame frame, boolean pixelsEscaped) {
++        synchronized (mCameraLock) {
++            if (mGlAcquired > 0) mGlAcquired--;
++        }
++        if (!pixelsEscaped) frame.recycler.accept(frame.argb);
+     }
+ 
+     /** Called by CameraImage.close(). */
+@@ -370,10 +497,15 @@ public class ImageReader implements AutoCloseable {
+     @Override
+     public void close() {
+         macapkDetachCameraSource();
++        java.util.ArrayList<GlFrame> queued;
+         synchronized (mCameraLock) {
+             mListener = null;
+             mListenerHandler = null;
++            mClosed = true;
++            queued = new java.util.ArrayList<>(mGlQueue);
++            mGlQueue.clear();
+         }
++        for (GlFrame f : queued) f.recycler.accept(f.argb);
+         Surface s;
+         synchronized (sSurfaceOwners) {
+             s = mSurface;
+@@ -425,6 +557,77 @@ public class ImageReader implements AutoCloseable {
+     // stride of 128. An app that assumes rowStride == width gets a sheared
+     // image; one that reads getRowStride() gets the right one.
+ 
++    /** A frame a GL producer rendered: one RGBA_8888 plane, or the same pixels
++     *  as a HardwareBuffer. */
++    static final class GlImage extends Image {
++        private final ImageReader mReader;
++        private final GlFrame mFrame;
++        private final int mImgFormat;
++        private Plane[] mPlanes;
++        private android.hardware.HardwareBuffer mBuffer;
++        private boolean mIsClosed;
++
++        GlImage(ImageReader reader, GlFrame frame, int format) {
++            mReader = reader;
++            mFrame = frame;
++            mImgFormat = format;
++        }
++        private void checkOpen() {
++            if (mIsClosed) throw new IllegalStateException("Image is already closed");
++        }
++        @Override public int getFormat() { checkOpen(); return mImgFormat; }
++        @Override public int getWidth() { checkOpen(); return mFrame.width; }
++        @Override public int getHeight() { checkOpen(); return mFrame.height; }
++        @Override public long getTimestamp() { checkOpen(); return mFrame.timestampNs; }
++
++        @Override public synchronized Plane[] getPlanes() {
++            checkOpen();
++            if (mPlanes == null) {
++                final int w = mFrame.width, n = w * mFrame.height;
++                final int[] argb = mFrame.argb;
++                ByteBuffer rgba = ByteBuffer.allocateDirect(n * 4);
++                for (int i = 0; i < n; i++) {
++                    // A gralloc RGBA_8888 buffer is premultiplied, in R,G,B,A byte order.
++                    final int c = argb[i], a = c >>> 24;
++                    int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
++                    if (a != 0xff) {
++                        r = (r * a + 127) / 255; g = (g * a + 127) / 255; b = (b * a + 127) / 255;
++                    }
++                    rgba.put((byte) r).put((byte) g).put((byte) b).put((byte) a);
++                }
++                rgba.flip();
++                final ByteBuffer pixels = rgba;
++                mPlanes = new Plane[] { new Plane() {
++                    @Override public ByteBuffer getBuffer() { return pixels; }
++                    @Override public int getRowStride() { return w * 4; }
++                    @Override public int getPixelStride() { return 4; }
++                } };
++            }
++            return mPlanes;
++        }
++
++        @Override public synchronized android.hardware.HardwareBuffer getHardwareBuffer() {
++            checkOpen();
++            if (mBuffer == null) {
++                mBuffer = android.hardware.HardwareBuffer.macapkWrap(mFrame.argb, mFrame.width,
++                        mFrame.height, android.hardware.HardwareBuffer.RGBA_8888,
++                        android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
++                                | android.hardware.HardwareBuffer.USAGE_GPU_COLOR_OUTPUT);
++            }
++            return mBuffer;
++        }
++
++        @Override public void close() {
++            final boolean escaped;
++            synchronized (this) {
++                if (mIsClosed) return;
++                mIsClosed = true;
++                escaped = mBuffer != null;
++            }
++            mReader.macapkGlImageClosed(mFrame, escaped);
++        }
++    }
++
+     static final class CameraImage extends Image {
+ 
+         private final ImageReader mReader;
+diff --git a/runtime/java/android/media/Image.java b/runtime/java/android/media/Image.java
+--- a/runtime/java/android/media/Image.java
++++ b/runtime/java/android/media/Image.java
+@@ -80,6 +80,11 @@ public abstract class Image implements AutoCloseable {
+ 
+     private long mQueuedTimestamp;
+ 
++    /** AOSP Image.getFence() (API 33): signals when the producer is done with
++     *  the buffer. Ours is complete before it is queued: nothing to wait for. */
++    public android.hardware.SyncFence getFence() throws java.io.IOException {
++        return android.hardware.SyncFence.createEmpty();
++    }
+     public android.hardware.HardwareBuffer getHardwareBuffer() {
+         int w = 1, h = 1, f = android.hardware.HardwareBuffer.RGBA_8888;
+         try { w = Math.max(1, getWidth()); h = Math.max(1, getHeight()); } catch (Throwable ignored) {}
+diff --git a/runtime/java/android/hardware/HardwareBuffer.java b/runtime/java/android/hardware/HardwareBuffer.java
+--- a/runtime/java/android/hardware/HardwareBuffer.java
++++ b/runtime/java/android/hardware/HardwareBuffer.java
+@@ -68,6 +68,22 @@ public final class HardwareBuffer implements android.os.Parcelable, AutoCloseabl
+         mWidth = width; mHeight = height; mFormat = format; mLayers = layers; mUsage = usage;
+         mId = sNextId.getAndIncrement();
+     }
++
++    /** The pixels of a buffer a GL producer filled (an ImageReader's Image):
++     *  top-down rows of non-premultiplied ARGB, mWidth per row. Null for a
++     *  buffer nothing rendered into. */
++    private int[] mArgb;
++
++    /** @hide */
++    public static HardwareBuffer macapkWrap(int[] argb, int width, int height, int format,
++            long usage) {
++        HardwareBuffer b = new HardwareBuffer(width, height, format, 1, usage);
++        b.mArgb = argb;
++        return b;
++    }
++
++    /** @hide */
++    public int[] macapkArgb() { return mArgb; }
+     public static HardwareBuffer create(int width, int height, int format, int layers, long usage) {
+         if (width <= 0 || height <= 0 || layers <= 0)
+             throw new IllegalArgumentException("Invalid HardwareBuffer dimensions");
+diff --git a/runtime/java/android/graphics/Bitmap.java b/runtime/java/android/graphics/Bitmap.java
+--- a/runtime/java/android/graphics/Bitmap.java
++++ b/runtime/java/android/graphics/Bitmap.java
+@@ -952,8 +952,12 @@ public final class Bitmap implements android.os.Parcelable {
+     public static Bitmap wrapHardwareBuffer(android.hardware.HardwareBuffer hardwareBuffer,
+             android.graphics.ColorSpace colorSpace) {
+         if (hardwareBuffer == null) return null;
+-        return createBitmap(Math.max(1, hardwareBuffer.getWidth()),
+-                Math.max(1, hardwareBuffer.getHeight()), Config.ARGB_8888);
++        int w = Math.max(1, hardwareBuffer.getWidth()), h = Math.max(1, hardwareBuffer.getHeight());
++        Bitmap b = createBitmap(w, h, Config.ARGB_8888);
++        // A buffer a GL producer rendered into (HardwareBuffer.macapkArgb) is copied.
++        int[] argb = hardwareBuffer.macapkArgb();
++        if (argb != null && argb.length >= w * h) b.setPixels(argb, 0, w, 0, 0, w, h);
++        return b;
+     }
+     /** AOSP: a HARDWARE bitmap's pixels live in graphics memory and can never
+      *  be written, so it is immutable regardless of how it was produced. */
+diff --git a/runtime/java/android/view/SurfaceControl.java b/runtime/java/android/view/SurfaceControl.java
+--- a/runtime/java/android/view/SurfaceControl.java
++++ b/runtime/java/android/view/SurfaceControl.java
+@@ -31,6 +31,54 @@ public final class SurfaceControl implements Parcelable {
+     }
+ 
+     public void release() { mValid = false; }
++
++    // ---- buffers set on a SurfaceView's layer -------------------------------
++    // A renderer that draws into an ImageReader shows each Image with
++    // Transaction.setBuffer on a child of SurfaceView.getSurfaceControl()
++    // (Instagram's photo editor on API 34+). There is no SurfaceFlinger here:
++    // the buffer is shown by the SurfaceView the control hangs under, through
++    // the path its lockCanvas frames take.
++    private SurfaceControl mParent;
++    private SurfaceView mOwnerView;
++
++    /** The SurfaceView whose layer this control is (SurfaceView.getSurfaceControl). */
++    void macapkSetOwnerView(SurfaceView view) { mOwnerView = view; }
++
++    private SurfaceView macapkOwnerView() {
++        SurfaceControl sc = this;
++        for (int depth = 0; sc != null && depth < 16; depth++) {
++            if (sc.mOwnerView != null) return sc.mOwnerView;
++            sc = sc.mParent;
++        }
++        return null;
++    }
++
++    private void macapkReparent(SurfaceControl parent) {
++        mParent = parent;
++        SurfaceView owner = macapkOwnerView();
++        if (owner != null && mOwnerView == null) owner.macapkNoteBufferFed();
++    }
++
++    private void macapkShowBuffer(android.hardware.HardwareBuffer buffer,
++            java.util.function.Consumer<android.hardware.SyncFence> releaseCallback) {
++        SurfaceView owner = macapkOwnerView();
++        int[] argb = buffer != null ? buffer.macapkArgb() : null;
++        if (owner != null && argb != null) {
++            owner.macapkPresentBuffer(argb, buffer.getWidth(), buffer.getHeight());
++        }
++        // The present copied the pixels, so the buffer is free again at once. A
++        // device reports that from a binder thread, never inside apply().
++        if (releaseCallback != null) {
++            sReleaser.execute(() -> releaseCallback.accept(android.hardware.SyncFence.createEmpty()));
++        }
++    }
++
++    private static final java.util.concurrent.ExecutorService sReleaser =
++        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
++            Thread t = new Thread(r, "SurfaceControl-release");
++            t.setDaemon(true);
++            return t;
++        });
+     public boolean isValid() { return mValid; }
+     public String getName() { return mName; }
+     public int getWidth() { return mWidth; }
+@@ -165,6 +213,7 @@ public final class SurfaceControl implements Parcelable {
+         private String mName = "SurfaceControl";
+         private int mWidth;
+         private int mHeight;
++        private SurfaceControl mParent;
+ 
+         public Builder() {}
+         public Builder(Object session) {}  // SurfaceSession overload (untyped: no SurfaceSession in tree)
+@@ -178,7 +227,7 @@ public final class SurfaceControl implements Parcelable {
+         public Builder setSecure(boolean secure) { return this; }
+         public Builder setOpaque(boolean opaque) { return this; }
+         public Builder setHidden(boolean hidden) { return this; }
+-        public Builder setParent(SurfaceControl parent) { return this; }
++        public Builder setParent(SurfaceControl parent) { mParent = parent; return this; }
+         public Builder setMetadata(int key, int data) { return this; }
+         public Builder setEffectLayer() { return this; }
+         public Builder setColorLayer() { return this; }
+@@ -189,7 +238,9 @@ public final class SurfaceControl implements Parcelable {
+         public Builder setLocalOwnerView(View view) { return this; }
+ 
+         public SurfaceControl build() {
+-            return new SurfaceControl(mName, mWidth, mHeight);
++            SurfaceControl sc = new SurfaceControl(mName, mWidth, mHeight);
++            if (mParent != null) sc.macapkReparent(mParent);
++            return sc;
+         }
+     }
+ 
+@@ -200,9 +251,23 @@ public final class SurfaceControl implements Parcelable {
+     public static class Transaction implements Closeable, Parcelable {
+         public Transaction() {}
+ 
+-        public void apply() { macapkFireCommitted(); }
+-        public void apply(boolean sync) { macapkFireCommitted(); }
+-        public void applyAsyncUnsafe() {}
++        public void apply() { macapkRunPending(); macapkFireCommitted(); }
++        public void apply(boolean sync) { macapkRunPending(); macapkFireCommitted(); }
++        public void applyAsyncUnsafe() { macapkRunPending(); }
++
++        /** What apply() performs, in the order it was recorded: the few
++         *  operations that have an effect here (reparent, setBuffer). */
++        private java.util.ArrayList<Runnable> mPending;
++        private void macapkRecord(Runnable effect) {
++            if (mPending == null) mPending = new java.util.ArrayList<>(2);
++            mPending.add(effect);
++        }
++        private void macapkRunPending() {
++            java.util.ArrayList<Runnable> pending = mPending;
++            if (pending == null) return;
++            mPending = null;
++            for (int i = 0; i < pending.size(); i++) pending.get(i).run();
++        }
+ 
+         public Transaction setVisibility(SurfaceControl sc, boolean visible) { return this; }
+         public Transaction show(SurfaceControl sc) { return this; }
+@@ -229,9 +294,35 @@ public final class SurfaceControl implements Parcelable {
+         public Transaction setColor(SurfaceControl sc, float[] color) { return this; }
+         public Transaction setOpaque(SurfaceControl sc, boolean isOpaque) { return this; }
+         public Transaction setSecure(SurfaceControl sc, boolean isSecure) { return this; }
+-        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) { return this; }
++        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) {
++            if (sc != null) macapkRecord(() -> sc.macapkReparent(newParent));
++            return this;
++        }
+         public Transaction setBuffer(SurfaceControl sc, Object buffer) { return this; }
+-        public Transaction merge(Transaction other) { return this; }
++        /** AOSP Transaction.setBuffer(SurfaceControl, HardwareBuffer) (API 33). */
++        public Transaction setBuffer(SurfaceControl sc, android.hardware.HardwareBuffer buffer) {
++            return setBuffer(sc, buffer, null, null);
++        }
++        /** AOSP Transaction.setBuffer(SurfaceControl, HardwareBuffer, SyncFence). */
++        public Transaction setBuffer(SurfaceControl sc, android.hardware.HardwareBuffer buffer,
++                android.hardware.SyncFence fence) {
++            return setBuffer(sc, buffer, fence, null);
++        }
++        /** AOSP Transaction.setBuffer(SurfaceControl, HardwareBuffer, SyncFence,
++         *  Consumer&lt;SyncFence&gt;): the callback runs when the buffer may be reused. */
++        public Transaction setBuffer(SurfaceControl sc, android.hardware.HardwareBuffer buffer,
++                android.hardware.SyncFence fence,
++                java.util.function.Consumer<android.hardware.SyncFence> releaseCallback) {
++            if (sc != null) macapkRecord(() -> sc.macapkShowBuffer(buffer, releaseCallback));
++            return this;
++        }
++        public Transaction merge(Transaction other) {
++            if (other != null && other != this && other.mPending != null) {
++                for (Runnable effect : other.mPending) macapkRecord(effect);
++                other.mPending = null;
++            }
++            return this;
++        }
+ 
+         // ---- AOSP API-36 surface completion (android.view lane) -------------
+         // Same contract as every setter above: chain and record, because macOS
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -3917,7 +3917,12 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+             int[] pixels = drawBitmap.macapkLiveArgbOrNull();
+             if (pixels == null) pixels = drawBitmap.macapkArgbBuffer();
+             if (pixels == null) return;
+-            int pw = drawBitmap.getWidth(), ph = drawBitmap.getHeight();
++            macapkPost(pixels, drawBitmap.getWidth(), drawBitmap.getHeight());
++        }
++
++        /** Show one frame of this surface: a lockCanvas post, or a buffer set on
++         *  the view's SurfaceControl (SurfaceView.macapkPresentBuffer). */
++        void macapkPost(int[] pixels, int pw, int ph) {
+             if (owner != null) {
+                 // 2026-09-26: show the frame WHERE its view is (see "where a
+                 // lockCanvas frame is shown" in SurfaceView): its own layer when
+@@ -4067,10 +4072,28 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+             mSurfaceControl = new SurfaceControl.Builder()
+                     .setName("SurfaceView[" + getClass().getSimpleName() + "]")
+                     .build();
++            mSurfaceControl.macapkSetOwnerView(this);
+         }
+         return mSurfaceControl;
+     }
+ 
++    /** A child layer was parented under this view's SurfaceControl: the view
++     *  will be fed buffers (Transaction.setBuffer), not drawn by a renderer.
++     *  Its holder then answers by the Canvas rule -- the view's own size --
++     *  as it does from a first lockCanvas on (macapkHolderSurfaceSize). */
++    void macapkNoteBufferFed() {
++        if (holder.macapkLockedCanvas) return;
++        holder.macapkLockedCanvas = true;
++        NativeLog.i(TAG, "SurfaceControl child on " + getClass().getName()
++            + ": the surface is buffer-fed; it takes the view's size and place");
++    }
++
++    /** One buffer set on this view's layer, or on a child of it. */
++    void macapkPresentBuffer(int[] argb, int w, int h) {
++        holder.macapkLockedCanvas = true;
++        holder.macapkPost(argb, w, h);
++    }
++
+     /** AOSP SurfaceView.applyTransactionToFrame(SurfaceControl.Transaction):
+      *  apply the transaction atomically WITH the next buffer this view posts.
+      *  With no compositor to synchronise against, applying it now is the same
+diff --git a/runtime/java/android/view/PixelCopy.java b/runtime/java/android/view/PixelCopy.java
+--- a/runtime/java/android/view/PixelCopy.java
++++ b/runtime/java/android/view/PixelCopy.java
+@@ -49,7 +49,25 @@ public final class PixelCopy {
+         if (source == null || !source.isValid()) {
+             throw new IllegalArgumentException("Surface isn't valid, source.isValid() == false");
+         }
+-        deliver(listener, listenerThread, ERROR_SOURCE_NO_DATA);
++        // The one Surface whose last queued buffer is in reach: an ImageReader's
++        // that a GL producer renders into. AOSP copies the source rect of that
++        // buffer, scaled to the destination.
++        android.media.ImageReader reader = android.media.ImageReader.macapkReaderForSurface(source);
++        Bitmap last = reader != null ? reader.macapkLastGlFrame() : null;
++        if (last == null) {
++            deliver(listener, listenerThread, ERROR_SOURCE_NO_DATA);
++            return;
++        }
++        Rect src = new Rect(0, 0, last.getWidth(), last.getHeight());
++        if (srcRect != null && !src.intersect(srcRect)) {
++            deliver(listener, listenerThread, ERROR_SOURCE_INVALID);
++            return;
++        }
++        android.graphics.Paint copy = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
++        copy.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC));
++        new android.graphics.Canvas(dest).drawBitmap(last, src,
++                new Rect(0, 0, dest.getWidth(), dest.getHeight()), copy);
++        deliver(listener, listenerThread, SUCCESS);
+     }
+ 
+     public static void request(Window source, Bitmap dest,

@@ -1,0 +1,146 @@
+dex translator: compact locals, a last rescue before the oversize stub
+
+Local slots are numbered in order of first appearance, per (register,
+reading). A load/store of slot 0-3 is 1 byte, of 4-255 is 2, of 256+ is 4
+(wide). A method with several hundred registers therefore pays the wide form
+on most accesses. Translator.COMPACT_LOCALS numbers the slots hottest-first
+instead; DexConverter arms it only for a method every other transform failed
+to bring under 65535, retranslates with no outlining or splitting, and keeps
+the result only if it fits. Every method that already fits is byte-identical.
+
+Measured on Instagram 455 (228,034 classes): exactly one class changes.
+    RESCUED X/09IF.A0p(LX/013g;)LX/06Vi;  code_length 68700 -> 61730
+    X/0bRx.getValues()[I                   73744 -> 68914  (still stubbed)
+A0p is the Litho component that renders a Reel: 805 slots, 492 try ranges and
+loops, which the splitter cannot cut. As a stub it made every Reel -- and any
+video opened with sound -- draw "Esse reel está indisponível".
+
+Applies to the overlay in src/dex (Translator.java, DexConverter.java).
+
+diff --git a/src/dex/DexConverter.java b/src/dex/DexConverter.java
+index 60d9937..e8883b7 100644
+--- a/src/dex/DexConverter.java
++++ b/src/dex/DexConverter.java
+@@ -594,6 +594,31 @@ public final class DexConverter {
+                         System.err.println("[" + Options.logTag + "] oversize <clinit> of "
+                             + cls.name() + " not precomputed: " + refusal);
+                     }
++                    // Last rescue before the stub: the same body with its local
++                    // slots numbered hottest-first (Translator.COMPACT_LOCALS).
++                    // It moves no code and adds no members, so a method that is
++                    // only a few percent over -- too tangled for the splitter,
++                    // with loops and hundreds of try ranges -- can still fit.
++                    {
++                        int compact = -1;
++                        try {
++                            compact = Translator.translateCompactLocals(
++                                m, mw, hierarchy, plan, superIfaces);
++                        } catch (RuntimeException e) {
++                            compact = -1;       // not a size problem: fall to the stub
++                        }
++                        if (compact >= 0 && compact <= 65535) {
++                            System.err.println("[" + Options.logTag + "] RESCUED oversize method "
++                                + cls.name() + "." + m.name() + m.descriptor()
++                                + " by compact locals: code_length " + over + " -> " + compact);
++                            continue;
++                        }
++                        mw.resetCode();
++                        if (compact > 65535) {
++                            System.err.println("[" + Options.logTag + "] compact locals not enough for "
++                                + cls.name() + "." + m.name() + ": " + over + " -> " + compact);
++                        }
++                    }
+                     // Only THIS method is inexpressible; the rest of the class
+                     // is fine. Emit a body that throws with the reason in the
+                     // message, so a caller that actually reaches it says so.
+diff --git a/src/dex/Translator.java b/src/dex/Translator.java
+index 6c411cc..fbdca09 100644
+--- a/src/dex/Translator.java
++++ b/src/dex/Translator.java
+@@ -4289,6 +4299,51 @@ public final class Translator {
+      * actually uses. Slots start above the parameter block, which the JVM
+      * reserves for the incoming arguments.
+      */
++    /**
++     * COMPACT LOCALS: number the local slots hottest-first instead of in order
++     * of first appearance. Armed on this thread only by
++     * {@link #translateCompactLocals}, DexConverter's last rescue before the
++     * oversize stub, so every method that already fits stays byte-identical.
++     *
++     * <p>Why it shrinks a method: a load or store of slot 0-3 is 1 byte, of
++     * slot 4-255 is 2 bytes, and of slot 256+ is 4 (the {@code wide} form,
++     * JVMS 6.5). Slots are handed out per (register, reading), so a method
++     * with several hundred registers puts most of them past 255 and pays the
++     * wide form on the majority of its accesses -- including for the registers
++     * it touches most, when those first appear late. Numbering by use count
++     * gives the short forms to the accesses that are executed and emitted
++     * most. Nothing else changes: the same instructions, the same frames (the
++     * frame builders index by {@code Entry.slot}), a different numbering.
++     *
++     * <p>MEASURED on Instagram 455: {@code X/09IF.A0p}, the Litho component
++     * that renders a Reel, has 805 slots and translated to 68,700 bytes, 3,165
++     * over the limit. It was the oversize stub, so every Reel -- and any video
++     * opened with sound -- drew "Esse reel está indisponível".
++     */
++    static final ThreadLocal<Boolean> COMPACT_LOCALS = ThreadLocal.withInitial(() -> false);
++
++    /**
++     * Translate {@code m} once more with {@link #COMPACT_LOCALS} armed and no
++     * outlining or splitting, leaving the body in {@code mw}. Returns the
++     * code_length it measured, or -1 when the method has no body. The caller
++     * keeps the result only when that fits and resets {@code mw} otherwise.
++     */
++    static int translateCompactLocals(DexMethod m, ClassFileWriter.MethodWriter mw,
++                                      DexType.ClassHierarchy hierarchy, InitRepointPlan plan,
++                                      SuperInterfacePlan superIfaces) {
++        final boolean was = COMPACT_LOCALS.get();
++        COMPACT_LOCALS.set(true);
++        try {
++            translate(m, mw, hierarchy, plan, superIfaces, false);
++            CodeWriter body = mw.code();
++            return body == null ? -1 : body.measuredLength();
++        } catch (CodeWriter.CodeLengthExceeded e) {
++            return e.length;
++        } finally {
++            COMPACT_LOCALS.set(was);
++        }
++    }
++
+     static final class Locals {
+         static final class Entry {
+             final int register, scalar, slot;
+@@ -4306,6 +4361,34 @@ public final class Translator {
+         static Locals allocate(TypeInference.Result types, List<TypeInference.Insn> code,
+                                int registerCount, int argSlots) {
+             Locals l = new Locals(argSlots);
++            if (COMPACT_LOCALS.get()) {
++                // Hot-first numbering (see COMPACT_LOCALS): count every read and
++                // write of each (register, reading), then hand out slots in
++                // descending order. The sort is stable, so equally used entries
++                // keep first-appearance order and the result is deterministic.
++                final Map<Long, int[]> uses = new java.util.LinkedHashMap<>();
++                for (TypeInference.Insn insn : code) {
++                    TypeInference.InsnTypes it = types.typesFor(insn.offset);
++                    if (it == null) continue;
++                    for (TypeInference.Use u : it.uses) {
++                        if (u.scalar != DexType.NONE)
++                            uses.computeIfAbsent(key(u.register, u.scalar), k -> new int[1])[0]++;
++                    }
++                    for (TypeInference.Def d : it.defs) {
++                        for (int scalar : DexType.scalarBits(d.scalars)) {
++                            if (scalar != DexType.NONE)
++                                uses.computeIfAbsent(key(d.register, scalar), k -> new int[1])[0]++;
++                        }
++                    }
++                }
++                List<Map.Entry<Long, int[]>> order = new ArrayList<>(uses.entrySet());
++                order.sort((a, b) -> Integer.compare(b.getValue()[0], a.getValue()[0]));
++                for (Map.Entry<Long, int[]> e : order) {
++                    long k = e.getKey();
++                    l.ensure((int) (k >>> 8), (int) (k & 0xff));
++                }
++                return l;
++            }
+             for (TypeInference.Insn insn : code) {
+                 TypeInference.InsnTypes it = types.typesFor(insn.offset);
+                 if (it == null) continue;

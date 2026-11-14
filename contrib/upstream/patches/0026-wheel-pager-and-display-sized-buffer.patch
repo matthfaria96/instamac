@@ -1,0 +1,245 @@
+wheel over a vertical pager pages it, and a display-sized buffer on a smaller SurfaceView shows its own part
+
+Mouse wheel on a ViewPager2 (Instagram's Reels). Since WheelScroll.ALL every
+wheel notch goes out as ACTION_SCROLL; ViewPager2's RecyclerView scrolls that by
+pixels and never snaps, so a Reel stopped halfway between two. Before that path,
+the synthetic drag sent DOWN, MOVE and UP in one instant, which VelocityTracker
+measures as no velocity, and the pager snapped back.
+- TouchDispatcher.dispatchWheel answers false (keep the drag) when a ViewPager2
+  under the pointer can still move in the wheel's direction (depth-first over
+  every view under the point; by class name, and View.canScrollVertically on its
+  RecyclerView child, which R8 cannot rename). MACAPK_WHEEL_PAGER_DRAG=0 keeps
+  ACTION_SCROLL everywhere.
+- cocoa_bridge.mm, "a wheel burst is a drag" (MACAPK_WHEEL_GESTURE): the notches
+  of one burst (until the wheel is still for 200 ms) make ONE swipe: a quarter of
+  the view's height in six 8 ms steps, released 8 ms after the last move while
+  still moving -- a click-and-drag's release, which pages.
+Measured: four notches down page four Reels, two up page back two (the final
+Reel is the one before the third notch); nothing stops halfway. Lists keep
+ACTION_SCROLL.
+
+SurfaceView.macapkPresentBuffer: a buffer the size of the display on a smaller
+view is the app having sized its ImageReader from the first surfaceChanged
+(display-sized, before the view was known to be buffer-fed) and laid out for
+it. Instagram's photo editor did this on its first open after launch: the
+photo was squeezed 915 -> 412 over the gallery around it; the second open was
+right. The part of the buffer under the view is shown now, where a
+display-sized surface puts it. Measured: first open shows the photo whole.
+
+diff --git a/runtime/java/com/macapk/loader/TouchDispatcher.java b/runtime/java/com/macapk/loader/TouchDispatcher.java
+--- a/runtime/java/com/macapk/loader/TouchDispatcher.java
++++ b/runtime/java/com/macapk/loader/TouchDispatcher.java
+@@ -2463,6 +2463,16 @@ public final class TouchDispatcher {
+         noteRealInput();
+         final float scale = macapkBackingScale();
+         final float px = x * scale, py = (viewH - y) * scale;
++        // A VERTICAL PAGER under the pointer (ViewPager2: Instagram's Reels) takes
++        // the wheel as the host's drag instead (false -> cocoa_bridge.mm "a wheel
++        // burst is a drag"). ACTION_SCROLL scrolls its RecyclerView by pixels and
++        // never snaps, so a Reel stopped halfway; a drag released while moving is
++        // what a pager pages on, as with a click-and-drag. MACAPK_WHEEL_PAGER_DRAG=0
++        // keeps ACTION_SCROLL everywhere.
++        if (!taken && WHEEL_PAGER_DRAG && vscroll != 0f && pagerUnder(a, px, py, vscroll)) {
++            if (WHEEL_TRACE && sWheelLogged++ < 6) NativeLog.i(TAG, "wheel over a vertical pager -> drag");
++            return false;
++        }
+         final MotionEvent ev = wheelEvent(px, py, vscroll, hscroll);
+         Runnable r = taken ? () -> deliverToTakenInputQueue(a, ev)
+                            : () -> deliverWheelToWindows(a, ev);
+@@ -2476,6 +2486,49 @@ public final class TouchDispatcher {
+      *  touch rules, else the activity, whose view tree routes it to the view
+      *  under the pointer (ViewGroup.dispatchGenericPointerEvent). An event no
+      *  view handles is dropped, as on a device; it never becomes a touch. */
++    static final boolean WHEEL_PAGER_DRAG = !"0".equals(System.getenv("MACAPK_WHEEL_PAGER_DRAG"));
++
++    /** True when the deepest views under (x, y) (decor coordinates, display
++     *  pixels) include a ViewPager2 whose page list can still move in the
++     *  wheel's direction (vscroll < 0: toward the next page). By class NAME:
++     *  ViewPager2 is the app's own androidx copy; its RecyclerView child keeps
++     *  View.canScrollVertically, a framework method R8 cannot rename. */
++    static boolean pagerUnder(Activity a, float x, float y, float vscroll) {
++        try {
++            return pagerUnder(a.getWindow().getDecorView(), x, y, vscroll < 0f ? 1 : -1,
++                              new int[2], 0);
++        } catch (Throwable ignored) {
++            return false;
++        }
++    }
++
++    /** Every visible view containing the point, depth first: a transparent
++     *  full-screen sibling drawn over the pager must not hide it. */
++    private static boolean pagerUnder(android.view.View v, float x, float y, int dir,
++                                      int[] loc, int depth) {
++        if (v == null || depth > 40 || v.getVisibility() != android.view.View.VISIBLE) return false;
++        v.getLocationInWindow(loc);
++        if (x < loc[0] || x >= loc[0] + v.getWidth() || y < loc[1] || y >= loc[1] + v.getHeight()) {
++            return false;
++        }
++        if (isViewPager2(v.getClass()) && v instanceof android.view.ViewGroup g
++                && g.getChildCount() > 0 && g.getChildAt(0).canScrollVertically(dir)) {
++            return true;
++        }
++        if (!(v instanceof android.view.ViewGroup g)) return false;
++        for (int i = g.getChildCount() - 1; i >= 0; i--) {
++            if (pagerUnder(g.getChildAt(i), x, y, dir, loc, depth + 1)) return true;
++        }
++        return false;
++    }
++
++    private static boolean isViewPager2(Class<?> c) {
++        for (; c != null && c != android.view.View.class; c = c.getSuperclass()) {
++            if (c.getName().equals("androidx.viewpager2.widget.ViewPager2")) return true;
++        }
++        return false;
++    }
++
+     /** MACAPK_WHEEL_TRACE=1: log where the first wheel steps went. */
+     private static final boolean WHEEL_TRACE = "1".equals(System.getenv("MACAPK_WHEEL_TRACE"));
+     private static int sWheelLogged;
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -11149,6 +12119,16 @@ @implementation MacApkMetalView {
+     BOOL    _scrollDownSent;  // the synthetic ACTION_DOWN has been sent
+     NSPoint _scrollAnchor;    // gesture start, view points (Cocoa y-up)
+     NSPoint _scrollAcc;       // accumulated synthetic-finger offset
++    BOOL    _scrollLiftPending;   // fingers lifted; waiting to see a momentum tail
++    NSUInteger _scrollLiftToken;  // which lift the pending timer belongs to
++    // Mouse-wheel notches turned into ONE drag (see "a wheel burst is a drag"
++    // in macapkScrollAt): the finger's anchor, how far it has travelled, and
++    // which burst the release timer belongs to.
++    BOOL       _wheelActive;
++    NSPoint    _wheelAnchor;
++    NSPoint    _wheelAcc;
++    NSUInteger _wheelToken;
++    CFTimeInterval _wheelQuietUntil;   // notches before this belong to the last swipe
+ 
+     // Host input-method (NSTextInputClient) state. The composition buffer is
+     // ours, not the guest's: we have no read access to the guest editor's text,
+@@ -11944,10 +12950,66 @@ - (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)pr
+             dx *= kWheelMinTravelPt / len;
+             dy *= kWheelMinTravelPt / len;
+         }
+-        NSPoint b = NSMakePoint(p.x + dx, p.y - dy);
++        // A WHEEL BURST IS A DRAG (MACAPK_WHEEL_GESTURE, default on). Each notch
++        // used to be a whole tap-drag -- DOWN, MOVE, UP in the same instant -- so
++        // VelocityTracker saw no time pass and measured no velocity: a pager
++        // (Instagram's Reels, any ViewPager2) took it as a short drag and snapped
++        // BACK to the item it was on. Now the notches of one burst move one
++        // finger: DOWN at the first, the travel spread over a few frames, and
++        // UP shortly after the last while the finger is still moving -- the
++        // release a click-and-drag with the mouse makes, which pages a pager and
++        // flings a list. =0 restores the per-notch tap-drag.
++        static const bool kWheelGesture = []{
++            const char* e = getenv("MACAPK_WHEEL_GESTURE");
++            return !e || e[0] != '0';
++        }();
++        if (!kWheelGesture) {
++            NSPoint b = NSMakePoint(p.x + dx, p.y - dy);
++            [self dispatchTouchAction:0 atPoint:p];
++            [self dispatchTouchAction:2 atPoint:b];
++            [self dispatchTouchAction:1 atPoint:b];
++            return;
++        }
++        if (_scrollActive) return;   // a trackpad gesture owns the finger
++        // Only a pager reaches here in practice: everywhere else the notch went
++        // out above as ACTION_SCROLL (TouchDispatcher.dispatchWheel answers false
++        // for a vertical pager). So a burst is ONE page swipe, the one a
++        // click-and-drag makes: a quarter of the view's height in six frames,
++        // released while still moving. Later notches of the same burst only
++        // keep the finger down until the swipe ends; the next burst pages again.
++        // A burst is one swipe: notches until the wheel has been still for 200 ms
++        // only extend that window. The release comes right after the swipe --
++        // VelocityTracker reads a finger still for ~40 ms as stopped, so waiting
++        // for the burst to end would release at velocity 0 and snap back.
++        const CFTimeInterval now = CACurrentMediaTime();
++        const bool quiet = now >= _wheelQuietUntil;
++        _wheelQuietUntil = now + 0.200;
++        if (_wheelActive || !quiet) return;
++        _wheelActive = YES;
++        _wheelAnchor = p;
++        _wheelAcc = NSZeroPoint;
+         [self dispatchTouchAction:0 atPoint:p];
+-        [self dispatchTouchAction:2 atPoint:b];
+-        [self dispatchTouchAction:1 atPoint:b];
++        const CGFloat step = hypot(dx, dy) > 0 ? hypot(dx, dy) : 1.0;
++        const CGFloat travel = std::max<CGFloat>(step, 0.25 * self.bounds.size.height);
++        const CGFloat sx = dx / step * travel / 6.0, sy = -dy / step * travel / 6.0;
++        __unsafe_unretained MacApkMetalView* me0 = self;   // the view outlives the swipe
++        for (int k = 1; k <= 7; k++) {
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) k * 8 * NSEC_PER_MSEC),
++                           dispatch_get_main_queue(), ^{
++                MacApkMetalView* me = me0;
++                if (!me->_wheelActive) return;
++                const NSPoint at = NSMakePoint(me->_wheelAnchor.x + me->_wheelAcc.x + (k <= 6 ? sx : 0),
++                                               me->_wheelAnchor.y + me->_wheelAcc.y + (k <= 6 ? sy : 0));
++                if (k <= 6) {
++                    me->_wheelAcc.x += sx;
++                    me->_wheelAcc.y += sy;
++                    [me dispatchTouchAction:2 atPoint:at];
++                } else {
++                    me->_wheelActive = NO;
++                    [me dispatchTouchAction:1 atPoint:at];   // 8 ms after the last move
++                }
++            });
++        }
+         return;
+     }
+ 
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -4067,10 +4112,53 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
+             mSurfaceControl = new SurfaceControl.Builder()
+                     .setName("SurfaceView[" + getClass().getSimpleName() + "]")
+                     .build();
++            mSurfaceControl.macapkSetOwnerView(this);
+         }
+         return mSurfaceControl;
+     }
+ 
++    /** A child layer was parented under this view's SurfaceControl: the view
++     *  will be fed buffers (Transaction.setBuffer), not drawn by a renderer.
++     *  Its holder then answers by the Canvas rule -- the view's own size --
++     *  as it does from a first lockCanvas on (macapkHolderSurfaceSize). */
++    void macapkNoteBufferFed() {
++        if (holder.macapkLockedCanvas) return;
++        holder.macapkLockedCanvas = true;
++        NativeLog.i(TAG, "SurfaceControl child on " + getClass().getName()
++            + ": the surface is buffer-fed; it takes the view's size and place");
++    }
++
++    /** One buffer set on this view's layer, or on a child of it. */
++    void macapkPresentBuffer(int[] argb, int w, int h) {
++        holder.macapkLockedCanvas = true;
++        // A buffer the size of the DISPLAY on a smaller view: the app sized it from
++        // the first surfaceChanged, which (before the view was known to be
++        // buffer-fed) reported the display, and laid its content out for that
++        // surface. Show the part of it under the view, where a display-sized
++        // surface puts it, instead of squeezing the whole buffer into the view
++        // (Instagram's photo editor, first open: the photo squashed over the
++        // gallery around it; the second open was right).
++        int[] d = macapkNotedDisplaySize();
++        int vw = getWidth(), vh = getHeight();
++        if (d != null && w == d[0] && h == d[1] && vw > 0 && vh > 0 && (vw != w || vh != h)) {
++            int[] o = new int[2];
++            macapkWindowOrigin(o);
++            int x0 = Math.max(0, o[0]), y0 = Math.max(0, o[1]);
++            int cw = Math.min(vw, w - x0), ch = Math.min(vh, h - y0);
++            if (cw > 0 && ch > 0) {
++                int[] crop = macapkCropBuf;
++                if (crop == null || crop.length != cw * ch) crop = macapkCropBuf = new int[cw * ch];
++                for (int row = 0; row < ch; row++) {
++                    System.arraycopy(argb, (y0 + row) * w + x0, crop, row * cw, cw);
++                }
++                holder.macapkPost(crop, cw, ch);
++                return;
++            }
++        }
++        holder.macapkPost(argb, w, h);
++    }
++    private int[] macapkCropBuf;
++
+     /** AOSP SurfaceView.applyTransactionToFrame(SurfaceControl.Transaction):
+      *  apply the transaction atomically WITH the next buffer this view posts.
+      *  With no compositor to synchronise against, applying it now is the same

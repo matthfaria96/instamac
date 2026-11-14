@@ -1,0 +1,136 @@
+diagnostic: DEX2JVM_TRACE_ENTRY logs method entries (and int-like arguments) of chosen classes
+
+A conversion-time regex over internal class names (DEX2JVM_TRACE_ENTRY) makes the
+translator emit, at the entry of every method of a matching class, a call to
+NativeLog.traceEntry("<class>.<method><desc>") and, for each boolean/byte/char/
+short/int argument, NativeLog.traceArg(method, index, value). NativeLog logs the
+first 30 entries of each method (then one line per 1000) with their arguments.
+Unset: nothing is emitted. Used to follow Instagram's share-sheet search
+(which request runs, with show_threads=1, and which parsers see the response)
+without a debugger.
+
+Fixed later: the prologue read each argument from the next one's slot
+(spacedParams() lists the receiver first), so a boolean `true` went out as the
+reference 0x1 and the trace itself threw; an object argument is now described
+without ever throwing, and an exception argument with its cause chain and the
+frames where the innermost one was thrown.
+
+diff --git a/runtime/java/com/macapk/loader/NativeLog.java b/runtime/java/com/macapk/loader/NativeLog.java
+--- a/runtime/java/com/macapk/loader/NativeLog.java
++++ b/runtime/java/com/macapk/loader/NativeLog.java
+@@ -73,5 +73,62 @@ public final class NativeLog {
+     public static void d(String tag, String msg) { if (DEBUG   >= MIN_LEVEL) print(DEBUG,   tag, msg); }
+     public static void i(String tag, String msg) { if (INFO    >= MIN_LEVEL) print(INFO,    tag, msg); }
+     public static void w(String tag, String msg) { if (WARN    >= MIN_LEVEL) print(WARN,    tag, msg); }
++
++    /** Called at the entry of every method of the classes the dex translator was
++     *  told to trace (DEX2JVM_TRACE_ENTRY, a regex over internal class names, at
++     *  conversion time). Diagnostic: the first 30 entries of each method are
++     *  logged, then one line per 1000. */
++    public static void traceEntry(String method) {
++        int[] c = sTraceCounts.computeIfAbsent(method, k -> new int[1]);
++        int n;
++        synchronized (c) { n = ++c[0]; }
++        if (n <= 30 || n % 1000 == 0) {
++            print(WARN, "trace", method + " #" + n + " on " + Thread.currentThread().getName());
++        }
++    }
++    /** An object argument of a traced method entry (see traceEntry): its class,
++     *  a collection's size or a short text, while that method's entry is still
++     *  within its first 30. */
++    public static void traceArgObj(String method, int index, Object value) {
++        int[] c = sTraceCounts.get(method);
++        if (c == null || c[0] > 30) return;
++        String d;
++        // A trace must not change what it watches: an argument whose size() or
++        // text throws (half-built, lazily filled) is shown by class only.
++        try {
++            if (value == null) d = "null";
++            else if (value instanceof Throwable t) d = describeThrowable(t);
++            else if (value instanceof java.util.Collection<?> col) d = value.getClass().getName() + " size=" + col.size();
++            else if (value instanceof java.util.Map<?, ?> m) d = value.getClass().getName() + " size=" + m.size();
++            else if (value instanceof CharSequence cs) d = "\"" + (cs.length() > 40 ? cs.subSequence(0, 40) + "…" : cs) + "\"";
++            else if (value.getClass().isArray()) d = value.getClass().getSimpleName() + " len=" + java.lang.reflect.Array.getLength(value);
++            else d = value.getClass().getName();
++        } catch (Throwable t) {
++            d = value.getClass().getName() + " (" + t.getClass().getSimpleName() + ")";
++        }
++        print(WARN, "trace", "  arg" + index + "=" + d + " (" + method + ")");
++    }
++    /** A traced exception argument: each cause's class and message, and where
++     *  the innermost one was thrown -- an error handed to a callback has
++     *  usually been caught far from its cause. */
++    private static String describeThrowable(Throwable t) {
++        StringBuilder sb = new StringBuilder();
++        Throwable root = t;
++        for (int depth = 0; t != null && depth < 6; t = t.getCause(), depth++) {
++            if (depth > 0) sb.append(" <- caused by ");
++            sb.append(t.getClass().getName());
++            if (t.getMessage() != null) sb.append(": ").append(t.getMessage());
++            root = t;
++        }
++        StackTraceElement[] st = root.getStackTrace();
++        for (int i = 0; i < Math.min(st.length, 14); i++) sb.append("\n\t    at ").append(st[i]);
++        return sb.toString();
++    }
++    public static void traceArg(String method, int index, int value) {
++        int[] c = sTraceCounts.get(method);
++        if (c != null && c[0] <= 30) print(WARN, "trace", "  arg" + index + "=" + value + " (" + method + ")");
++    }
++    private static final java.util.concurrent.ConcurrentHashMap<String, int[]> sTraceCounts =
++        new java.util.concurrent.ConcurrentHashMap<>();
+     public static void e(String tag, String msg) { if (ERROR   >= MIN_LEVEL) print(ERROR,   tag, msg); }
+ }
+diff --git a/src/dex/Translator.java b/src/dex/Translator.java
+--- a/src/dex/Translator.java
++++ b/src/dex/Translator.java
+@@ -2271,6 +2502,49 @@ public final class Translator {
+          * parameter word k.
+          */
+         void emitPrologue() {
++            // DEX2JVM_TRACE_ENTRY (diagnostic, conversion time): log every entry
++            // of the methods of matching classes through NativeLog.traceEntry.
++            if (TRACE_ENTRY != null && TRACE_ENTRY.matcher(ownerName).find()) {
++                final String key = ownerName.replace('/', '.') + "." + method.name() + method.descriptor();
++                out.ldcString(key);
++                out.methodOp(CodeWriter.INVOKESTATIC, "com/macapk/loader/NativeLog", "traceEntry",
++                             "(Ljava/lang/String;)V", false);
++                // The int-like arguments too (boolean, byte, char, short, int).
++                // spacedParams() lists the receiver first: skip it, so argument
++                // k is the k-th declared parameter and is read from its own slot.
++                // (Starting at slot 1 with the receiver's descriptor read every
++                // argument from the next one's slot: a boolean `true` went out as
++                // the reference 0x1 and the trace itself threw.)
++                String[] ps = spacedParams();
++                final int first = isStatic ? 0 : 1;
++                int slot = first;
++                for (int i = first, argNo = 0; i < ps.length; i++) {
++                    String d = ps[i];
++                    if (d == null) continue;              // wide high half
++                    char c0 = d.charAt(0);
++                    if (c0 == 'Z' || c0 == 'B' || c0 == 'C' || c0 == 'S' || c0 == 'I') {
++                        out.ldcString(key);
++                        out.pushInt(argNo);
++                        out.varOp(CodeWriter.ILOAD, slot);
++                        out.methodOp(CodeWriter.INVOKESTATIC, "com/macapk/loader/NativeLog", "traceArg",
++                                     "(Ljava/lang/String;II)V", false);
++                    } else if (c0 == 'L' || c0 == '[') {
++                        // Objects: their class, a collection's size, a short string.
++                        out.ldcString(key);
++                        out.pushInt(argNo);
++                        out.varOp(CodeWriter.ALOAD, slot);
++                        out.methodOp(CodeWriter.INVOKESTATIC, "com/macapk/loader/NativeLog", "traceArgObj",
++                                     "(Ljava/lang/String;ILjava/lang/Object;)V", false);
++                    }
++                    slot += isWideDesc(d) ? 2 : 1;
++                    argNo++;
++                }
++            }
++            // A DEX static value lands before <clinit> runs: store first.
++            if ("<clinit>".equals(method.name())) {
++                java.util.List<Object[]> sv = CLINIT_STATIC_VALUES.get();
++                if (sv != null) emitStaticValueStores(out, ownerName, sv);
++            }
+             zeroInitRegisterSlots();
+             int firstParamReg = code.registersSize() - code.insSize();
+             int slot = 0;

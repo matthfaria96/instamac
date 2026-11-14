@@ -1,0 +1,548 @@
+Canvas: antialiased clipPath (soft clip) and mipmapped reductions
+
+clipPath: Java2D clips to a shape with a hard edge; Android's clipPath edge is antialiased, so every circular avatar and rounded card had a stair-stepped rim. For a non-rectangular clip right after a plain save(), the save becomes an offscreen layer the size of the shape's box (at most 600k px); restore masks it with the shape filled antialiased (DstIn) and draws it back. A second clip in the same save, a larger shape or no save keep the hard clip. MACAPK_SOFT_CLIP=0 = old behaviour. Measured: draw 1.9 -> 2.2-2.9 ms per frame.
+
+Reductions: a strong downscale with one bilinear step reads 4 of every NxN source pixels (aliased edges, glittering texture) -- a 1080 px photo into a 412 px column on a 1x Mac display, an image into an 85 px avatar. Cached scaled blits (dcScaledBlit) now halve the source first (a mipmap chain) and land on the exact size with the last bilinear step; MacApkBitmapShaderPaint picks the mip level nearest the drawn scale from a per-Bitmap (generation-keyed) chain. Both paid once per bitmap and size. MACAPK_MIP_DOWNSCALE=0 = old behaviour.
+
+diff --git a/runtime/java/android/graphics/Canvas.java b/runtime/java/android/graphics/Canvas.java
+--- a/runtime/java/android/graphics/Canvas.java
++++ b/runtime/java/android/graphics/Canvas.java
+@@ -93,6 +93,8 @@ public class Canvas {
+         ColorFilter   colorFilter; // captured at saveLayer, applied once to the flattened pixels
+         java.awt.Composite filteredComposite; // destination blend, without paint alpha
+         Shape         filterClipDev; // exact initial clip: filters can make transparent pixels opaque
++        java.awt.Shape softMaskDev;  // soft clip: the clip shape in device space (AA mask at restore)
++        int           softX, softY;  // soft clip: where layerImage sits on the parent
+     }
+     private static final Layer NO_LAYER = new Layer();
+ 
+@@ -497,7 +499,12 @@ public class Canvas {
+             // branch `g`/`image` point back at the parent so the stack pops
+             // act on the parent context, exactly as in the no-layer case.
+             Layer layer = layerStack.isEmpty() ? NO_LAYER : layerStack.pop();
+-            if (layer != NO_LAYER) {
++            if (layer != NO_LAYER && layer.softMaskDev != null) {
++                layer.layerG.dispose();
++                image = layer.parentImage;
++                g = layer.parentG;
++                macapkSoftClipRestore(layer);
++            } else if (layer != NO_LAYER) {
+                 layer.layerG.dispose();
+                 Graphics2D pg = layer.parentG;
+                 image = layer.parentImage;
+@@ -4536,6 +4705,7 @@ public class Canvas {
+         if (g == null || path == null || !REAL_CLIP) return true;
+         java.awt.Shape s = path.macapkShape();
+         if (s == null) return true;
++        if (macapkSoftClip(s)) return true;
+         if (DIAG_CLIP) {
+             long t0 = System.nanoTime();
+             int how = macapkIntersectClip(s);
+@@ -4557,6 +4727,82 @@ public class Canvas {
+         return true;
+     }
+ 
++    /** MACAPK_SOFT_CLIP (default on): an antialiased clipPath. Java2D clips to a
++     *  shape with a hard, aliased edge (a pixel is in or out); Android's clipPath
++     *  edge is antialiased, so every circular avatar and rounded card here had a
++     *  stair-stepped rim. For a non-rectangular clip right after a plain save(),
++     *  the save becomes a small offscreen layer the size of the shape's box; the
++     *  restore masks it with the shape filled antialiased (DstIn) and draws it
++     *  back. Shapes larger than SOFT_CLIP_MAX_PX, a second clip in the same save,
++     *  or no save to attach to keep the hard clip. */
++    private static final boolean SOFT_CLIP = !"0".equals(System.getenv("MACAPK_SOFT_CLIP"));
++    private static final long SOFT_CLIP_MAX_PX = 600_000L;
++    private boolean macapkSoftClip(java.awt.Shape s) {
++        if (!SOFT_CLIP || image == null || s instanceof java.awt.geom.Rectangle2D) return false;
++        if (layerStack.isEmpty() || layerStack.peek() != NO_LAYER) return false;
++        final AffineTransform ctm = g.getTransform();
++        final java.awt.Shape dev;
++        try { dev = ctm.createTransformedShape(s); } catch (Throwable t) { return false; }
++        java.awt.Rectangle box = dev.getBounds();
++        java.awt.Shape cur = g.getClip();
++        if (cur != null) {
++            try { box = box.intersection(ctm.createTransformedShape(cur).getBounds()); } catch (Throwable t) { return false; }
++        }
++        box = box.intersection(new java.awt.Rectangle(0, 0, image.getWidth(), image.getHeight()));
++        if (box.isEmpty() || (long) box.width * box.height > SOFT_CLIP_MAX_PX) return false;
++        final BufferedImage li = new BufferedImage(box.width, box.height, BufferedImage.TYPE_INT_ARGB);
++        final Graphics2D lg = li.createGraphics();
++        macapkInitHints(lg);
++        lg.setRenderingHints(g.getRenderingHints());
++        final AffineTransform lt = AffineTransform.getTranslateInstance(-box.x, -box.y);
++        lg.setClip(new java.awt.Rectangle(0, 0, box.width, box.height));
++        lt.concatenate(ctm);
++        lg.setTransform(lt);
++        final Layer layer = new Layer();
++        layer.parentImage = image;
++        layer.parentG = g;
++        layer.layerG = lg;
++        layer.layerImage = li;
++        layer.alpha = 1f;
++        layer.softMaskDev = dev;
++        layer.softX = box.x;
++        layer.softY = box.y;
++        layerStack.pop();
++        layerStack.push(layer);
++        image = li;
++        g = lg;
++        return true;
++    }
++    private void macapkSoftClipRestore(Layer layer) {
++        final BufferedImage li = layer.layerImage;
++        final BufferedImage mask = new BufferedImage(li.getWidth(), li.getHeight(), BufferedImage.TYPE_INT_ARGB);
++        final Graphics2D mg = mask.createGraphics();
++        try {
++            mg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
++            mg.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
++            mg.translate(-layer.softX, -layer.softY);
++            mg.setColor(java.awt.Color.WHITE);
++            mg.fill(layer.softMaskDev);
++        } finally {
++            mg.dispose();
++        }
++        final Graphics2D lg = li.createGraphics();
++        try {
++            lg.setComposite(AlphaComposite.DstIn);
++            lg.drawImage(mask, 0, 0, null);
++        } finally {
++            lg.dispose();
++        }
++        final Graphics2D pg = layer.parentG;
++        final AffineTransform oldT = pg.getTransform();
++        final java.awt.Composite oldC = pg.getComposite();
++        pg.setTransform(new AffineTransform());
++        pg.setComposite(AlphaComposite.SrcOver);
++        pg.drawImage(li, layer.softX, layer.softY, null);
++        pg.setComposite(oldC);
++        pg.setTransform(oldT);
++    }
++
+     /** Intersect the clip with `s` (user space), as g.clip(s) does, but without
+      *  java.awt.geom.Area when one shape provably contains the other.
+      *
+@@ -4720,7 +4966,7 @@ public class Canvas {
+                         final boolean bilinear = fm == BitmapShader.FILTER_MODE_LINEAR
+                             || (fm == BitmapShader.FILTER_MODE_DEFAULT && (p == null || p.isFilterBitmap()));
+                         return new MacApkBitmapShaderPaint(img, hasMatrix ? lm : null,
+-                            bs.tileX, bs.tileY, bilinear);
++                            bs.tileX, bs.tileY, bilinear, bilinear ? macapkMips(bs.bitmap, img) : null);
+                     }
+                 }
+                 BufferedImage tile = img;
+@@ -4751,6 +4997,37 @@ public class Canvas {
+         }
+         return null;
+     }
++    /** Halvings of a shader bitmap for MacApkBitmapShaderPaint's mipmap pick,
++     *  cached per Bitmap and generation (a mutated bitmap gets a new chain).
++     *  Only for images worth it (>= 128 px on the short side). */
++    private static final java.util.Map<Bitmap, Object[]> sMips =
++        java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
++    private static BufferedImage[] macapkMips(Bitmap b, BufferedImage img) {
++        if (!MIP_DOWNSCALE || b == null || img == null || Math.min(img.getWidth(), img.getHeight()) < 128) return null;
++        final int gen = b.getGenerationId();
++        final Object[] e = sMips.get(b);
++        if (e != null && ((Integer) e[0]) == gen && e[1] == img) return (BufferedImage[]) e[2];
++        final java.util.ArrayList<BufferedImage> out = new java.util.ArrayList<>();
++        BufferedImage cur = img;
++        while (cur.getWidth() >= 16 && cur.getHeight() >= 16) {
++            final int nw = Math.max(1, cur.getWidth() / 2), nh = Math.max(1, cur.getHeight() / 2);
++            final BufferedImage half = new BufferedImage(nw, nh, BufferedImage.TYPE_INT_ARGB);
++            final Graphics2D hg = half.createGraphics();
++            try {
++                hg.setComposite(AlphaComposite.Src);
++                hg.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
++                hg.drawImage(cur, 0, 0, nw, nh, null);
++            } finally {
++                hg.dispose();
++            }
++            out.add(half);
++            cur = half;
++        }
++        final BufferedImage[] arr = out.toArray(new BufferedImage[0]);
++        sMips.put(b, new Object[] { gen, img, arr });
++        return arr;
++    }
++
+     /** AWT MultipleGradientPaint requires fractions[] length == colors, each in
+      *  [0,1] and STRICTLY increasing. Android allows null (even spacing) and
+      *  tolerates duplicate stops; sanitize to AWT's stricter contract. */
+@@ -5328,6 +5605,312 @@ public class Canvas {
+     // fails the timing row, and a pre-fix div8 table and a late-starting band each
+     // fail their own row. MACAPK_BITMAP_SCALE_FAST=0 restores g.drawImage.
+     // Doc: docs/telegram-wallpaper-scaled-blit_2026-10-01.md.
++    // ---- MACAPK_DRAW_CACHE: pixels a scroll redraws without anything changing ----
++    // MEASURED 2026-11-12 (Instamac, Instagram's feed scrolled, MACAPK_DRAW_SAMPLER=1
++    // in ViewCanvasDriver): ~40% of rootView.draw went to pixels that are the same
++    // frame after frame -- avatars filled with a BitmapShader (MacApkBitmapShaderPaint
++    // samples every covered pixel through the shader matrix in Java, then MaskBlit
++    // composites it) and photos drawn scaled (TransformHelper resamples the whole
++    // photo; macapkScaledBlit refuses most of them: non-stock source, shaped clip).
++    // Both are kept here, keyed by everything that decides their pixels: the bitmap
++    // and its generation id (bumped on every pixel change, inBitmap reuse and
++    // reconfigure included), the source rect or shader matrix and tile modes, the
++    // shape, the filter and AA flags, and the sub-pixel phase on the device grid.
++    // A later frame copies the kept pixels 1:1 to an integer device position under
++    // its own clip and composite (SrcOver with the paint alpha, as the direct draw
++    // applies it). Only under a translate-only CTM, SrcOver and no colour filter;
++    // edge pixels may differ from the direct draw by a rounding step (the kept
++    // pixels are stored once before being composited).
++    // Bounded LRU, MACAPK_DRAW_CACHE_MB (default 24). MACAPK_DRAW_CACHE=0 draws
++    // everything directly, as before.
++    static final boolean DRAW_CACHE =
++        !"0".equals(System.getenv("MACAPK_DRAW_CACHE")) && Bitmap.GENID;
++    private static final long DC_BUDGET = dcBudget();
++    private static long dcBudget() {
++        try {
++            String e = System.getenv("MACAPK_DRAW_CACHE_MB");
++            if (e != null) return Math.max(1L, Long.parseLong(e.trim())) << 20;
++        } catch (Throwable ignored) { }
++        return 24L << 20;
++    }
++    private static final int DC_MAX_SIDE = 4096;
++    /** Bisect gates: MACAPK_DRAW_CACHE_SCALED=0 / MACAPK_DRAW_CACHE_SHADER=0 draw
++     *  that kind directly while the other stays kept. */
++    static final boolean DC_SCALED = !"0".equals(System.getenv("MACAPK_DRAW_CACHE_SCALED"));
++    static final boolean DC_SHADER = !"0".equals(System.getenv("MACAPK_DRAW_CACHE_SHADER"));
++    private static final long DC_MAX_PIXELS = 1_200_000L;   // ~4.8 MB kept per image at most
++    private static final int DC_MIN_SIDE = dcMinSide();
++    private static int dcMinSide() {
++        try { String e = System.getenv("MACAPK_DRAW_CACHE_MIN_SIDE"); if (e != null) return Integer.parseInt(e.trim()); }
++        catch (Throwable ignored) { }
++        return 8;
++    }
++    /** `src` is what the pixels come from, compared by identity: the Bitmap (with
++     *  its generation id), the Shader (Android shaders are immutable but for their
++     *  local matrix, which is in geo), or null for a solid colour (in geo). */
++    private static final class DcKey {
++        final Object src; final int gen; final long[] geo; final int hash;
++        DcKey(Object src, int gen, long[] geo) {
++            this.src = src; this.gen = gen; this.geo = geo;
++            this.hash = (System.identityHashCode(src) * 31 + gen) * 31 + java.util.Arrays.hashCode(geo);
++        }
++        @Override public int hashCode() { return hash; }
++        @Override public boolean equals(Object o) {
++            return o instanceof DcKey k && k.src == src && k.gen == gen && java.util.Arrays.equals(k.geo, geo);
++        }
++    }
++    private static final java.util.LinkedHashMap<DcKey, BufferedImage> sDc =
++        new java.util.LinkedHashMap<>(64, 0.75f, true);
++    private static long sDcBytes;
++    /** Diagnostic counters (ViewCanvasDriver's draw sampler reports them): a
++     *  miss is either a first sighting (New: drawn directly, only noted) or a
++     *  second identical sighting that is then kept. */
++    public static long sDcHits, sDcMisses, sDcMissNew, sDcMissGen, sDcMissGeo;
++    /** Admission: a draw is kept only the SECOND time it is seen identical. A first
++     *  sighting draws directly and is only noted -- a bitmap drawn once while
++     *  scrolling past, or whose pixels change between frames, never costs an
++     *  allocation (keeping them on first sight churned ~700 MB a minute and the
++     *  GC pauses stalled frames for seconds, measured 2026-11-12). Sightings of a
++     *  source object are remembered weakly (the 4 most recent per object), so a
++     *  noted bitmap is never kept alive; solid colours, which have no object,
++     *  in a bounded LRU. */
++    private static final java.util.WeakHashMap<Object, long[][]> sDcSeen = new java.util.WeakHashMap<>();
++    private static final java.util.LinkedHashMap<DcKey, Boolean> sDcSeenSolid =
++        new java.util.LinkedHashMap<DcKey, Boolean>(256, 0.75f, true) {
++            @Override protected boolean removeEldestEntry(java.util.Map.Entry<DcKey, Boolean> e) {
++                return size() > 1024;
++            }
++        };
++    private static boolean dcAdmit(DcKey key) {
++        if (key.src == null) {
++            synchronized (sDcSeenSolid) {
++                if (sDcSeenSolid.remove(key) != null) return true;
++                sDcSeenSolid.put(key, Boolean.TRUE);
++                sDcMissNew++;
++                return false;
++            }
++        }
++        final long[] now = new long[1 + key.geo.length];
++        now[0] = key.gen;
++        System.arraycopy(key.geo, 0, now, 1, key.geo.length);
++        synchronized (sDcSeen) {
++            long[][] seen = sDcSeen.get(key.src);
++            if (seen == null) sDcSeen.put(key.src, seen = new long[4][]);
++            for (int i = 0; i < seen.length; i++) {
++                if (seen[i] != null && java.util.Arrays.equals(seen[i], now)) {
++                    seen[i] = null;
++                    return true;
++                }
++            }
++            System.arraycopy(seen, 0, seen, 1, seen.length - 1);
++            seen[0] = now;
++            sDcMissNew++;
++            return false;
++        }
++    }
++    public static long macapkDrawCacheBytes() { synchronized (sDc) { return sDcBytes; } }
++
++    private static BufferedImage dcGet(DcKey k) { synchronized (sDc) { return sDc.get(k); } }
++    private static void dcPut(DcKey k, BufferedImage img) {
++        synchronized (sDc) {
++            BufferedImage old = sDc.put(k, img);
++            if (old != null) sDcBytes -= 4L * old.getWidth() * old.getHeight();
++            sDcBytes += 4L * img.getWidth() * img.getHeight();
++            java.util.Iterator<java.util.Map.Entry<DcKey, BufferedImage>> it = sDc.entrySet().iterator();
++            while (sDcBytes > DC_BUDGET && it.hasNext()) {
++                BufferedImage v = it.next().getValue();
++                it.remove();
++                sDcBytes -= 4L * v.getWidth() * v.getHeight();
++            }
++        }
++    }
++    private static long dcQ(double v) { return Math.round(v * 256.0); }
++
++    /** The kept pixels to integer device (ix, iy), under this frame's clip and composite. */
++    private void dcBlit(BufferedImage px, int ix, int iy) {
++        final AffineTransform save = g.getTransform();
++        try {
++            g.setTransform(new AffineTransform());
++            g.drawImage(px, ix, iy, null);
++        } finally {
++            g.setTransform(save);
++        }
++    }
++
++    /** True when this draw may use the cache: SrcOver (any alpha) under a
++     *  translate-only CTM, or with `scaled` an axis-aligned positive scale too
++     *  (ImageView draws a photo through canvas.concat(drawMatrix)). */
++    private boolean dcUsable(boolean scaled) {
++        if (!DRAW_CACHE || g == null || image == null) return false;
++        if (!(g.getComposite() instanceof AlphaComposite ac) || ac.getRule() != AlphaComposite.SRC_OVER) return false;
++        final AffineTransform t = g.getTransform();
++        final int allowed = scaled
++            ? AffineTransform.TYPE_TRANSLATION | AffineTransform.TYPE_UNIFORM_SCALE | AffineTransform.TYPE_GENERAL_SCALE
++            : AffineTransform.TYPE_TRANSLATION;
++        return (t.getType() & ~allowed) == 0 && t.getScaleX() > 0 && t.getScaleY() > 0;
++    }
++
++    /** A scaled drawBitmap of `b` (whose pixels are `src`): src's [sx0,sx1) x
++     *  [sy0,sy1) onto the user rect [ux0,ux1) x [uy0,uy1), kept. False = not
++     *  handled; the caller draws it. */
++    /** MACAPK_MIP_DOWNSCALE=0: the old single bilinear step for cached reductions. */
++    private static final boolean MIP_DOWNSCALE = !"0".equals(System.getenv("MACAPK_MIP_DOWNSCALE"));
++    /** Halve while the next half is still >= target * this (1.0 = never below
++     *  the target; the final bilinear step then reduces by at most 2x). */
++    private static final double MIP_SLACK = 1.0;
++    private boolean dcScaledBlit(Bitmap b, BufferedImage src, Paint p, boolean filt,
++                                 int sx0, int sy0, int sx1, int sy1,
++                                 double ux0, double uy0, double ux1, double uy1) {
++        if (!DC_SCALED || b == null || src == null || src == image || !dcUsable(true)) return false;
++        if (p != null && p.getColorFilter() != null) return false;
++        if (sx1 <= sx0 || sy1 <= sy0 || !(ux1 > ux0) || !(uy1 > uy0)) return false;
++        if (sx0 < 0 || sy0 < 0 || sx1 > src.getWidth() || sy1 > src.getHeight()) return false;
++        // The destination in DEVICE pixels: the CTM is translate + positive scale.
++        final AffineTransform t = g.getTransform();
++        final double dx0 = ux0 * t.getScaleX() + t.getTranslateX(), dy0 = uy0 * t.getScaleY() + t.getTranslateY();
++        final double dw = (ux1 - ux0) * t.getScaleX(), dh = (uy1 - uy0) * t.getScaleY();
++        if (Math.abs(dw - (sx1 - sx0)) < 1e-9 && Math.abs(dh - (sy1 - sy0)) < 1e-9) return false;
++        final int ix = (int) Math.floor(dx0), iy = (int) Math.floor(dy0);
++        final int w = (int) Math.ceil(dx0 + dw) - ix, h = (int) Math.ceil(dy0 + dh) - iy;
++        if (w < DC_MIN_SIDE || h < DC_MIN_SIDE || w > DC_MAX_SIDE || h > DC_MAX_SIDE
++                || (long) w * h > DC_MAX_PIXELS) return false;
++        final int gen = b.getGenerationId();
++        if (gen == 0) return false;
++        final long[] geo = { 1, sx0, sy0, sx1, sy1, dcQ(dx0 - ix), dcQ(dy0 - iy),
++                             Double.doubleToLongBits(dw), Double.doubleToLongBits(dh),
++                             filt ? 1 : 0 };
++        final DcKey key = new DcKey(b, gen, geo);
++        BufferedImage px = dcGet(key);
++        if (px == null) {
++            if (!dcAdmit(key)) return false;
++            px = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
++            final Graphics2D cg = px.createGraphics();
++            try {
++                cg.setComposite(AlphaComposite.Src);
++                cg.setRenderingHint(RenderingHints.KEY_INTERPOLATION, filt
++                    ? RenderingHints.VALUE_INTERPOLATION_BILINEAR
++                    : g.getRenderingHint(RenderingHints.KEY_INTERPOLATION) != null
++                        ? g.getRenderingHint(RenderingHints.KEY_INTERPOLATION)
++                        : RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
++                // A strong reduction (a 1080 px photo into a 412 px phone column
++                // on a 1x Mac display) with one bilinear step reads 4 of every
++                // ~7x7 source pixels: aliased edges, glittering fine texture.
++                // Halve first (each 2x bilinear step averages 2x2: a mipmap
++                // chain), then the last bilinear step lands on the exact size.
++                // Kept in this cache, so it is paid once per bitmap and size.
++                BufferedImage from = src;
++                int fx0 = sx0, fy0 = sy0, fw = sx1 - sx0, fh = sy1 - sy0;
++                if (filt && MIP_DOWNSCALE) {
++                    while (fw / 2 >= dw * MIP_SLACK && fh / 2 >= dh * MIP_SLACK && fw >= 4 && fh >= 4) {
++                        final int nw = fw / 2, nh = fh / 2;
++                        final BufferedImage half = new BufferedImage(nw, nh, BufferedImage.TYPE_INT_ARGB);
++                        final Graphics2D hg = half.createGraphics();
++                        try {
++                            hg.setComposite(AlphaComposite.Src);
++                            hg.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
++                                RenderingHints.VALUE_INTERPOLATION_BILINEAR);
++                            hg.drawImage(from, 0, 0, nw, nh, fx0, fy0, fx0 + fw, fy0 + fh, null);
++                        } finally {
++                            hg.dispose();
++                        }
++                        from = half; fx0 = 0; fy0 = 0; fw = nw; fh = nh;
++                    }
++                }
++                final AffineTransform m = AffineTransform.getTranslateInstance(dx0 - ix, dy0 - iy);
++                m.scale(dw / fw, dh / fh);
++                m.translate(-fx0, -fy0);
++                cg.setClip(0, 0, w, h);
++                cg.drawImage(from, m, null);
++            } finally {
++                cg.dispose();
++            }
++            dcPut(key, px);
++            sDcMisses++;
++            if (DC_TRACE && sDcTraced < 60) {
++                sDcTraced++;
++                com.macapk.loader.NativeLog.i("Mac.apk.Canvas", "draw-cache kept scaled: bmp@"
++                    + Integer.toHexString(System.identityHashCode(b)) + " gen=" + gen + " " + b.getWidth() + "x"
++                    + b.getHeight() + " src=[" + sx0 + "," + sy0 + "," + sx1 + "," + sy1 + "] dev=" + ix + ","
++                    + iy + " " + w + "x" + h + " srcImg@" + Integer.toHexString(System.identityHashCode(src))
++                    + " " + src.getWidth() + "x" + src.getHeight() + " type=" + src.getType()
++                    + " target@" + Integer.toHexString(System.identityHashCode(image)) + " "
++                    + image.getWidth() + "x" + image.getHeight());
++            }
++        } else {
++            sDcHits++;
++        }
++        dcBlit(px, ix, iy);
++        return true;
++    }
++    static final boolean DC_TRACE = System.getenv("MACAPK_DRAW_CACHE_TRACE") != null;
++    private static int sDcTraced;
++
++    /** A fill of an ellipse, rounded rect or rect with a BitmapShader paint (the
++     *  installed MacApkBitmapShaderPaint), kept. False = not handled. */
++    private boolean dcShaderFill(Shape s, Paint p) {
++        if (!DC_SHADER || s == null || p == null || !dcUsable(false)) return false;
++        if (!(g.getPaint() instanceof MacApkBitmapShaderPaint)) return false;
++        if (!(p.getShader() instanceof BitmapShader bs) || bs.bitmap == null || p.getColorFilter() != null) return false;
++        final long kind; final double[] sp;
++        if (s instanceof java.awt.geom.Ellipse2D e) {
++            kind = 1; sp = new double[] { e.getX(), e.getY(), e.getWidth(), e.getHeight() };
++        } else if (s instanceof RoundRectangle2D r) {
++            kind = 2; sp = new double[] { r.getX(), r.getY(), r.getWidth(), r.getHeight(), r.getArcWidth(), r.getArcHeight() };
++        } else if (s instanceof Rectangle2D r) {
++            kind = 3; sp = new double[] { r.getX(), r.getY(), r.getWidth(), r.getHeight() };
++        } else {
++            return false;
++        }
++        final int gen = bs.bitmap.getGenerationId();
++        if (gen == 0) return false;
++        final Rectangle2D lb = s.getBounds2D();
++        if (lb.isEmpty()) return false;
++        final AffineTransform t = g.getTransform();
++        final double tx = t.getTranslateX(), ty = t.getTranslateY();
++        final int ix = (int) Math.floor(lb.getMinX() + tx) - 1, iy = (int) Math.floor(lb.getMinY() + ty) - 1;
++        final int w = (int) Math.ceil(lb.getMaxX() + tx) + 1 - ix, h = (int) Math.ceil(lb.getMaxY() + ty) + 1 - iy;
++        if (w <= 0 || h <= 0 || w > DC_MAX_SIDE || h > DC_MAX_SIDE || (long) w * h > DC_MAX_PIXELS) return false;
++        final double ox = tx - ix, oy = ty - iy;
++        final AffineTransform lm = bs.macapkLocalAffine();
++        final double[] m = { 1, 0, 0, 1, 0, 0 };
++        if (lm != null) lm.getMatrix(m);
++        final long[] geo = new long[8 + sp.length + m.length];
++        int i = 0;
++        geo[i++] = 2;
++        geo[i++] = kind;
++        geo[i++] = dcQ(ox);
++        geo[i++] = dcQ(oy);
++        geo[i++] = bs.tileX.ordinal() * 16L + bs.tileY.ordinal();
++        geo[i++] = bs.getFilterMode() * 2L + (p.isFilterBitmap() ? 1 : 0);
++        geo[i++] = RenderingHints.VALUE_ANTIALIAS_ON.equals(
++            g.getRenderingHint(RenderingHints.KEY_ANTIALIASING)) ? 1 : 0;
++        geo[i++] = w * 65536L + h;
++        for (double v : sp) geo[i++] = Double.doubleToLongBits(v);
++        for (double v : m) geo[i++] = Double.doubleToLongBits(v);
++        final DcKey key = new DcKey(bs.bitmap, gen, geo);
++        BufferedImage px = dcGet(key);
++        if (px == null) {
++            if (!dcAdmit(key)) return false;
++            px = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
++            final Graphics2D cg = px.createGraphics();
++            try {
++                cg.setRenderingHints(g.getRenderingHints());
++                cg.setComposite(AlphaComposite.SrcOver);
++                cg.setPaint(g.getPaint());
++                cg.translate(ox, oy);
++                cg.fill(s);
++            } finally {
++                cg.dispose();
++            }
++            dcPut(key, px);
++            sDcMisses++;
++        } else {
++            sDcHits++;
++        }
++        dcBlit(px, ix, iy);
++        return true;
++    }
++
+     static final boolean BITMAP_SCALE_FAST =
+         !"0".equals(System.getenv("MACAPK_BITMAP_SCALE_FAST"));
+     /** How many draws the fast path served (diagnostic; the gate reads it). */
+diff --git a/runtime/java/android/graphics/MacApkBitmapShaderPaint.java b/runtime/java/android/graphics/MacApkBitmapShaderPaint.java
+--- a/runtime/java/android/graphics/MacApkBitmapShaderPaint.java
++++ b/runtime/java/android/graphics/MacApkBitmapShaderPaint.java
+@@ -42,9 +42,19 @@ final class MacApkBitmapShaderPaint implements java.awt.Paint {
+     private final AffineTransform local;   // null = identity
+     private final Shader.TileMode tx, ty;
+     private final boolean bilinear;
++    /** Successive halvings of the image (level k = 1/2^k), or null. A strong
++     *  reduction -- a 1080 px photo into an 85 px avatar -- sampled bilinearly
++     *  from the full image reads 4 of every ~13x13 texels: aliased, glittering.
++     *  createContext picks the level nearest the drawn size (a mipmap). */
++    private final BufferedImage[] mips;
+ 
+     MacApkBitmapShaderPaint(BufferedImage img, AffineTransform local,
+                             Shader.TileMode tx, Shader.TileMode ty, boolean bilinear) {
++        this(img, local, tx, ty, bilinear, null);
++    }
++    MacApkBitmapShaderPaint(BufferedImage img, AffineTransform local,
++                            Shader.TileMode tx, Shader.TileMode ty, boolean bilinear,
++                            BufferedImage[] mips) {
+         this.w = img.getWidth();
+         this.h = img.getHeight();
+         this.argb = pixels(img);
+@@ -52,6 +62,17 @@ final class MacApkBitmapShaderPaint implements java.awt.Paint {
+         this.tx = tx != null ? tx : Shader.TileMode.CLAMP;
+         this.ty = ty != null ? ty : Shader.TileMode.CLAMP;
+         this.bilinear = bilinear;
++        this.mips = mips;
++    }
++    private MacApkBitmapShaderPaint(MacApkBitmapShaderPaint base, BufferedImage level) {
++        this.w = level.getWidth();
++        this.h = level.getHeight();
++        this.argb = pixels(level);
++        this.local = base.local;
++        this.tx = base.tx;
++        this.ty = base.ty;
++        this.bilinear = base.bilinear;
++        this.mips = null;
+     }
+ 
+     /** The image's pixels as non-premultiplied ARGB: the backing array itself for
+@@ -80,6 +101,23 @@ final class MacApkBitmapShaderPaint implements java.awt.Paint {
+                                       RenderingHints hints) {
+         AffineTransform total = new AffineTransform(xform);
+         if (local != null) total.concatenate(local);
++        if (bilinear && mips != null && mips.length > 0) {
++            // Device pixels per texel along each axis; the coarser one decides.
++            final double ex = Math.hypot(total.getScaleX(), total.getShearY());
++            final double ey = Math.hypot(total.getShearX(), total.getScaleY());
++            final double s = Math.max(ex, ey);
++            int k = 0;
++            while (k < mips.length && s * (1 << (k + 1)) <= 1.0) k++;
++            if (k > 0) {
++                final AffineTransform lv = new AffineTransform(total);
++                lv.scale(1 << k, 1 << k);   // level-k texel -> original texel
++                return new MacApkBitmapShaderPaint(this, mips[k - 1]).contextFor(lv);
++            }
++        }
++        return contextFor(total);
++    }
++
++    private PaintContext contextFor(AffineTransform total) {
+         AffineTransform inv;
+         try {
+             inv = total.createInverse();
