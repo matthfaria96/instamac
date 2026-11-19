@@ -215,6 +215,7 @@ vídeo e som nos Reels; keystore; sessão estável; nome/ícone/menu.
 | 0036 | `ViewPropertyAnimator` como no AOSP (um por view, começa sozinho, `cancel()` real); layout resiliente a `onLayout` que lança | seta do editor volta ao fechar o painel de áudio; perfil inteiro com lista de sugestões quebrada; painel de áudio colapsado ~1 em 15 (aberto) |
 | 0040 | Tamanho da Interface (Visualizar: Automático/100/125/150%): densidade e janelas escaladas; automático = maior que cabe | 125% nesta tela (515×1144, 200 dpi), toque e layout de celular conferidos |
 | 0041 | distribuição 1.0.0: `release-clean.sh` (sem identidade/caminhos, abre em Celular) no `make-dmg.sh`; repo público com histórico novo | DMG 608 MB, cópia limpa abre no "Participe do Instagram" |
+| 0042 | ideias futuras (fechar só esconde, recuperação automática, heap, treino AOT) e caminhos descartados (VM, Skia no `Canvas`, sair do Java, Rust) | anotação; nada implementado |
 
 **Aberto, em ordem:**
 1. Dono testar à mão o scroll (feed, Reels, stories) e o giro (ADR 0007), e os modos de janela
@@ -295,6 +296,10 @@ scripts/boot-loop.sh 10 -               # gate depois de mexer em runtime/shim/l
 ```
 
 **Onde parei** (atualize esta seção ao encerrar; é o que poupa redescobrir o estado):
+2026-11-19: projeto encerrado por ora. Ideias e caminhos descartados anotados no ADR 0042
+(retomar por ele). Artefatos de build apagados (refazer com as receitas do §2); `payload/`,
+`runtime/` e o app em /Applications ficaram.
+
 2026-11-14 (noite): patches 0046–0053 (ADRs 0035–0039). Varredura feita: Stories (destaque) e
 Direct (caixa de entrada) corretos; módulos baixados de volta a 0444 (meu build-notifier tinha
 tirado). Imagens: recorte suavizado + mipmaps (0054); Tamanho da Interface automático (0055, ADR 0040: 125% nesta tela, coordenadas do `ui.sh tap` ×1,25). Pendentes: captura de tela PNG do Mac preta no editor
